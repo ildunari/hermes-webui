@@ -2813,7 +2813,7 @@ def handle_get(handler, parsed) -> bool:
             logged_in = bool(cv and verify_session(cv))
         return j(handler, {"auth_enabled": is_auth_enabled(), "logged_in": logged_in})
 
-    if parsed.path in ("/manifest.json", "/manifest.webmanifest"):
+    if parsed.path in ("/manifest.json", "/manifest.webmanifest") or parsed.path.endswith(("/manifest.json", "/manifest.webmanifest")):
         static_root = Path(__file__).parent.parent / "static"
         manifest_path = (static_root / "manifest.json").resolve()
         if manifest_path.exists():
@@ -2827,7 +2827,7 @@ def handle_get(handler, parsed) -> bool:
             return True
         return j(handler, {"error": "not found"}, status=404)
 
-    if parsed.path == "/sw.js":
+    if parsed.path == "/sw.js" or parsed.path.endswith("/sw.js"):
         static_root = Path(__file__).parent.parent / "static"
         sw_path = (static_root / "sw.js").resolve()
         if sw_path.exists():
