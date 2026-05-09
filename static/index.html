@@ -23,6 +23,30 @@
 <meta name="theme-color" id="hermes-theme-color" content="#0D0D1A">
 <script>(function(){try{var t=localStorage.getItem('hermes-theme')||'dark';if(t==='system')t=window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';var c=t==='dark'?'#0D0D1A':'#FEFCF7';document.querySelectorAll('meta[name="theme-color"]').forEach(function(m){m.setAttribute('content',c);m.removeAttribute('media');});}catch(e){}})()</script>
 <script>(function(){try{document.documentElement.dataset.workspacePanel=localStorage.getItem('hermes-webui-workspace-panel')==='open'?'open':'closed';}catch(e){document.documentElement.dataset.workspacePanel='closed';}})()</script>
+<script>(function(){
+  var isStandalone = window.navigator.standalone === true ||
+    (window.matchMedia && (window.matchMedia('(display-mode: standalone)').matches || window.matchMedia('(display-mode: fullscreen)').matches));
+  if (!isStandalone) return;
+  document.documentElement.dataset.pwaStandalone = 'true';
+  document.addEventListener('click', function(event) {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    var anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+    if (!anchor || anchor.hasAttribute('download')) return;
+    var href = anchor.getAttribute('href') || '';
+    if (!href || href.indexOf('#') === 0 || href.indexOf('mailto:') === 0 || href.indexOf('tel:') === 0 || href.indexOf('sms:') === 0) return;
+    var url;
+    try { url = new URL(href, window.location.href); } catch(e) { return; }
+    if (url.origin !== window.location.origin) return;
+    var target = (anchor.getAttribute('target') || '').toLowerCase();
+    if (!target || target === '_self') return;
+    anchor.setAttribute('target', '_self');
+    // iOS standalone PWAs can show Safari's top/bottom browser bars when a
+    // same-origin in-app link opens a new web view. Keep internal navigation
+    // inside the installed PWA window instead.
+    event.preventDefault();
+    window.location.assign(url.pathname + url.search + url.hash);
+  }, true);
+})()</script>
 <link rel="stylesheet" href="static/style.css?v=__WEBUI_VERSION__">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" integrity="sha384-LJcOxlx9IMbNXDqJ2axpfEQKkAYbFjJfhXexLfiRJhjDU81mzgkiQq8rkV0j6dVh" crossorigin="anonymous">
   <!-- KaTeX math rendering CSS (loaded eagerly to prevent layout shift) -->
