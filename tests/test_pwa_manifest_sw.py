@@ -262,6 +262,21 @@ class TestIndexHtmlIntegration:
                 "?v=__WEBUI_VERSION__ to match the URL the page requests"
             )
 
+    def test_sw_shell_assets_are_network_first(self):
+        """Shell JS/CSS must prefer the network, then fall back to CacheStorage.
+
+        Cache-first with an unchanged local dev version can keep stale boot.js
+        loaded after a hotfix, which is exactly how browser chrome/theme-color
+        regressions survive a patch until someone performs cache exorcism.
+        """
+        src = SW.read_text(encoding="utf-8")
+        marker = "// Shell assets: network-first with cache fallback"
+        assert marker in src
+        block = src[src.find(marker):src.find(marker) + 900]
+        assert "fetch(event.request).then" in block
+        assert "caches.match(event.request)" in block
+        assert "caches.match(event.request).then((cached)" not in block[:250]
+
     def test_index_route_url_encodes_asset_version(self):
         src = ROUTES.read_text(encoding="utf-8")
         idx = src.find('parsed.path in ("/", "/index.html")')

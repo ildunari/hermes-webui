@@ -12,6 +12,7 @@ let _kanbanLanesByProfile = false;
 let _kanbanCurrentBoard = null;
 let _kanbanBoardsList = null;
 let _kanbanBoardMenuOpen = false;
+let _kanbanIsDispatching = false;
 // SSE event stream — replaces the 30s polling cadence with a long-lived
 // /api/kanban/events/stream connection. Falls back to polling when the
 // EventSource fails to connect (proxy that strips text/event-stream, etc).
@@ -31,6 +32,7 @@ let _profilePreFormDetail = null;
 let _pendingSettingsTargetPanel = null; // destination selected while settings had unsaved changes
 let _logsAutoRefreshTimer = null;
 let _lastLogsLines = [];
+let _logsSeverityFilter = 'all';
 
 // Map of panel names → i18n keys for the app titlebar label.
 const APP_TITLEBAR_KEYS = {
@@ -182,6 +184,26 @@ function _consumeSettingsTargetPanel(fallback = 'chat') {
 async function switchPanel(name, opts = {}) {
   const nextPanel = name || 'chat';
   const prevPanel = _currentPanel;
+  // ── Desktop sidebar collapse toggle (rail-click only) ──
+  // If the click came from a rail icon AND we're on desktop, the rail icon
+  // does double duty: clicking the already-active panel collapses the sidebar;
+  // clicking any panel while collapsed expands first. Programmatic switches
+  // (no opts.fromRailClick) are unaffected so legacy callers preserve
+  // behaviour exactly.
+  if (opts.fromRailClick && typeof _isSidebarCollapsed === 'function'
+      && typeof _isDesktopWidth === 'function' && _isDesktopWidth()) {
+    if (_isSidebarCollapsed()) {
+      // Expand first, then continue to the normal panel switch below so
+      // the clicked panel becomes (or stays) active in the same gesture.
+      expandSidebar();
+    } else if (prevPanel === nextPanel) {
+      // Same panel clicked while sidebar is open → collapse and short-circuit.
+      // Skip the guard/cleanup work below; nothing about the active panel
+      // is changing, only the visibility of the panel container.
+      toggleSidebar(true);
+      return false;
+    }
+  }
   if (!opts.bypassSettingsGuard && !_beforePanelSwitch(nextPanel)) return false;
   if (prevPanel !== 'settings' && nextPanel === 'settings') _beginSettingsPanelSession();
   // Close any long-lived Kanban SSE stream when leaving the kanban panel
@@ -192,6 +214,8 @@ async function switchPanel(name, opts = {}) {
   _currentPanel = nextPanel;
   // Update nav tabs (rail + mobile sidebar-nav share data-panel)
   document.querySelectorAll('[data-panel]').forEach(t => t.classList.toggle('active', t.dataset.panel === nextPanel));
+  // Refresh aria-expanded on the newly-active rail button to mirror sidebar state.
+  if (typeof _syncSidebarAria === 'function') _syncSidebarAria();
   // Update panel views
   document.querySelectorAll('.panel-view').forEach(p => p.classList.remove('active'));
   const panelEl = $('panel' + nextPanel.charAt(0).toUpperCase() + nextPanel.slice(1));
@@ -228,6 +252,26 @@ async function switchPanel(name, opts = {}) {
 function _isRecurringCronJob(job) {
   const kind = job && job.schedule && job.schedule.kind;
   return kind === 'cron' || kind === 'interval';
+}
+
+function _cronScheduleKindForInput(value) {
+  const schedule = String(value || '').trim();
+  if (!schedule) return '';
+  const lower = schedule.toLowerCase();
+  if (lower.startsWith('every ')) return 'interval';
+  if (lower.startsWith('@')) return 'cron';
+  const parts = schedule.split(/\s+/);
+  if (parts.length >= 5 && parts.slice(0, 5).every(p => /^[\d*\-,/]+$/.test(p))) return 'cron';
+  if (schedule.includes('T') || /^\d{4}-\d{2}-\d{2}/.test(schedule)) return 'once';
+  if (/^\d+\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/i.test(schedule)) return 'once';
+  return '';
+}
+
+function _syncCronScheduleWarning() {
+  const input = $('cronFormSchedule');
+  const warning = $('cronFormScheduleOnceWarning');
+  if (!input || !warning) return;
+  warning.style.display = _cronScheduleKindForInput(input.value) === 'once' ? '' : 'none';
 }
 
 function _hasUnlimitedRepeat(job) {
@@ -721,6 +765,7 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, no_agent=fa
           <label for="cronFormSchedule">${esc(t('cron_schedule_label') || 'Schedule')}</label>
           <input type="text" id="cronFormSchedule" value="${esc(schedule || '')}" placeholder="0 9 * * *  —  every 1h  —  @daily" autocomplete="off" required>
           <div class="detail-form-hint">${esc(t('cron_schedule_hint') || "Cron expression or shorthand like 'every 1h'.")}</div>
+          <div id="cronFormScheduleOnceWarning" class="detail-form-warning cron-once-warning" style="display:none">${esc(t('cron_schedule_once_warning') || "Duration forms like '30m' run once and are removed after running. Use 'every 30m' to keep a recurring job.")}</div>
         </div>
         <div class="detail-form-row ${isNoAgent ? 'cron-no-agent-prompt-row' : ''}">
           <label for="cronFormPrompt">${esc(t('cron_prompt_label') || 'Prompt')}</label>
@@ -733,6 +778,7 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, no_agent=fa
             ${deliverOpt('local', t('cron_deliver_local') || 'Local (save output only)')}
             ${deliverOpt('discord','Discord')}
             ${deliverOpt('telegram','Telegram')}
+            ${deliverOpt('slack','Slack')}
           </select>
         </div>
         <div class="detail-form-row">
@@ -758,6 +804,12 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, no_agent=fa
   if (empty) empty.style.display = 'none';
   _setCronHeaderButtons(isEdit ? 'edit' : 'create');
   _renderCronSkillTags();
+  const scheduleEl = $('cronFormSchedule');
+  if (scheduleEl) {
+    scheduleEl.addEventListener('input', _syncCronScheduleWarning);
+    scheduleEl.addEventListener('change', _syncCronScheduleWarning);
+    _syncCronScheduleWarning();
+  }
   const focusEl = $('cronFormName');
   if (focusEl) focusEl.focus();
 }
@@ -1424,12 +1476,97 @@ function _kanbanBoardQuery(extra){
 }
 
 async function nudgeKanbanDispatcher(){
+  if (_kanbanIsDispatching) return;
+  // Dry-run dispatch: show what WOULD be spawned, without actually spawning
+  // workers.  Uses ?dry_run=1 so the dispatcher reports its plan without
+  // mutating the board.  The result shape includes spawned/skipped_unassigned/
+  // skipped_nonspawnable/promoted/auto_blocked so users can diagnose why a
+  // Ready task isn't being picked up before they commit to a real run.
+  _kanbanIsDispatching = true;
+  _setKanbanDispatcherButtonsDisabled(true);
   try {
     const dispatchEndpoint = '/api/kanban/dispatch';
-    await api(dispatchEndpoint + '?dry_run=1&max=1' + (_kanbanCurrentBoard ? '&board=' + encodeURIComponent(_kanbanCurrentBoard) : ''), {method: 'POST'});
-    showToast(t('kanban_nudge_dispatcher'));
+    const result = await api(
+      dispatchEndpoint + '?dry_run=1&max=8' + (_kanbanCurrentBoard ? '&board=' + encodeURIComponent(_kanbanCurrentBoard) : ''),
+      {method: 'POST'},
+    );
+    showToast(_kanbanFormatDispatchResult(result, true), 'info', 6000);
     await loadKanban(true);
-  } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
+  } catch(e) {
+    showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error');
+  } finally {
+    _kanbanIsDispatching = false;
+    _setKanbanDispatcherButtonsDisabled(false);
+  }
+}
+
+async function runKanbanDispatcher(){
+  if (_kanbanIsDispatching) return;
+  // Real dispatch: claims Ready tasks and spawns worker subprocesses
+  // (one `hermes -p <assignee>` per claimed row, up to max=8 per call).
+  // Confirmation dialog first because this actually consumes API budget on
+  // each spawned worker.  Result toast surfaces what happened so users see
+  // the dispatcher actually doing work.
+  if (!_kanbanCurrentBoard) {
+    showToast(t('kanban_unavailable') || 'Kanban unavailable', 'error');
+    return;
+  }
+
+  _kanbanIsDispatching = true;
+  _setKanbanDispatcherButtonsDisabled(true);
+  try {
+    const ok = await showConfirmDialog({
+      title: t('kanban_run_dispatcher') || 'Run dispatcher',
+      message: t('kanban_run_dispatcher_confirm')
+        || 'This will claim Ready tasks on this board and spawn worker subprocesses (one per task, up to 8 per click). Continue?',
+      confirmLabel: t('kanban_run_dispatcher') || 'Run dispatcher',
+    });
+    if (!ok) return;
+    const dispatchEndpoint = '/api/kanban/dispatch';
+    const result = await api(
+      dispatchEndpoint + '?max=8' + (_kanbanCurrentBoard ? '&board=' + encodeURIComponent(_kanbanCurrentBoard) : ''),
+      {method: 'POST'},
+    );
+    showToast(_kanbanFormatDispatchResult(result, false), 'info', 8000);
+    await loadKanban(true);
+  } catch(e) {
+    showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error');
+  } finally {
+    _kanbanIsDispatching = false;
+    _setKanbanDispatcherButtonsDisabled(false);
+  }
+}
+
+function _setKanbanDispatcherButtonsDisabled(disabled){
+  document.querySelectorAll('.kanban-run-dispatch-btn, .kanban-nudge-dispatch-btn').forEach((btn) => {
+    btn.disabled = !!disabled;
+    btn.classList.toggle('disabled', !!disabled);
+  });
+}
+
+function _kanbanFormatDispatchResult(result, dryRun){
+  // Produce a human-readable one-line summary of dispatch_once's output so
+  // users can see exactly what happened rather than a generic "OK" toast.
+  const r = result || {};
+  const spawned = (r.spawned || []).length;
+  const promoted = r.promoted || 0;
+  const reclaimed = r.reclaimed || 0;
+  const skippedUnassigned = (r.skipped_unassigned || []).length;
+  const skippedNonspawnable = (r.skipped_nonspawnable || []).length;
+  const autoBlocked = (r.auto_blocked || []).length;
+  const timedOut = (r.timed_out || []).length;
+  const crashed = (r.crashed || []).length;
+  const verb = dryRun ? (t('kanban_dispatch_preview_prefix') || 'Preview:') : (t('kanban_dispatch_run_prefix') || 'Dispatched:');
+  const parts = [];
+  parts.push(spawned + ' ' + (t('kanban_dispatch_spawned') || 'spawned'));
+  if (promoted) parts.push(promoted + ' ' + (t('kanban_dispatch_promoted') || 'promoted'));
+  if (reclaimed) parts.push(reclaimed + ' ' + (t('kanban_dispatch_reclaimed') || 'reclaimed'));
+  if (skippedUnassigned) parts.push(skippedUnassigned + ' ' + (t('kanban_dispatch_skipped_unassigned') || 'skipped (no assignee)'));
+  if (skippedNonspawnable) parts.push(skippedNonspawnable + ' ' + (t('kanban_dispatch_skipped_nonspawnable') || 'skipped (unknown profile)'));
+  if (autoBlocked) parts.push(autoBlocked + ' ' + (t('kanban_dispatch_auto_blocked') || 'auto-blocked'));
+  if (timedOut) parts.push(timedOut + ' ' + (t('kanban_dispatch_timed_out') || 'timed out'));
+  if (crashed) parts.push(crashed + ' ' + (t('kanban_dispatch_crashed') || 'crashed'));
+  return verb + ' ' + parts.join(', ');
 }
 
 function _kanbanSelectedTaskIds(){
@@ -1566,7 +1703,14 @@ function _kanbanLinksHtml(links){
 async function createKanbanTask(){
   const input = document.getElementById('kanbanNewTaskTitle');
   const title = input ? input.value.trim() : '';
-  if (!title) return;
+  if (!title) {
+    // Empty inline input (or a click on the panel-head "+" via openKanbanCreate)
+    // — open the full create-task modal so the user has somewhere obvious to
+    // type and configure the task. Mirrors the cron / skills pattern of routing
+    // header "+" clicks through to a clearly-modal create surface.
+    openKanbanCreate();
+    return;
+  }
   try {
     const created = await api('/api/kanban/tasks' + _kanbanBoardQuery(), {
       method: 'POST',
@@ -1576,6 +1720,447 @@ async function createKanbanTask(){
     await loadKanban(true);
     if (created && created.task && created.task.id) await loadKanbanTask(created.task.id);
   } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Kanban: create-task modal (panel-head "+" button entry point).
+//
+// Same `.kanban-modal-overlay` shell as openKanbanCreateBoard() so the two
+// flows look and behave identically (centered card, dim backdrop, ESC closes,
+// click-on-backdrop closes). The modal markup lives in static/index.html as
+// #kanbanTaskModal — see the section just above </body>. Submit hits the
+// existing /api/kanban/tasks POST endpoint (which already accepts title, body,
+// assignee, tenant, priority, status — see api/kanban_bridge.py:306).
+// ────────────────────────────────────────────────────────────────────────────
+
+// ────────────────────────────────────────────────────────────────────────────
+// Kanban: create-task / edit-task modal (panel-head "+" + task-detail Edit
+// button entry points).
+//
+// Single modal serves both flows.  Title + submit-button labels and the
+// underlying submit verb (POST vs PATCH) flip based on `_kanbanTaskModalMode`.
+//
+// Same `.kanban-modal-overlay` shell as openKanbanCreateBoard() so the two
+// flows look and behave identically (centered card, dim backdrop, ESC closes,
+// click-on-backdrop closes). The modal markup lives in static/index.html as
+// #kanbanTaskModal — see the section just above </body>.
+//
+// The assignee field auto-completes against the union of (a) live Hermes
+// profile names from /api/profiles and (b) historical assignees on the
+// active board, with an inline hint that explains the dispatcher claim
+// contract — most users will pick a profile name from the dropdown rather
+// than type one.
+// ────────────────────────────────────────────────────────────────────────────
+
+let _kanbanTaskModalMode = 'create';   // 'create' | 'edit'
+let _kanbanTaskModalEditingId = null;  // task id when mode === 'edit'
+let _kanbanProfileNamesCache = null;   // populated lazily on first modal open
+let _kanbanProfileNamesCacheAt = 0;
+const _KANBAN_PROFILE_NAMES_CACHE_TTL_MS = 30000;
+function _invalidateKanbanProfileCache() {
+  _kanbanProfileNamesCache = null;
+  _kanbanProfileNamesCacheAt = 0;
+}
+let _kanbanTaskModalFocusCleanup = null;
+// Status the modal *displayed* on edit-mode open.  If the user doesn't touch
+// the dropdown, we must NOT send `status` in the PATCH payload — otherwise
+// editing a task whose real status is non-editable in this dropdown
+// (running/blocked/done/archived → mapped to 'triage' for display) would
+// silently demote the task on save.  See the regression caught during PR
+// review: editing a 'running' task without touching status was reclaiming
+// the worker and moving the task back to triage.
+let _kanbanTaskModalInitialDisplayedStatus = null;
+let _kanbanBoardModalFocusCleanup = null;
+
+async function _kanbanLoadProfileNames(){
+  // Hit /api/profiles once per session and cache for a short TTL.
+  // Returns an array of profile names (sorted, default first if present).
+  const hasFreshCache = (
+    Array.isArray(_kanbanProfileNamesCache) &&
+    (Date.now() - _kanbanProfileNamesCacheAt) < _KANBAN_PROFILE_NAMES_CACHE_TTL_MS
+  );
+  if (hasFreshCache) return _kanbanProfileNamesCache;
+  try {
+    const data = await api('/api/profiles');
+    const profiles = Array.isArray(data && data.profiles) ? data.profiles : [];
+    const names = profiles.map(p => p && p.name).filter(Boolean);
+    // Stable order: default first, then alphabetical.
+    names.sort((a, b) => {
+      if (a === 'default') return -1;
+      if (b === 'default') return 1;
+      return a.localeCompare(b);
+    });
+    _kanbanProfileNamesCache = names;
+    _kanbanProfileNamesCacheAt = Date.now();
+    return names;
+  } catch(_) {
+    _kanbanProfileNamesCache = [];
+    _kanbanProfileNamesCacheAt = Date.now();
+    return [];
+  }
+}
+
+async function _kanbanPopulateAssigneeSelect(currentValue){
+  const sel = document.getElementById('kanbanTaskModalAssignee');
+  if (!sel) return;
+  // Profile names: the canonical set the dispatcher can claim.
+  const profileNames = await _kanbanLoadProfileNames();
+  // Historical assignees from the active board: include them so users who
+  // assigned to a CLI lane (e.g. orion-cc) before still see those values.
+  const historicalAssignees = (_kanbanBoard && Array.isArray(_kanbanBoard.assignees))
+    ? _kanbanBoard.assignees
+    : [];
+  // Build a final ordered list, deduping.  Profiles come first, then any
+  // historical assignees that aren't profiles (rare but keeps round-tripping
+  // correct for tasks created via CLI).
+  const seen = new Set();
+  const profiles = [];
+  for (const name of profileNames) {
+    if (!seen.has(name)) { profiles.push(name); seen.add(name); }
+  }
+  const extras = [];
+  for (const name of historicalAssignees) {
+    if (name && !seen.has(name)) { extras.push(name); seen.add(name); }
+  }
+  // If the current value isn't in either bucket (e.g. an old CLI-created
+  // assignee that's since been deleted), preserve it as a final option so
+  // editing the task doesn't silently change its assignee.
+  if (currentValue && !seen.has(currentValue)) {
+    extras.push(currentValue);
+    seen.add(currentValue);
+  }
+  // The empty value maps to null on submit (intentionally unassigned).  Keep
+  // it last so the default-selected option is the first profile, not "no one".
+  let html = '';
+  if (profiles.length) {
+    html += `<optgroup label="${esc(t('kanban_assignee_profiles_label') || 'Hermes profiles')}">`;
+    html += profiles.map(v => `<option value="${esc(v)}"${v === currentValue ? ' selected' : ''}>${esc(v)}</option>`).join('');
+    html += '</optgroup>';
+  }
+  if (extras.length) {
+    html += `<optgroup label="${esc(t('kanban_assignee_other_label') || 'Other (CLI lanes / removed profiles)')}">`;
+    html += extras.map(v => `<option value="${esc(v)}"${v === currentValue ? ' selected' : ''}>${esc(v)}</option>`).join('');
+    html += '</optgroup>';
+  }
+  // Final "no assignee" fallthrough — explicit so users know what they're choosing.
+  html += `<option value=""${(!currentValue) ? ' selected' : ''}>${esc(t('kanban_assignee_unassigned') || '— Unassigned (won\u2019t auto-run) —')}</option>`;
+  sel.innerHTML = html;
+}
+
+function openKanbanCreate(){
+  // Make sure the user is on the kanban panel so the resulting board reload is
+  // visible behind the modal.
+  if (typeof switchPanel === 'function' && _currentPanel !== 'kanban') switchPanel('kanban');
+  const modal = document.getElementById('kanbanTaskModal');
+  if (!modal) return;
+  _kanbanTaskModalMode = 'create';
+  _kanbanTaskModalEditingId = null;
+  _kanbanTaskModalInitialDisplayedStatus = null;  // create mode: always send status
+  // Default new tasks to "ready" so they're immediately claimable by the
+  // dispatcher (assuming the user picks an assignee).  Triage is for staging
+  // tasks that need human review before being marked actionable; users who
+  // want it can still pick it from the status dropdown.
+  _kanbanResetTaskModalFields({status: 'ready'});
+  _kanbanSetTaskModalStatusHint(null);
+  _kanbanSetTaskModalLabels('create');
+  _kanbanPopulateAssigneeSelect('').then(() => {
+    // After the dropdown is populated, default-select the first profile (not
+    // the "Unassigned" fallthrough).  This is the right hint: most users want
+    // to assign to *something* — they can pick "Unassigned" deliberately.
+    const sel = document.getElementById('kanbanTaskModalAssignee');
+    if (sel && sel.options.length > 0 && sel.value === '') {
+      const firstProfile = Array.from(sel.options).find(opt => opt.value !== '');
+      if (firstProfile) sel.value = firstProfile.value;
+    }
+  });
+  _kanbanPopulateTenantDatalist();
+  modal.hidden = false;
+  if (_kanbanTaskModalFocusCleanup) {
+    _kanbanTaskModalFocusCleanup();
+    _kanbanTaskModalFocusCleanup = null;
+  }
+  _kanbanTaskModalFocusCleanup = _trapModalFocus(modal);
+  setTimeout(() => {
+    const titleEl = document.getElementById('kanbanTaskModalTitleInput');
+    if (titleEl) titleEl.focus();
+  }, 50);
+  document.addEventListener('keydown', _kanbanTaskModalKey);
+}
+
+async function openKanbanEdit(taskId){
+  // Triggered by the Edit button on the task detail view.  Fetches the task
+  // (rather than relying on whatever's cached locally) so the modal always
+  // reflects authoritative server state.
+  if (!taskId) return;
+  if (typeof switchPanel === 'function' && _currentPanel !== 'kanban') switchPanel('kanban');
+  const modal = document.getElementById('kanbanTaskModal');
+  if (!modal) return;
+  let task = null;
+  try {
+    const data = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + _kanbanBoardQuery());
+    task = data && data.task;
+  } catch(e) {
+    showToast((t('kanban_unavailable') || 'Kanban unavailable') + ': ' + (e.message || e), 'error');
+    return;
+  }
+  if (!task) return;
+  _kanbanTaskModalMode = 'edit';
+  _kanbanTaskModalEditingId = task.id;
+  // Track the displayed status so submitKanbanTaskModal can detect whether
+  // the user actually picked a new value vs. the dropdown's mapped default.
+  // Without this, editing a 'running'/'blocked'/'done'/'archived' task whose
+  // real status maps to 'triage' for display would silently demote the task
+  // (the mapped 'triage' would land in the PATCH payload, and _patch_task
+  // would call _set_status_direct → reclaim worker → move to triage).
+  const initialDisplayedStatus = _kanbanEditableStatusFor(task.status);
+  const originalStatus = task.status || initialDisplayedStatus;
+  _kanbanTaskModalInitialDisplayedStatus = initialDisplayedStatus;
+  _kanbanResetTaskModalFields({
+    title: task.title || '',
+    body: task.body || '',
+    status: initialDisplayedStatus,
+    tenant: task.tenant || '',
+    priority: typeof task.priority === 'number' ? task.priority : 0,
+  });
+  // Populate the assignee select AFTER reset so the option exists when we
+  // call sel.value = currentAssignee.
+  await _kanbanPopulateAssigneeSelect(task.assignee || '');
+  _kanbanSetTaskModalStatusHint(originalStatus, initialDisplayedStatus);
+  _kanbanSetTaskModalLabels('edit');
+  _kanbanPopulateTenantDatalist();
+  modal.hidden = false;
+  if (_kanbanTaskModalFocusCleanup) {
+    _kanbanTaskModalFocusCleanup();
+    _kanbanTaskModalFocusCleanup = null;
+  }
+  _kanbanTaskModalFocusCleanup = _trapModalFocus(modal);
+  setTimeout(() => {
+    const titleEl = document.getElementById('kanbanTaskModalTitleInput');
+    if (titleEl) { titleEl.focus(); titleEl.select(); }
+  }, 50);
+  document.addEventListener('keydown', _kanbanTaskModalKey);
+}
+
+function _kanbanEditableStatusFor(status){
+  // The modal's status select only offers triage/todo/ready (the user-writable
+  // states).  blocked/running/done/archived are reached via the detail-view
+  // status buttons or the dispatcher.  Map non-editable states to a sensible
+  // default so the user can still change them via the buttons after saving.
+  const editable = new Set(['triage', 'todo', 'ready']);
+  return editable.has(status) ? status : 'triage';
+}
+
+function _kanbanResetTaskModalFields(values){
+  const v = values || {};
+  const set = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.value = (val == null ? '' : String(val));
+  };
+  set('kanbanTaskModalTitleInput', v.title || '');
+  set('kanbanTaskModalBody', v.body || '');
+  set('kanbanTaskModalStatus', v.status || 'triage');
+  // Assignee handled separately by _kanbanPopulateAssigneeSelect() because
+  // it's a <select> populated from /api/profiles + board history; setting
+  // .value before the options exist would silently fail.
+  set('kanbanTaskModalTenant', v.tenant || '');
+  set('kanbanTaskModalPriority', v.priority != null ? v.priority : 0);
+  const errEl = document.getElementById('kanbanTaskModalError');
+  if (errEl) { errEl.textContent = ''; delete errEl.dataset.warningShown; }
+  const submitBtn = document.getElementById('kanbanTaskModalSubmit');
+  if (submitBtn) submitBtn.disabled = false;
+}
+
+function _kanbanSetTaskModalLabels(mode){
+  const titleH = document.getElementById('kanbanTaskModalTitle');
+  const submitBtn = document.getElementById('kanbanTaskModalSubmit');
+  if (mode === 'edit') {
+    if (titleH) titleH.textContent = t('kanban_edit_task') || 'Edit task';
+    if (submitBtn) submitBtn.textContent = t('save') || 'Save';
+  } else {
+    if (titleH) titleH.textContent = t('kanban_new_task') || 'New task';
+    if (submitBtn) submitBtn.textContent = t('create') || 'Create';
+  }
+}
+
+function _kanbanSetTaskModalStatusHint(realStatus, editableStatus){
+  const hintEl = document.getElementById('kanbanTaskModalStatusOriginalHint');
+  if (!hintEl) return;
+  if (!realStatus || realStatus === editableStatus) {
+    hintEl.hidden = true;
+    hintEl.textContent = '';
+    return;
+  }
+  const statusLabel = t(`kanban_status_${realStatus}`) || realStatus;
+  hintEl.textContent = String(t('kanban_status_original_hint')).replace('{0}', statusLabel);
+  hintEl.hidden = false;
+}
+
+function _kanbanPopulateTenantDatalist(){
+  const tenants = (_kanbanBoard && Array.isArray(_kanbanBoard.tenants)) ? _kanbanBoard.tenants : [];
+  const tList = document.getElementById('kanbanTaskModalTenantList');
+  if (tList) tList.innerHTML = tenants.map(v => `<option value="${esc(v)}"></option>`).join('');
+}
+
+function _trapModalFocus(modalEl){
+  if (!modalEl) return () => {};
+  const selector = 'a[href], button, textarea, input, select, summary, [tabindex]:not([tabindex="-1"])';
+  const collect = () => {
+    const candidates = Array.from(modalEl.querySelectorAll(selector));
+    return candidates.filter((el) => {
+      if (el.disabled || el.hidden) return false;
+      const style = getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      return el.tabIndex >= 0;
+    });
+  };
+  let focusableEls = collect();
+  const onKeyDown = (ev) => {
+    if (ev.key !== 'Tab') return;
+    if (!focusableEls.length) {
+      ev.preventDefault();
+      return;
+    }
+    const current = document.activeElement;
+    let idx = focusableEls.indexOf(current);
+    if (idx === -1) {
+      ev.preventDefault();
+      focusableEls[0].focus();
+      return;
+    }
+    if (ev.shiftKey) idx -= 1;
+    else idx += 1;
+    idx = (idx + focusableEls.length) % focusableEls.length;
+    ev.preventDefault();
+    focusableEls[idx].focus();
+  };
+  modalEl.addEventListener('keydown', onKeyDown);
+  return () => {
+    modalEl.removeEventListener('keydown', onKeyDown);
+  };
+}
+
+function closeKanbanTaskModal(){
+  const modal = document.getElementById('kanbanTaskModal');
+  if (modal) modal.hidden = true;
+  _kanbanTaskModalMode = 'create';
+  _kanbanTaskModalEditingId = null;
+  _kanbanTaskModalInitialDisplayedStatus = null;
+  _kanbanSetTaskModalStatusHint(null, null);
+  if (_kanbanTaskModalFocusCleanup) {
+    _kanbanTaskModalFocusCleanup();
+    _kanbanTaskModalFocusCleanup = null;
+  }
+  document.removeEventListener('keydown', _kanbanTaskModalKey);
+}
+
+function _kanbanTaskModalKey(ev){
+  if (ev.key === 'Escape') {
+    ev.preventDefault();
+    closeKanbanTaskModal();
+    return;
+  }
+  if (ev.key === 'Enter' && !ev.shiftKey) {
+    // Enter submits except when the focus is in the description textarea
+    // (where Enter should insert a newline).
+    const target = ev.target;
+    if (target && target.tagName === 'TEXTAREA') return;
+    const modal = document.getElementById('kanbanTaskModal');
+    if (modal && !modal.hidden) {
+      ev.preventDefault();
+      submitKanbanTaskModal();
+    }
+  }
+}
+
+async function submitKanbanTaskModal(){
+  const titleEl = document.getElementById('kanbanTaskModalTitleInput');
+  const bodyEl = document.getElementById('kanbanTaskModalBody');
+  const statusEl = document.getElementById('kanbanTaskModalStatus');
+  const assigneeEl = document.getElementById('kanbanTaskModalAssignee');
+  const tenantEl = document.getElementById('kanbanTaskModalTenant');
+  const priorityEl = document.getElementById('kanbanTaskModalPriority');
+  const errEl = document.getElementById('kanbanTaskModalError');
+  const submitBtn = document.getElementById('kanbanTaskModalSubmit');
+  const title = titleEl ? titleEl.value.trim() : '';
+  if (!title) {
+    if (errEl) errEl.textContent = t('kanban_title_required') || 'Title is required.';
+    if (titleEl) titleEl.focus();
+    return;
+  }
+  // Build payload — for create we omit defaulted fields so the backend chooses;
+  // for edit we send every field so users can clear assignee/tenant/body.
+  const isEdit = _kanbanTaskModalMode === 'edit';
+  const payload = {title};
+  const bodyVal = bodyEl ? bodyEl.value : '';
+  const assigneeVal = assigneeEl ? assigneeEl.value.trim() : '';
+  const tenantVal = tenantEl ? tenantEl.value.trim() : '';
+  const statusVal = statusEl ? statusEl.value : '';
+  const priorityRaw = priorityEl ? priorityEl.value : '';
+  if (isEdit) {
+    payload.body = bodyVal;
+    payload.assignee = assigneeVal || null;
+    payload.tenant = tenantVal || null;
+    // Only send status if the user actually changed the dropdown from the
+    // value the modal opened with.  Otherwise editing a 'running'/'blocked'/
+    // 'done'/'archived' task — whose real status maps to the dropdown's
+    // 'triage' default — would silently demote the task on every save.
+    if (statusVal && statusVal !== _kanbanTaskModalInitialDisplayedStatus) {
+      payload.status = statusVal;
+    }
+    const n = parseInt(priorityRaw, 10);
+    payload.priority = Number.isNaN(n) ? 0 : n;
+  } else {
+    if (bodyVal.trim()) payload.body = bodyVal;
+    if (statusVal) payload.status = statusVal;
+    if (assigneeVal) payload.assignee = assigneeVal;
+    if (tenantVal) payload.tenant = tenantVal;
+    if (priorityRaw !== '' && priorityRaw !== '0') {
+      const n = parseInt(priorityRaw, 10);
+      if (!Number.isNaN(n)) payload.priority = n;
+    }
+  }
+  // Soft warning: a Ready task with the explicit "Unassigned" option will sit
+  // forever because the dispatcher skips unassigned rows (kanban_db.py:3567).
+  // The dropdown now makes this an explicit choice (the user picked "—
+  // Unassigned (won't auto-run) —"), but we still surface a one-time confirm
+  // so they don't lose work to a typo.
+  if (statusVal === 'ready' && !assigneeVal) {
+    if (errEl && !errEl.dataset.warningShown) {
+      errEl.textContent = t('kanban_ready_needs_assignee')
+        || 'You picked Unassigned + Ready. The dispatcher will skip this task. Submit again to confirm, or pick a profile.';
+      errEl.dataset.warningShown = '1';
+      const sel = document.getElementById('kanbanTaskModalAssignee');
+      if (sel) sel.focus();
+      return;
+    }
+  }
+  if (submitBtn) submitBtn.disabled = true;
+  if (errEl) { errEl.textContent = ''; delete errEl.dataset.warningShown; }
+  try {
+    let saved;
+    if (isEdit && _kanbanTaskModalEditingId) {
+      saved = await api(
+        '/api/kanban/tasks/' + encodeURIComponent(_kanbanTaskModalEditingId) + _kanbanBoardQuery(),
+        {method: 'PATCH', body: JSON.stringify(payload)},
+      );
+    } else {
+      saved = await api('/api/kanban/tasks' + _kanbanBoardQuery(), {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+    }
+    closeKanbanTaskModal();
+    await loadKanban(true);
+    const savedId = saved && saved.task && saved.task.id;
+    if (savedId) {
+      await loadKanbanTask(savedId);
+    } else if (isEdit && _kanbanTaskModalEditingId) {
+      await loadKanbanTask(_kanbanTaskModalEditingId);
+    }
+  } catch(e) {
+    if (errEl) errEl.textContent = (e.message || String(e));
+    if (submitBtn) submitBtn.disabled = false;
+  }
 }
 
 async function updateKanbanTask(taskId, patch){
@@ -1625,6 +2210,7 @@ function _kanbanRenderTaskDetail(data){
   return `<div class="kanban-task-preview-header">
       <button class="btn secondary kanban-back-btn" onclick="closeKanbanTaskDetail()">${esc(t('kanban_back_to_board'))}</button>
       <div class="kanban-task-preview-title">${esc(title)}</div>
+      <button class="btn secondary kanban-edit-btn" onclick="openKanbanEdit('${esc(task.id)}')" data-i18n="kanban_edit_task" title="${esc(t('kanban_edit_task') || 'Edit task')}">${esc(t('kanban_edit_task') || 'Edit task')}</button>
     </div>
     <div class="kanban-task-preview-body">${esc(body)}</div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
@@ -1902,6 +2488,11 @@ function openKanbanCreateBoard(){
   document.getElementById('kanbanBoardModalColor').value = '#7aa2ff';
   document.getElementById('kanbanBoardModalError').textContent = '';
   modal.hidden = false;
+  if (_kanbanBoardModalFocusCleanup) {
+    _kanbanBoardModalFocusCleanup();
+    _kanbanBoardModalFocusCleanup = null;
+  }
+  _kanbanBoardModalFocusCleanup = _trapModalFocus(modal);
   // Auto-focus name field
   setTimeout(() => document.getElementById('kanbanBoardModalName').focus(), 50);
   // Auto-suggest slug from name as user types
@@ -1941,6 +2532,11 @@ function openKanbanRenameBoard(){
   document.getElementById('kanbanBoardModalColor').value = meta.color || '#7aa2ff';
   document.getElementById('kanbanBoardModalError').textContent = '';
   modal.hidden = false;
+  if (_kanbanBoardModalFocusCleanup) {
+    _kanbanBoardModalFocusCleanup();
+    _kanbanBoardModalFocusCleanup = null;
+  }
+  _kanbanBoardModalFocusCleanup = _trapModalFocus(modal);
   setTimeout(() => document.getElementById('kanbanBoardModalName').focus(), 50);
   document.addEventListener('keydown', _kanbanBoardModalEsc);
 }
@@ -1952,6 +2548,10 @@ function _kanbanBoardModalEsc(ev){
 function closeKanbanBoardModal(){
   const modal = document.getElementById('kanbanBoardModal');
   if (modal) modal.hidden = true;
+  if (_kanbanBoardModalFocusCleanup) {
+    _kanbanBoardModalFocusCleanup();
+    _kanbanBoardModalFocusCleanup = null;
+  }
   document.removeEventListener('keydown', _kanbanBoardModalEsc);
 }
 
@@ -2064,6 +2664,32 @@ function _selectedLogsTail() {
   return [100,200,500,1000].includes(value) ? value : 200;
 }
 
+function _severityForLine(line) {
+  const text = String(line || '').toUpperCase();
+  if (/\b(ERROR|CRITICAL|TRACEBACK)\b/.test(text)) return 'error';
+  if (/\b(WARNING|WARN)\b/.test(text)) return 'warning';
+  if (/\b(DEBUG)\b/.test(text)) return 'debug';
+  if (/\b(INFO)\b/.test(text)) return 'info';
+  return 'other';
+}
+
+function _filteredLogsLines() {
+  if (_logsSeverityFilter === 'all') return _lastLogsLines;
+  return _lastLogsLines.filter(line => {
+    const sev = _severityForLine(line);
+    if (_logsSeverityFilter === 'errors') return sev === 'error';
+    if (_logsSeverityFilter === 'warnings') return sev === 'warning' || sev === 'error';
+    return true;
+  });
+}
+
+function _applyLogsSeverityFilter() {
+  const el = $('logsSeverityFilter');
+  _logsSeverityFilter = (el && el.value) || 'all';
+  // Re-render from cached lines without re-fetching
+  _renderLogs({ lines: _lastLogsLines, hint: '', truncated: false, _fromFilter: true });
+}
+
 function _logLineSeverityClass(line) {
   const text = String(line || '').toUpperCase();
   if (/\b(WARNING|WARN)\b/.test(text)) return 'log-line-warning';
@@ -2111,14 +2737,19 @@ function _renderLogs(data) {
   const box = $('logsOutput');
   const status = $('logsStatus');
   if (!box) return;
-  const lines = Array.isArray(data && data.lines) ? data.lines : [];
-  _lastLogsLines = lines.slice();
+  const rawLines = Array.isArray(data && data.lines) ? data.lines : [];
+  // Only update cache when loading fresh data (not when re-rendering from filter)
+  if (data && !data._fromFilter) _lastLogsLines = rawLines.slice();
+  const displayLines = _filteredLogsLines();
   const hint = data && data.hint ? `<div class="logs-hint">${esc(data.hint)}</div>` : '';
   const truncated = data && data.truncated ? `<div class="logs-hint warn">${esc(t('logs_truncated_hint'))}</div>` : '';
-  if (!lines.length) {
-    box.innerHTML = `${hint}${truncated}<div class="logs-empty">${esc(t('logs_empty'))}</div>`;
+  const filterNote = _logsSeverityFilter !== 'all'
+    ? `<div class="logs-hint">${esc(displayLines.length + ' / ' + _lastLogsLines.length + ' ' + t('logs_filter_active'))}</div>`
+    : '';
+  if (!displayLines.length) {
+    box.innerHTML = `${hint}${truncated}${filterNote}<div class="logs-empty">${esc(t('logs_empty'))}</div>`;
   } else {
-    box.innerHTML = `${hint}${truncated}` + lines.map(line => {
+    box.innerHTML = `${hint}${truncated}${filterNote}` + displayLines.map(line => {
       const cls = _logLineSeverityClass(line);
       return `<div class="log-line ${cls}">${esc(line)}</div>`;
     }).join('');
@@ -2127,7 +2758,7 @@ function _renderLogs(data) {
   if (status) {
     const bytes = data && Number(data.total_bytes || 0);
     const when = data && data.mtime ? new Date(data.mtime * 1000).toLocaleString() : t('logs_no_mtime');
-    status.textContent = `${lines.length} / ${data.tail || _selectedLogsTail()} lines · ${bytes.toLocaleString()} bytes · ${when}`;
+    status.textContent = `${rawLines.length} / ${data.tail || _selectedLogsTail()} lines · ${bytes.toLocaleString()} bytes · ${when}`;
   }
 }
 
@@ -2155,9 +2786,10 @@ function _syncLogsAutoRefresh() {
 }
 
 async function copyLogsAll() {
-  const text = _lastLogsLines.join('\n');
+  const lines = _filteredLogsLines();
+  const text = lines.join('\n');
   try {
-    await navigator.clipboard.writeText(text);
+    await _copyText(text);
     showToast(t('logs_copied'));
   } catch(e) {
     showToast(t('copy_failed'), 'error');
@@ -3097,6 +3729,24 @@ function renderWorkspaceDropdownInto(dd, workspaces, currentWs){
   // ── Footer actions ────────────────────────────────────────────────────────
   dd.appendChild(document.createElement('div')).className='ws-divider';
   dd.appendChild(_renderWorkspaceAction(
+    t('workspace_new_worktree_conversation'),
+    t('workspace_new_worktree_conversation_meta'),
+    li('git-branch',12),
+    async()=>{
+      closeWsDropdown();
+      try{
+        await newSession(false,{worktree:true});
+        await renderSessionList();
+        const msg=$('msg');
+        if(msg)msg.focus();
+        showToast(t('workspace_worktree_created'));
+      }catch(e){
+        showToast(t('workspace_worktree_failed')+(e&&e.message?e.message:e),'error');
+      }
+    }
+  ));
+  dd.appendChild(document.createElement('div')).className='ws-divider';
+  dd.appendChild(_renderWorkspaceAction(
     t('workspace_choose_path'),
     t('workspace_choose_path_meta'),
     li('folder',12),
@@ -3757,6 +4407,7 @@ async function deleteCurrentProfile(){
   if(!_ok) return;
   try {
     await api('/api/profile/delete', { method: 'POST', body: JSON.stringify({ name }) });
+    _invalidateKanbanProfileCache();
     _clearProfileDetail();
     await loadProfilesPanel();
     showToast(t('profile_deleted', name));
@@ -4034,6 +4685,7 @@ async function saveProfileForm(){
     if (baseUrl) payload.base_url = baseUrl;
     if (apiKey) payload.api_key = apiKey;
     await api('/api/profile/create', { method: 'POST', body: JSON.stringify(payload) });
+    _invalidateKanbanProfileCache();
     _profilePreFormDetail = null;
     await loadProfilesPanel();
     showToast(t('profile_created', name));
@@ -4054,6 +4706,7 @@ async function deleteProfile(name) {
   if(!_delProf) return;
   try {
     await api('/api/profile/delete', { method: 'POST', body: JSON.stringify({ name }) });
+    _invalidateKanbanProfileCache();
     await loadProfilesPanel();
     showToast(t('profile_deleted', name));
   } catch (e) { showToast(t('delete_failed') + e.message); }
@@ -5398,7 +6051,7 @@ function _clearCronUnreadForJob(jobId){
 }
 
 const _origSwitchPanel=switchPanel;
-switchPanel=async function(name){ return _origSwitchPanel(name); };
+switchPanel=async function(name,opts){ return _origSwitchPanel(name,opts); };
 
 // Start polling on page load
 startCronPolling();

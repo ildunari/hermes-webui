@@ -17,6 +17,74 @@ const ICONS={
 // before the first request completes (#1060).
 let _loadingSessionId = null;
 
+// ── Composer draft persistence ────────────────────────────────────────────────
+
+// Debounced save — prevents hammering the server on every keystroke.
+let _draftSaveTimer = null;
+const _DRAFT_SAVE_DELAY_MS = 400;
+
+function _saveComposerDraft(sid, text, files) {
+  if (!sid) return;
+  clearTimeout(_draftSaveTimer);
+  _draftSaveTimer = setTimeout(() => {
+    api('/api/session/draft', {
+      method: 'POST',
+      body: JSON.stringify({ session_id: sid, text: text || '', files: files || [] }),
+    }).catch(() => {});
+  }, _DRAFT_SAVE_DELAY_MS);
+}
+
+// Fire-and-forget immediate save (used before session switches).
+function _saveComposerDraftNow(sid, text, files) {
+  if (!sid) return;
+  clearTimeout(_draftSaveTimer);
+  api('/api/session/draft', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sid, text: text || '', files: files || [] }),
+  }).catch(() => {});
+}
+
+// Restore composer draft from server onto #msg textarea.
+// Only restores if there's actual text (skip empty/None drafts).
+// Guards against double-restore when rapidly switching sessions.
+function _restoreComposerDraft(draft, targetSid) {
+  const ta = $('msg');
+  if (!ta) return;
+  // targetSid is the session that was requested — if it no longer matches
+  // _loadingSessionId, a newer session switch has already begun, so skip.
+  if (targetSid && _loadingSessionId !== null && _loadingSessionId !== targetSid) return;
+  const text = (draft && typeof draft.text === 'string') ? draft.text : '';
+  const files = (draft && Array.isArray(draft.files)) ? draft.files : [];
+  // If there's no text and no files, clear the textarea (a previous session's
+  // draft may still be sitting there from a cross-session switch).
+  if (!text && !files.length) {
+    if (ta.value) {
+      ta.value = '';
+      if (typeof autoResize === 'function') autoResize();
+      if (typeof updateSendBtn === 'function') updateSendBtn();
+    }
+    return;
+  }
+  // Only update if different to avoid cursor jumps on unrelated session switches.
+  const current = ta.value || '';
+  if (current !== text) {
+    ta.value = text;
+    if (typeof autoResize === 'function') autoResize();
+    if (typeof updateSendBtn === 'function') updateSendBtn();
+  }
+  // Files restoration is skipped for now (requires S.pendingFiles plumbing).
+}
+
+// Clear the saved draft for a session (called when message is sent).
+function _clearComposerDraft(sid) {
+  if (!sid) return;
+  clearTimeout(_draftSaveTimer);
+  api('/api/session/draft', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sid, text: '' }),
+  }).catch(() => {});
+}
+
 const SESSION_VIEWED_COUNTS_KEY = 'hermes-session-viewed-counts';
 const SESSION_COMPLETION_UNREAD_KEY = 'hermes-session-completion-unread';
 const SESSION_OBSERVED_STREAMING_KEY = 'hermes-session-observed-streaming';
@@ -163,14 +231,36 @@ function _isSessionActivelyViewedForList(sid) {
 function _isSessionLocallyStreaming(s) {
   if (!s || !s.session_id) return false;
   const isActive = S.session && s.session_id === S.session.session_id;
-  return Boolean(
-    (isActive && S.busy)
-    || (typeof INFLIGHT === 'object' && INFLIGHT && INFLIGHT[s.session_id])
-  );
+  // For the active session, rely on S.busy to indicate an ongoing stream.
+  // INFLIGHT entries for non-active sessions are artifacts of interrupted
+  // streams (page refresh, network disconnect, gateway restart) where
+  // `delete INFLIGHT[sid]` was never reached — they should NOT cause the
+  // sidebar spinner to appear on completed sessions. (#2066)
+  return isActive && Boolean(S.busy);
 }
 
 function _isSessionEffectivelyStreaming(s) {
   return Boolean(s && (s.is_streaming || _isSessionLocallyStreaming(s)));
+}
+
+function _purgeStaleInflightEntries() {
+  // Clean up INFLIGHT entries for sessions the server confirms are NOT
+  // streaming. This prevents the in-memory cache from growing unbounded
+  // when streams end abnormally. (#2066)
+  if (typeof INFLIGHT !== 'object' || !INFLIGHT) return;
+  const sessionsById = new Map();
+  if (Array.isArray(_allSessions)) {
+    for (const s of _allSessions) {
+      if (s && s.session_id) sessionsById.set(s.session_id, s);
+    }
+  }
+  for (const sid of Object.keys(INFLIGHT)) {
+    const s = sessionsById.get(sid);
+    if (s && !s.is_streaming) {
+      delete INFLIGHT[sid];
+      if (typeof clearInflightState === 'function') clearInflightState(sid);
+    }
+  }
 }
 
 function _rememberRenderedStreamingState(s, isStreaming) {
@@ -272,7 +362,7 @@ function _markPollingCompletionUnreadTransitions(sessions) {
   }
 }
 
-async function newSession(flash){
+async function newSession(flash, options={}){
   updateQueueBadge();
   S.toolCalls=[];
   clearLiveToolCards();
@@ -303,6 +393,7 @@ async function newSession(flash){
     workspace:inheritWs,
     profile:S.activeProfile||'default',
   };
+  if(options&&options.worktree) reqBody.worktree=true;
   if(_activeProject&&_activeProject!==NO_PROJECT_FILTER) reqBody.project_id=_activeProject;
   const data=await api('/api/session/new',{method:'POST',body:JSON.stringify(reqBody)});
   S.session=data.session;S.messages=data.session.messages||[];
@@ -324,6 +415,17 @@ async function newSession(flash){
   updateSendBtn();
   setStatus('');
   setComposerStatus('');
+  if(typeof _setLiveAssistantTps==='function') _setLiveAssistantTps(null);
+  if(typeof _syncCtxIndicator==='function'){
+    _syncCtxIndicator({
+      input_tokens:data.session.input_tokens||0,
+      output_tokens:data.session.output_tokens||0,
+      estimated_cost:data.session.estimated_cost||0,
+      context_length:data.session.context_length||0,
+      last_prompt_tokens:data.session.last_prompt_tokens||0,
+      threshold_tokens:data.session.threshold_tokens||0,
+    });
+  }
   updateQueueBadge(S.session.session_id);
   syncTopbar();renderMessages();loadDir('.');
   // don't call renderSessionList here - callers do it when needed
@@ -345,11 +447,10 @@ async function loadSession(sid){
   // Show loading indicator immediately for responsiveness.
   // Cleared by renderMessages() once full session data arrives.
   // Persist the current composer draft before switching away so it can be
-  // restored when the user switches back (#1060).
+  // restored when the user switches back (#1060). Save to server now so the
+  // draft survives page refresh and syncs across clients.
   if (currentSid && currentSid !== sid) {
-    if (!S.composerDrafts) S.composerDrafts = {};
-    const draft = { text: ($('msg') || {}).value || '', files: S.pendingFiles ? [...S.pendingFiles] : [] };
-    if (draft.text || draft.files.length) S.composerDrafts[currentSid] = draft;
+    _saveComposerDraftNow(currentSid, ($('msg') || {}).value || '', S.pendingFiles ? [...S.pendingFiles] : []);
   }
   if (currentSid !== sid) {
     S.messages = [];
@@ -563,6 +664,15 @@ async function loadSession(sid){
     });
   }
   if(typeof _renderPendingPromptsForActiveSession==='function') _renderPendingPromptsForActiveSession();
+
+  // Restore server-persisted composer draft (synced across clients + survives refresh).
+  // Pass sid so _restoreComposerDraft can skip if this session is mid-load (guards
+  // against stale writes from slow responses racing to restore the previous draft).
+  const _draft = S.session && S.session.composer_draft;
+  if (_draft && (typeof _restoreComposerDraft === 'function')) {
+    _restoreComposerDraft(_draft, sid);
+  }
+
   _resolveSessionModelForDisplaySoon(sid);
   // Clear the in-flight session marker now that this load has completed (#1060).
   if (_loadingSessionId === sid) _loadingSessionId = null;
@@ -998,6 +1108,19 @@ let _loadingOlder = false;
 // oldest message currently loaded in S.messages. Starts at 0 when all
 // messages are loaded, or > 0 when truncated by msg_limit.
 let _oldestIdx = 0;
+// Generation token bumped every time S.messages is wholesale-replaced
+// (rather than incrementally extended). _loadOlderMessages snapshots it
+// before its `await` and re-checks after, so a late-resolving prefetch
+// does not prepend onto a transcript that was rebuilt under it
+// (e.g. by _ensureAllMessagesLoaded after a Start-jump). See #1937.
+let _messagesGeneration = 0;
+function _bumpMessagesGeneration() {
+  // Wrap to keep the counter bounded; the only operation that matters is
+  // strict inequality between the snapshot and the post-await read, so any
+  // monotonic bump is sufficient.
+  _messagesGeneration = (_messagesGeneration + 1) | 0;
+  return _messagesGeneration;
+}
 
 async function _loadOlderMessages() {
   if (_loadingOlder || !_messagesTruncated) return;
@@ -1005,6 +1128,11 @@ async function _loadOlderMessages() {
   if (!sid || !S.messages.length) return;
   if (_oldestIdx <= 0) { _messagesTruncated = false; return; }
   _loadingOlder = true;
+  // Snapshot the generation BEFORE we await. If S.messages is wholesale
+  // replaced while the request is in flight, the post-await check below
+  // bails out so we never prepend stale older messages onto a freshly
+  // rebuilt transcript (#1937).
+  const startGeneration = _messagesGeneration;
   try {
     const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${_oldestIdx}&msg_limit=${_INITIAL_MSG_LIMIT}`);
     // Guard: api() may have redirected (401) and returned undefined.
@@ -1017,6 +1145,13 @@ async function _loadOlderMessages() {
     if (!data || !data.session) return;
     if (!S.session || S.session.session_id !== sid) return;
     if (_loadingSessionId !== null && _loadingSessionId !== sid) return;
+    // Generation guard: another code path (typically jumpToSessionStart →
+    // _ensureAllMessagesLoaded) may have replaced S.messages while we were
+    // awaiting. Prepending older messages onto that replacement would
+    // duplicate the head of the transcript. Detect via the generation
+    // counter and abort cleanly. _oldestIdx and _messagesTruncated were
+    // already reset by the wholesale-replace path, so no rollback needed.
+    if (_messagesGeneration !== startGeneration) return;
     const olderMsgs = (data.session.messages || []).filter(m => m && m.role);
     if (!olderMsgs.length) { _messagesTruncated = false; return; }
     // Prepend older messages
@@ -1063,17 +1198,56 @@ async function _loadOlderMessages() {
 
 // Ensure the full message history is loaded (for undo, export, etc).
 // If the session was loaded with msg_limit, this fetches all messages.
+//
+// Race-safety (#1937): with the endless-scroll opt-in, _loadOlderMessages
+// may be in flight when this runs (e.g. user scrolled near the top, then
+// hit the Start jump pill). Two coordinated guards prevent the prefetch
+// from prepending duplicate messages onto our wholesale replacement:
+//   1. Hold the _loadingOlder mutex around the body so a NEW prefetch
+//      cannot start mid-replace (entry-gate check at line ~1003 returns
+//      early). The mutex is also self-protecting against concurrent
+//      ensure-all calls from rapid double-clicks on Start.
+//   2. Bump _messagesGeneration before mutating S.messages so any
+//      in-flight prefetch's post-await generation check bails out.
 async function _ensureAllMessagesLoaded() {
   if (!_messagesTruncated || !S.session) return;
-  const sid = S.session.session_id;
-  const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0`);
-  // Guard: api() may have redirected (401) and returned undefined.
-  if (!data || !data.session) return;
-  const msgs = (data.session.messages || []).filter(m => m && m.role);
-  S.messages = msgs;
-  _messagesTruncated = false;
-  if(S.session && S.session.session_id === sid){
-    S.session.message_count = Number(data.session.message_count || msgs.length);
+  if (_loadingOlder) {
+    // A prefetch is mid-flight (between the `_loadingOlder = true` line
+    // and its post-await guards). Bumping the generation token now
+    // poisons that prefetch's continuation, but we still need to claim
+    // the mutex AFTER it releases. Yield until the prefetch finishes
+    // (its finally-block clears _loadingOlder) before fetching the full
+    // history ourselves. The generation bump below ensures any other
+    // future race against this same continuation also fails closed.
+    _bumpMessagesGeneration();
+    while (_loadingOlder) {
+      await new Promise(resolve => setTimeout(resolve, 16));
+    }
+    if (!_messagesTruncated || !S.session) return;
+  }
+  _loadingOlder = true;
+  try {
+    const sid = S.session.session_id;
+    const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0`);
+    // Guard: api() may have redirected (401) and returned undefined.
+    if (!data || !data.session) return;
+    // Session may have been switched while we awaited. Bail rather than
+    // overwrite the new session's messages.
+    if (!S.session || S.session.session_id !== sid) return;
+    if (_loadingSessionId !== null && _loadingSessionId !== sid) return;
+    const msgs = (data.session.messages || []).filter(m => m && m.role);
+    // Bump the generation BEFORE the wholesale replace so any racing
+    // prefetch (whose snapshot was taken before this call's mutex
+    // acquisition) sees the new value and aborts.
+    _bumpMessagesGeneration();
+    S.messages = msgs;
+    _messagesTruncated = false;
+    _oldestIdx = 0;
+    if (S.session && S.session.session_id === sid) {
+      S.session.message_count = Number(data.session.message_count || msgs.length);
+    }
+  } finally {
+    _loadingOlder = false;
   }
 }
 
@@ -1097,6 +1271,7 @@ let _sessionActionMenu = null;
 let _sessionActionAnchor = null;
 let _sessionActionSessionId = null;
 const _expandedChildSessionKeys = new Set();
+const _expandedLineageKeys = new Set();
 let _sessionVisibleSidebarIds = [];
 const SESSION_VIRTUAL_ROW_HEIGHT = 52;
 const SESSION_VIRTUAL_BUFFER_ROWS = 12;
@@ -1837,6 +2012,7 @@ function _isChildSession(s){
 function _sessionLineageKey(s, sessionIdsInList){
   if(!s||!s.session_id) return null;
   if(_isChildSession(s)) return null;
+  if(s.session_source==='fork') return null;
   const lineageKey=s._lineage_root_id||s.lineage_root_id||null;
   if(lineageKey) return lineageKey;
   // If parent_session_id points to another session in the current list,
@@ -1943,6 +2119,9 @@ function _syncSidebarExpansionForActiveSession(rows, activeSid){
     if(Array.isArray(row._child_sessions)&&row._child_sessions.some(child=>child&&child.session_id===activeSid)){
       _expandedChildSessionKeys.add(key);
     }
+    if(Array.isArray(row._lineage_segments)&&row._lineage_segments.some(seg=>seg&&seg.session_id===activeSid&&seg.session_id!==row.session_id)){
+      _expandedLineageKeys.add(key);
+    }
   }
 }
 
@@ -1958,7 +2137,14 @@ function _collapseSessionLineageForSidebar(sessions){
   }
   for(const [key,items] of groups.entries()){
     if(items.length<=1){result.push(items[0]);continue;}
-    const sorted=[...items].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
+    const sorted=[...items].sort((a,b)=>{
+      const bSeg=Number(b&&b._compression_segment_count||0);
+      const aSeg=Number(a&&a._compression_segment_count||0);
+      if(bSeg||aSeg){
+        if(bSeg!==aSeg) return bSeg-aSeg;
+      }
+      return _sessionTimestampMs(b)-_sessionTimestampMs(a);
+    });
     const chosen=sorted[0];
     result.push({...chosen,_lineage_key:key,_lineage_collapsed_count:items.length,_lineage_segments:sorted});
   }
@@ -2093,6 +2279,10 @@ function renderSessionListFromCache(){
   // Don't re-render while user is actively renaming a session (would destroy the input)
   if(_renamingSid) return;
   closeSessionActionMenu();
+  // Purge stale INFLIGHT entries for sessions the server confirms are NOT
+  // streaming. This runs on every list refresh to prevent memory leaks from
+  // interrupted streams. (#2066)
+  _purgeStaleInflightEntries();
   const q=($('sessionSearch').value||'').toLowerCase();
   const activeSidForSidebar=_activeSessionIdForSidebar();
   const titleMatches=q?_allSessions.filter(s=>(s.title||'Untitled').toLowerCase().includes(q)):_allSessions;
@@ -2276,6 +2466,17 @@ function renderSessionListFromCache(){
     list.dataset.sessionVirtualActiveAnchor!==activeSidForSidebar||
     list.dataset.sessionVirtualFilter!==q
   );
+  const virtualWindowBeforeActiveAnchor=_sessionVirtualWindow({
+    total:flatSessionRows.length,
+    scrollTop:listScrollTopBeforeRender,
+    viewportHeight:list.clientHeight||520,
+    itemHeight:SESSION_VIRTUAL_ROW_HEIGHT,
+    buffer:SESSION_VIRTUAL_BUFFER_ROWS,
+    threshold:SESSION_VIRTUAL_THRESHOLD_ROWS,
+    activeIndex:-1,
+  });
+  const activeWasAlreadyVisible=activeIndex>=virtualWindowBeforeActiveAnchor.start&&activeIndex<virtualWindowBeforeActiveAnchor.end;
+  const shouldMoveSidebarToActive=shouldAnchorActive&&!activeWasAlreadyVisible;
   let virtualWindow=_sessionVirtualWindow({
     total:flatSessionRows.length,
     scrollTop:listScrollTopBeforeRender,
@@ -2283,10 +2484,10 @@ function renderSessionListFromCache(){
     itemHeight:SESSION_VIRTUAL_ROW_HEIGHT,
     buffer:SESSION_VIRTUAL_BUFFER_ROWS,
     threshold:SESSION_VIRTUAL_THRESHOLD_ROWS,
-    activeIndex:shouldAnchorActive?activeIndex:-1,
+    activeIndex:shouldMoveSidebarToActive?activeIndex:-1,
   });
   let virtualAnchorScrollTop=null;
-  if(shouldAnchorActive&&virtualWindow.virtualized){
+  if(shouldMoveSidebarToActive&&virtualWindow.virtualized){
     list.dataset.sessionVirtualActiveAnchor=activeSidForSidebar;
     virtualAnchorScrollTop=virtualWindow.topPad;
   }else if(activeSidForSidebar){
@@ -2407,6 +2608,14 @@ function renderSessionListFromCache(){
       pinInd.innerHTML=ICONS.pin;
       titleRow.appendChild(pinInd);
     }
+    if(s.worktree_path){
+      const wtInd=document.createElement('span');
+      wtInd.className='session-worktree-indicator';
+      wtInd.innerHTML=li('git-branch',12);
+      const wtLabel=(typeof t==='function'?t('session_worktree_badge'):'Worktree');
+      wtInd.title=`${wtLabel}: ${s.worktree_branch||s.worktree_path}`;
+      titleRow.appendChild(wtInd);
+    }
     // Parent session indicator for forked/branched sessions (#465)
     if(s.parent_session_id){
       const branchInd=document.createElement('span');
@@ -2426,13 +2635,49 @@ function renderSessionListFromCache(){
     ts.className='session-time'+(hasAttentionState?' is-hidden':'');
     ts.textContent=hasAttentionState?'':_formatRelativeSessionTime(tsMs);
     titleRow.appendChild(title);
+    // Project color dot: placed BETWEEN title and timestamp, not inside the
+    // title span. Inside the title span it would be clipped by the ellipsis
+    // truncation, becoming invisible exactly when the title is long enough
+    // to need the project marker. As a flex-flow sibling it stays visible
+    // regardless of title length and sits next to the timestamp on the right.
+    if(s.project_id){
+      const proj=_allProjects.find(p=>p.project_id===s.project_id);
+      if(proj){
+        const dot=document.createElement('span');
+        dot.className='session-project-dot';
+        dot.style.background=proj.color||'var(--blue)';
+        dot.title=proj.name;
+        titleRow.appendChild(dot);
+      }
+    }
+    const lineageKey=_sidebarLineageKeyForRow(s);
     const segmentCount=_sessionSegmentCount(s);
+    const lineageSegments=Array.isArray(s._lineage_segments)?s._lineage_segments.filter(seg=>seg&&seg.session_id&&seg.session_id!==s.session_id):[];
+    const canExpandLineageSegments=Boolean(lineageKey&&segmentCount>1&&lineageSegments.length>0);
+    const lineageSegmentsExpanded=canExpandLineageSegments&&_expandedLineageKeys.has(lineageKey);
     if(segmentCount>0){
       const segmentCountEl=document.createElement('span');
-      segmentCountEl.className='session-lineage-count';
+      segmentCountEl.className='session-lineage-count'+(canExpandLineageSegments?' expandable':'');
       const segmentLabel=t('session_meta_segments', segmentCount);
       segmentCountEl.textContent=segmentLabel;
       segmentCountEl.title=segmentLabel;
+      if(canExpandLineageSegments){
+        segmentCountEl.setAttribute('role','button');
+        segmentCountEl.setAttribute('tabindex','0');
+        segmentCountEl.setAttribute('aria-expanded',lineageSegmentsExpanded?'true':'false');
+        ['pointerdown','pointerup','click'].forEach(ev=>segmentCountEl.addEventListener(ev,e=>e.stopPropagation()));
+        const toggleLineageSegments=(e)=>{
+          e.preventDefault();
+          e.stopPropagation();
+          if(_expandedLineageKeys.has(lineageKey)) _expandedLineageKeys.delete(lineageKey);
+          else _expandedLineageKeys.add(lineageKey);
+          renderSessionListFromCache();
+        };
+        segmentCountEl.onclick=toggleLineageSegments;
+        segmentCountEl.onkeydown=(e)=>{
+          if(e.key==='Enter'||e.key===' '){toggleLineageSegments(e);}
+        };
+      }
       titleRow.appendChild(segmentCountEl);
     }
     const childCount=typeof s._child_session_count==='number'?s._child_session_count:(Array.isArray(s._child_sessions)?s._child_sessions.length:0);
@@ -2451,21 +2696,6 @@ function renderSessionListFromCache(){
         renderSessionListFromCache();
       };
       titleRow.appendChild(childCountEl);
-    }
-    // Project color dot: placed BETWEEN title and timestamp, not inside the
-    // title span. Inside the title span it would be clipped by the ellipsis
-    // truncation, becoming invisible exactly when the title is long enough
-    // to need the project marker. As a flex-flow sibling it stays visible
-    // regardless of title length and sits next to the timestamp on the right.
-    if(s.project_id){
-      const proj=_allProjects.find(p=>p.project_id===s.project_id);
-      if(proj){
-        const dot=document.createElement('span');
-        dot.className='session-project-dot';
-        dot.style.background=proj.color||'var(--blue)';
-        dot.title=proj.name;
-        titleRow.appendChild(dot);
-      }
     }
     titleRow.appendChild(ts);
     sessionText.appendChild(titleRow);
@@ -2489,7 +2719,32 @@ function renderSessionListFromCache(){
       meta.textContent=metaBits.join(' · ');
       sessionText.appendChild(meta);
     }
-    const lineageKey=_sidebarLineageKeyForRow(s);
+    if(lineageSegmentsExpanded){
+      const lineageList=document.createElement('div');
+      lineageList.className='session-lineage-segments';
+      ['pointerdown','pointerup','click'].forEach(ev=>lineageList.addEventListener(ev,e=>e.stopPropagation()));
+      const sortedSegments=[...lineageSegments].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
+      for(const seg of sortedSegments){
+        const row=document.createElement('button');
+        row.type='button';
+        row.className='session-lineage-segment'+(activeSidForSidebar&&seg.session_id===activeSidForSidebar?' active':'');
+        const segTitle=seg.title||t('session_lineage_segment_untitled');
+        const segTime=_formatRelativeSessionTime(_sessionTimestampMs(seg));
+        row.textContent=`-> ${segTitle} - ${segTime}`;
+        row.title=t('session_lineage_segment_open');
+        row.onclick=async(e)=>{
+          e.stopPropagation();
+          if(seg.is_cli_session){
+            try{await api('/api/session/import_cli',{method:'POST',body:JSON.stringify({session_id:seg.session_id})});}
+            catch(_e){ /* read-only fallback */ }
+          }
+          await loadSession(seg.session_id);
+          renderSessionListFromCache();
+        };
+        lineageList.appendChild(row);
+      }
+      sessionText.appendChild(lineageList);
+    }
     if(childCount>0&&Array.isArray(s._child_sessions)&&_expandedChildSessionKeys.has(lineageKey)){
       const childList=document.createElement('div');
       childList.className='session-child-sessions';
@@ -2686,7 +2941,7 @@ function renderSessionListFromCache(){
       _pointerActive=false;
       if(_renamingSid) return;
       if(actions&&actions.contains(e.target)) return;
-      if(e.target&&e.target.closest&&e.target.closest('.session-child-count,.session-child-sessions,.session-child-session')) return;
+      if(e.target&&e.target.closest&&e.target.closest('.session-child-count,.session-child-sessions,.session-child-session,.session-lineage-count,.session-lineage-segments,.session-lineage-segment')) return;
       if(_sessionSelectMode){e.stopPropagation();if(!readOnly)toggleSessionSelect(s.session_id);return;}
       // If the pointer moved enough to be a drag, cancel any pending tap
       if(_isDragging){clearTimeout(_tapTimer);_tapTimer=null;_lastTapTime=0;_clearDragTimer=setTimeout(()=>{el.classList.remove('dragging');_clearDragTimer=null;},50);return;}

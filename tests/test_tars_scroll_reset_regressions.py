@@ -84,3 +84,22 @@ def test_user_scroll_cancels_delayed_bottom_settling():
     assert "e.deltaY<0" in record
     assert "_cancelBottomSettle();" in record
     assert "_scrollPinned=false" in record
+
+
+def test_preserve_scroll_restores_unpinned_viewport_after_dom_rebuild():
+    render = _function_body(UI_JS, "function renderMessages")
+    after_render = _function_body(UI_JS, "function _scrollAfterMessageRender")
+    restore = _function_body(UI_JS, "function _restoreMessageScrollSnapshot")
+
+    snapshot_idx = render.index("const scrollSnapshot=preserveScroll?_captureMessageScrollSnapshot():null")
+    inner_idx = render.index("const inner=$('msgInner')")
+    final_scroll_idx = render.rindex("_scrollAfterMessageRender(preserveScroll, scrollSnapshot)")
+
+    assert snapshot_idx < inner_idx < final_scroll_idx, (
+        "renderMessages({preserveScroll:true}) must capture #messages.scrollTop before "
+        "replacing transcript DOM, then pass that snapshot to the post-render scroll helper"
+    )
+    assert "if(_scrollPinned) scrollIfPinned()" in after_render
+    assert "else _restoreMessageScrollSnapshot(scrollSnapshot)" in after_render
+    assert "el.scrollTop=Math.max(0,Math.min(Number(snapshot.top)||0,maxTop))" in restore
+    assert "_programmaticScroll=true" in restore

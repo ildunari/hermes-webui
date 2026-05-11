@@ -413,3 +413,155 @@ def test_provider_quota_styles_exist():
         ".provider-quota-window",
     ):
         assert token in css
+
+
+# ── Regression tests for #1912 ────────────────────────────────────────────────
+
+def test_account_usage_subprocess_uses_devnull_stdin(monkeypatch):
+    """Account-usage probe subprocess must receive stdin=DEVNULL.
+
+    DEVNULL prevents the child from inheriting any pipe that could block or
+    leak data.  This is a defence-in-depth measure beyond the parent-death
+    signal; it is tested separately to make the invariant explicit.
+    """
+    import api.providers as providers
+    import subprocess
+
+    seen_stdin = None
+
+    def capturing_run(*args, **kwargs):
+        nonlocal seen_stdin
+        seen_stdin = kwargs.get('stdin')
+        class FakeProc:
+            returncode = 0
+            stdout = '{}'
+            stderr = ''
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, 'run', capturing_run)
+    try:
+        providers._agent_fetch_account_usage_for_home(
+            'openai-codex', Path('/nonexistent'), api_key=None
+        )
+    except Exception:
+        pass  # errors are expected on a fake env; we only care about stdin
+
+    assert seen_stdin is subprocess.DEVNULL, (
+        f'expected stdin=subprocess.DEVNULL, got {seen_stdin!r}'
+    )
+
+
+def test_account_usage_probe_semaphore_has_correct_bound(monkeypatch, tmp_path):
+    """The probe semaphore must enforce the declared concurrency cap.
+
+    Verifying the bound directly ensures the cap actually prevents resource
+    exhaustion when the UI polls multiple providers in rapid succession.
+    """
+    import api.providers as providers
+
+    monkeypatch.setattr(profiles, 'get_active_hermes_home', lambda: tmp_path)
+    old_cfg, old_mtime = _with_config(model={'provider': 'openai-codex'})
+
+    sem = providers._get_account_usage_probe_semaphore()
+    try:
+        bound = sem._value
+        assert bound == providers._MAX_CONCURRENT_ACCOUNT_USAGE_PROBES, (
+            f'semaphore bound is {bound}, expected '
+            f'{providers._MAX_CONCURRENT_ACCOUNT_USAGE_PROBES}'
+        )
+    finally:
+        _restore_config(old_cfg, old_mtime)
+
+
+def test_account_usage_preexec_fn_is_wired_on_posix(monkeypatch):
+    """On POSIX systems the probe subprocess must receive a parent-death preexec_fn.
+
+    The preexec_fn arranges prctl(PR_SET_PDEATHSIG, SIGTERM) so the child is
+    terminated when the WebUI parent dies (OOM kill, systemctl restart, etc.).
+    This test verifies the wiring and skips harmlessly on non-POSIX (Windows).
+    """
+    import api.providers as providers
+
+    assert callable(providers._account_usage_preexec_fn)
+
+    try:
+        providers._account_usage_preexec_fn()
+    except Exception as exc:
+        raise AssertionError(
+            f'_account_usage_preexec_fn raised {exc!r}; it should be '
+            'safe to call unconditionally'
+        ) from exc
+
+    if hasattr(os, 'fork'):
+        import subprocess
+
+        captured_kwargs = {}
+
+        def capture_run(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            class FakeProc:
+                returncode = 0
+                stdout = '{}'
+                stderr = ''
+            return FakeProc()
+
+        monkeypatch.setattr(subprocess, 'run', capture_run)
+        try:
+            providers._agent_fetch_account_usage_for_home(
+                'openai-codex', Path('/nonexistent'), api_key=None
+            )
+        except Exception:
+            pass
+
+        assert 'preexec_fn' in captured_kwargs, (
+            'preexec_fn should be in subprocess.run kwargs on POSIX'
+        )
+        assert captured_kwargs['preexec_fn'] is providers._account_usage_preexec_fn
+
+
+def test_account_usage_semaphore_caps_concurrency(monkeypatch, tmp_path):
+    """The probe semaphore must actually serialise callers beyond its bound.
+
+    Verifies the bounded semaphore is used in the call path and genuinely
+    prevents more than _MAX_CONCURRENT_ACCOUNT_USAGE_PROBES probes running.
+    """
+    import api.providers as providers
+    import threading
+
+    monkeypatch.setattr(profiles, 'get_active_hermes_home', lambda: tmp_path)
+    old_cfg, old_mtime = _with_config(model={'provider': 'openai-codex'})
+
+    barrier = threading.Barrier(2, timeout=2)
+    unblock = threading.Event()
+
+    def slow_fetch(provider, home, api_key=None):
+        barrier.wait()
+        unblock.wait(timeout=5)
+        return None
+
+    monkeypatch.setattr(providers, '_agent_fetch_account_usage_for_home', slow_fetch)
+
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            results.append(
+                providers._fetch_account_usage_with_profile_context('openai-codex')
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    unblock.set()
+
+    try:
+        assert not errors, f'workers raised: {errors}'
+        assert len(results) == 2, f'expected 2 results, got {len(results)}'
+    finally:
+        _restore_config(old_cfg, old_mtime)

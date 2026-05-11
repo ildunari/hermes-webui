@@ -79,6 +79,18 @@ function getMatchingCommands(prefix){
     matches.push(skill);
     seen.add(skill.name);
   }
+  // Include agent/plugin commands from /api/commands metadata
+  for(const cmd of (_agentCommandCache||[])){
+    const name=String(cmd&&cmd.name||'').toLowerCase();
+    if(!name.startsWith(q)||seen.has(name))continue;
+    if(cmd.cli_only)continue;
+    matches.push({
+      name,
+      desc:String(cmd&&cmd.description||'').trim()||'Agent command',
+      source:cmd.category==='Plugin'?'plugin':'agent',
+    });
+    seen.add(name);
+  }
   return matches;
 }
 
@@ -191,9 +203,10 @@ function _getSlashSubArgOptions(spec){
   return Promise.resolve([]);
 }
 
+let _agentCommandCacheReady=false;
 async function loadAgentCommandMetadata(force=false){
-  if(_agentCommandCache&&!force) return _agentCommandCache;
-  if(_agentCommandCachePromise&&!force) return _agentCommandCachePromise;
+  if(_agentCommandCacheReady&&!force)return _agentCommandCache||[];
+  if(_agentCommandCachePromise&&!force)return _agentCommandCachePromise;
   _agentCommandCachePromise=(async()=>{
     try{
       const data=await api('/api/commands');
@@ -201,6 +214,7 @@ async function loadAgentCommandMetadata(force=false){
     }catch(_){
       _agentCommandCache=[];
     }finally{
+      _agentCommandCacheReady=true;
       _agentCommandCachePromise=null;
     }
     return _agentCommandCache;
@@ -227,6 +241,16 @@ function cliOnlyCommandResponse(cmdName, meta){
     extra='\n\nBrowser tools in WebUI must be configured server-side with the agent/browser environment. Once configured, ask the model to use browser tools directly; `/browser` itself only works in `hermes chat`.';
   }
   return `\`/${name}\` is a Hermes CLI-only command and cannot run inside the WebUI.${detail}${extra}`;
+}
+
+async function executeAgentPluginCommand(text,_meta){
+  const command=String(text||'').trim();
+  if(!command) throw new Error('command is required');
+  const data=await api('/api/commands/exec',{
+    method:'POST',
+    body:JSON.stringify({command})
+  });
+  return String(data&&data.output||'(no output)');
 }
 
 function _parseSlashAutocomplete(text){
@@ -639,7 +663,17 @@ async function cmdGoal(args){
       model_provider:S.session.model_provider||null,
       profile:S.activeProfile||S.session.profile||'default',
     })});
-    const msg=String((r&&r.message)||'').trim();
+    const msg = (() => {
+      const raw = String((r && r.message) || '').trim();
+      const key = String((r && r.message_key) || '').trim();
+      const args = Array.isArray(r && r.message_args) ? r.message_args : [];
+      if (raw.includes('\n')) return raw;
+      if (key && typeof t === 'function') {
+        const translated = String(t(key, ...args));
+        if (translated && translated !== key) return translated;
+      }
+      return raw;
+    })();
     if(msg){
       S.messages.push({role:'assistant',content:msg,_ts:Date.now()/1000,_goalStatus:true,_transient:true});
       renderMessages({preserveScroll:true});
@@ -649,7 +683,7 @@ async function cmdGoal(args){
     S.toolCalls=[];
     if(typeof clearLiveToolCards==='function')clearLiveToolCards();
     appendThinking();setBusy(true);
-    setComposerStatus('Working toward goal…');
+    setComposerStatus(t('goal_working_toward'));
     S.activeStreamId=r.stream_id;
     if(S.session&&S.session.session_id===activeSid){
       S.session.active_stream_id=r.stream_id;
@@ -1095,6 +1129,10 @@ function refreshSlashCommandDropdown(){
 function ensureSkillCommandsLoadedForAutocomplete(){
   if(_skillCommandCacheReady||_skillCommandLoadPromise)return;
   loadSkillCommands().then(()=>{refreshSlashCommandDropdown();});
+  // Also preload agent/plugin command metadata for autocomplete
+  if(!_agentCommandCacheReady&&!_agentCommandCachePromise){
+    loadAgentCommandMetadata().then(()=>{refreshSlashCommandDropdown();});
+  }
 }
 
 // ── Autocomplete dropdown ───────────────────────────────────────────────────
