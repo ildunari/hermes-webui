@@ -127,6 +127,9 @@ def _clarify_timeout_seconds(default: int = 120) -> int:
         return default
 
 
+_CANCEL_MARKER_PATTERNS = ('task cancelled', 'task canceled', 'response interrupted')
+
+
 def _classify_provider_error(err_str: str, exc=None, *, silent_failure: bool = False) -> dict:
     """Classify provider/agent failure text for WebUI apperror UX.
 
@@ -136,6 +139,41 @@ def _classify_provider_error(err_str: str, exc=None, *, silent_failure: bool = F
     err_str = str(err_str or '')
     _err_lower = err_str.lower()
     _exc_name = type(exc).__name__ if exc is not None else ''
+    _is_cancelled = (
+        'cancelled by user' in _err_lower
+        or 'canceled by user' in _err_lower
+        or 'user cancelled' in _err_lower
+        or 'user canceled' in _err_lower
+        or 'task cancelled' in _err_lower
+        or 'task canceled' in _err_lower
+        or 'cancellederror' in _err_lower
+        or (exc is not None and _exc_name in ('CancelledError', 'CanceledError'))
+    )
+    _is_interrupted = (
+        not _is_cancelled
+        and (
+            'interrupted by user' in _err_lower
+            or 'response interrupted' in _err_lower
+            or 'operation interrupted' in _err_lower
+            or 'operation was interrupted' in _err_lower
+            or 'operation aborted' in _err_lower
+            or 'request was aborted' in _err_lower
+            or 'aborterror' in _err_lower
+            or (exc is not None and type(exc).__name__ in ('KeyboardInterrupt', 'AbortError'))
+        )
+    )
+    if _is_cancelled:
+        return {
+            'label': 'Task cancelled',
+            'type': 'cancelled',
+            'hint': 'The run was cancelled by the user before Skyly finished. No provider failure occurred.',
+        }
+    if _is_interrupted:
+        return {
+            'label': 'Response interrupted',
+            'type': 'interrupted',
+            'hint': 'The run stopped before a provider response completed. If you did not cancel it, try again.',
+        }
     _is_quota = _is_quota_error_text(err_str)
     _is_auth = (
         not _is_quota and (
@@ -213,6 +251,90 @@ def _provider_error_payload(message: str, err_type: str, hint: str = '') -> dict
     return payload
 
 
+def _session_has_cancel_marker(session) -> bool:
+    """Return True if a visible cancel/interrupted marker is already persisted."""
+    for msg in reversed(getattr(session, 'messages', None) or []):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get('role') == 'user':
+            return False
+        if msg.get('role') != 'assistant':
+            continue
+        content = msg.get('content')
+        text = ''
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    parts.append(str(part.get('text') or part.get('content') or ''))
+            text = '\n'.join(parts)
+        normalized = text.strip().lower()
+        if any(pattern in normalized for pattern in _CANCEL_MARKER_PATTERNS):
+            return True
+    return False
+
+
+def _cancelled_turn_content(message: str = 'Task cancelled.') -> str:
+    """Return cancelled-turn copy matching the verbose provider-error layout."""
+    _message = str(message or 'Task cancelled.').strip()
+    if not _message.endswith('.'):
+        _message += '.'
+    return (
+        f"**Task cancelled:** {_message}\n\n"
+        "*The run was cancelled by the user before Skyly finished. No provider failure occurred.*"
+    )
+
+
+def _persist_cancelled_turn(session, *, message: str = 'Task cancelled.') -> None:
+    """Persist a user-cancelled terminal state without provider-error wording.
+
+    cancel_stream() usually writes this marker first, but the streaming thread can
+    later unwind through the silent-failure or exception path. Those paths must
+    not append a misleading provider no-response error after an explicit cancel.
+    """
+    _materialize_pending_user_turn_before_error(session)
+    session.active_stream_id = None
+    session.pending_user_message = None
+    session.pending_attachments = []
+    session.pending_started_at = None
+    if not _session_has_cancel_marker(session):
+        session.messages.append({
+            'role': 'assistant',
+            'content': _cancelled_turn_content(message),
+            '_error': True,
+            'provider_details': str(message or 'Task cancelled.').strip(),
+            'provider_details_label': 'Cancellation details',
+            'timestamp': int(time.time()),
+        })
+
+
+def _cleanup_ephemeral_cancelled_turn(session) -> None:
+    """Remove transient /btw session state after a cancel without saving it."""
+    session.active_stream_id = None
+    session.pending_user_message = None
+    session.pending_attachments = []
+    session.pending_started_at = None
+    try:
+        import pathlib
+        pathlib.Path(session.path).unlink(missing_ok=True)
+    except Exception:
+        logger.debug("Failed to clean up ephemeral cancelled session", exc_info=True)
+
+
+def _finalize_cancelled_turn(session, *, ephemeral: bool = False, message: str = 'Task cancelled.') -> None:
+    """Finalize a cancelled turn for persistent or ephemeral sessions."""
+    if ephemeral:
+        _cleanup_ephemeral_cancelled_turn(session)
+        return
+    _persist_cancelled_turn(session, message=message)
+    try:
+        session.save()
+    except Exception:
+        logger.debug("Failed to persist cancelled turn", exc_info=True)
+
+
 def _aiagent_import_error_detail() -> str:
     """Return a multi-line diagnostic string for the "AIAgent not available" path.
 
@@ -266,7 +388,7 @@ from api.workspace import set_last_workspace
 # Fields that are safe to send to LLM provider APIs.
 # Everything else (attachments, timestamp, _ts, etc.) is display-only
 # metadata added by the webui and must be stripped before the API call.
-_API_SAFE_MSG_KEYS = {'role', 'content', 'tool_calls', 'tool_call_id', 'name', 'refusal'}
+_API_SAFE_MSG_KEYS = {'role', 'content', 'tool_calls', 'tool_call_id', 'name', 'refusal', 'reasoning_content'}
 
 _NATIVE_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 
@@ -567,9 +689,12 @@ def _strip_thinking_markup(text: str) -> str:
     if not text:
         return ''
     s = str(text)
-    s = re.sub(r'<think>.*?</think>', ' ', s, flags=re.IGNORECASE | re.DOTALL)
-    s = re.sub(r'<\|channel\|>thought.*?<channel\|>', ' ', s, flags=re.IGNORECASE | re.DOTALL)
-    s = re.sub(r'<\|turn\|>thinking\n.*?<turn\|>', ' ', s, flags=re.IGNORECASE | re.DOTALL)  # Gemma 4
+    # Treat provider thinking wrappers as metadata only when they lead the
+    # response. Literal discussion of these tags later in normal prose should
+    # stay visible (#2152).
+    s = re.sub(r'^\s*<think>.*?</think>\s*', ' ', s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r'^\s*<\|channel\|?>thought\n?.*?<channel\|>\s*', ' ', s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r'^\s*<\|turn\|>thinking\n.*?<turn\|>\s*', ' ', s, flags=re.IGNORECASE | re.DOTALL)  # Gemma 4
     s = re.sub(r'^\s*(the|ther)\s+user\s+is\s+asking.*$', ' ', s, flags=re.IGNORECASE | re.MULTILINE)
     # Strip plain-text thinking preambles from models that don't use <think> tags (e.g. Qwen3).
     # These appear as the very first sentence of the assistant response and are not useful as titles.
@@ -789,7 +914,7 @@ def _is_provisional_title(current_title: str, messages) -> bool:
     candidate = re.sub(r'\s+', ' ', str(derived[:64] or '')).strip()
     if not current or not candidate:
         return False
-    return current == candidate or candidate.startswith(current)
+    return current == candidate
 
 
 def _title_prompts(user_text: str, assistant_text: str) -> tuple[str, list[str]]:
@@ -877,9 +1002,41 @@ def _title_retry_completion_budget(provider: str = '', model: str = '', base_url
 
 
 def _title_retry_status(status: str) -> bool:
+    # Whether to grant a second budget attempt within the same prompt+model
+    # combination.  ``llm_length`` indicates the model would have produced
+    # content with more headroom, so doubling the budget can help.
+    #
+    # ``llm_empty_reasoning`` historically also triggered a retry, but for
+    # reasoning models (Qwen3-thinking, DeepSeek-R1, Kimi-K2, etc.) that
+    # status means the model burned its entire budget on hidden reasoning
+    # tokens and emitted nothing visible.  Doubling the budget in that case
+    # just doubles the GPU/credit cost without changing the outcome — the
+    # next attempt produces the same shape.  We skip the retry for empty-
+    # reasoning statuses and let the title path fall through to the local
+    # fallback summary.  See issue #2083 for the LM Studio + Qwen3 repro.
     return status in {
         'llm_length',
         'llm_length_aux',
+    }
+
+
+def _title_should_skip_remaining_attempts(status: str) -> bool:
+    """Statuses where re-issuing the next prompt against the same model
+    produces the same failing shape (model burned its budget on hidden
+    reasoning, hit a hard provider gate, etc.).
+
+    Short-circuit the prompt-iteration loop so we don't issue a second
+    full-budget LLM call (and twice the GPU/credit burn) only to land in
+    the same fallback path. See issue #2083.
+
+    Add a status here only when retrying the next prompt is provably
+    wasted work (single-call signal already establishes that the next
+    call will return the same shape). Length-truncation WITHOUT
+    reasoning is NOT in the set — that's legitimately recoverable by
+    a larger budget on a different prompt and stays in
+    :func:`_title_retry_status`.
+    """
+    return status in {
         'llm_empty_reasoning',
         'llm_empty_reasoning_aux',
     }
@@ -922,10 +1079,16 @@ def _extract_title_response(resp, *, aux: bool = False) -> tuple[str, str]:
             or _safe_text_value(_safe_obj_value(message, 'reasoning_content'))
             or _safe_text_value(_safe_obj_value(message, 'thinking'))
         )
-        if finish_reason == 'length':
-            return '', f'llm_length{suffix}'
+        # When the model emitted reasoning tokens but no visible content, it
+        # burned its budget on hidden thinking — retrying with a larger budget
+        # almost never recovers a useful title (see issue #2083: Qwen3-thinking
+        # via LM Studio loops indefinitely on auto-title generation).  Report
+        # this case distinctly so callers can short-circuit instead of double-
+        # billing the GPU/credit on a near-certain repeat.
         if reasoning:
             return '', f'llm_empty_reasoning{suffix}'
+        if finish_reason == 'length':
+            return '', f'llm_length{suffix}'
         return '', f'llm_empty{suffix}'
     except Exception:
         return '', f'llm_empty{suffix}'
@@ -978,6 +1141,15 @@ def generate_title_raw_via_aux(
             except Exception as e:
                 last_status = 'llm_error_aux'
                 logger.debug("Aux title generation attempt %s failed: %s", idx + 1, e)
+            # If the model just burned its budget on hidden reasoning, retrying
+            # the next prompt against the same model produces the same shape.
+            # Short-circuit to the local fallback path (#2083).
+            if _title_should_skip_remaining_attempts(last_status):
+                logger.debug(
+                    "Aux title generation short-circuiting after %s (reasoning-only response).",
+                    last_status,
+                )
+                break
         return None, last_status
     except Exception as e:
         logger.debug("Aux title generation failed: %s", e)
@@ -1077,6 +1249,15 @@ def generate_title_raw_via_agent(agent, user_text: str, assistant_text: str) -> 
                     getattr(agent, 'model', None),
                     e,
                 )
+            # If the model just burned its budget on hidden reasoning, retrying
+            # the next prompt against the same model produces the same shape.
+            # Short-circuit to the local fallback path (#2083).
+            if _title_should_skip_remaining_attempts(last_status):
+                logger.debug(
+                    "Agent title generation short-circuiting after %s (reasoning-only response).",
+                    last_status,
+                )
+                break
         return None, last_status
     except Exception as e:
         logger.debug("Agent title generation failed: %s", e)
@@ -1647,6 +1828,16 @@ def _drop_checkpointed_current_user_from_context(messages, msg_text):
     if current_user_key and _message_identity(history[-1]) == current_user_key:
         return history[:-1]
     return history
+
+
+def _stream_writeback_is_current(session, stream_id):
+    """Return True only while a worker still owns the session writeback.
+
+    cancel_stream() intentionally clears ``active_stream_id`` early so the UI can
+    accept a follow-up turn while the old worker is unwinding. That old worker
+    must not later persist its stale result over the newer transcript.
+    """
+    return bool(stream_id) and getattr(session, 'active_stream_id', None) == stream_id
 
 
 def _merge_display_messages_after_agent_result(previous_display, previous_context, result_messages, msg_text):
@@ -2221,6 +2412,8 @@ def _run_agent_streaming(
         # TD1: set thread-local env context so concurrent sessions don't clobber globals
         # Check for pre-flight cancel (user cancelled before agent even started)
         if cancel_event.is_set():
+            with _agent_lock:
+                _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.')
             put('cancel', {'message': 'Cancelled before start'})
             return
 
@@ -2230,7 +2423,7 @@ def _run_agent_streaming(
         # process-level active-profile global.  Falls back gracefully.
         try:
             from api.profiles import (
-                _patch_skill_home_modules,
+                patch_skill_home_modules,
                 get_hermes_home_for_profile,
                 get_profile_runtime_env,
             )
@@ -2240,7 +2433,7 @@ def _run_agent_streaming(
         except ImportError:
             _profile_home = os.environ.get('HERMES_HOME', '')
             _profile_runtime_env = {}
-            _patch_skill_home_modules = None
+            patch_skill_home_modules = None
         
         # Capture the resolved profile name now, while profile context is
         # reliable. Used in the compression migration block to stamp s.profile
@@ -2293,8 +2486,8 @@ def _run_agent_streaming(
                 # above, so we only do lightweight sys.modules lookups and
                 # attribute assignments here — no first-time import under
                 # the lock (#2024).
-                if _patch_skill_home_modules is not None:
-                    _patch_skill_home_modules(Path(_profile_home))
+                if patch_skill_home_modules is not None:
+                    patch_skill_home_modules(Path(_profile_home))
         # Lock released — agent runs without holding it
         # ── MCP Server Discovery (lazy import, idempotent) ──
         # MUST run AFTER the HERMES_HOME mutation above — `discover_mcp_tools()`
@@ -2714,6 +2907,8 @@ def _run_agent_streaming(
                         'model': _fb_entry.get('model', ''),
                         'provider': _fb_entry.get('provider', ''),
                         'base_url': _fb_entry.get('base_url'),
+                        'api_key': _fb_entry.get('api_key'),
+                        'key_env': _fb_entry.get('key_env'),
                     }
 
             # Build kwargs defensively — guard newer params so the WebUI
@@ -2938,6 +3133,8 @@ def _run_agent_streaming(
                         agent.interrupt("Cancelled before start")
                     except Exception:
                         logger.debug("Failed to interrupt agent before start")
+                    with _agent_lock:
+                        _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.')
                     put('cancel', {'message': 'Cancelled by user'})
                     return
 
@@ -3039,6 +3236,30 @@ def _run_agent_streaming(
                 task_id=session_id,
                 persist_user_message=msg_text,
             )
+            if cancel_event.is_set():
+                if _checkpoint_stop is not None:
+                    _checkpoint_stop.set()
+                if _ckpt_thread is not None:
+                    _ckpt_thread.join(timeout=15)
+                if ephemeral:
+                    _cleanup_ephemeral_cancelled_turn(s)
+                else:
+                    with _agent_lock:
+                        _finalize_cancelled_turn(s, ephemeral=False)
+                        try:
+                            append_turn_journal_event_for_stream(
+                                s.session_id,
+                                stream_id,
+                                {
+                                    "event": "interrupted",
+                                    "created_at": time.time(),
+                                    "reason": "cancelled",
+                                },
+                            )
+                        except Exception:
+                            logger.debug("Failed to append cancelled turn journal event", exc_info=True)
+                put('cancel', {'message': 'Cancelled by user'})
+                return
             # ── Ephemeral mode (/btw): deliver answer, skip persistence, cleanup ──
             if ephemeral:
                 _answer = ''
@@ -3064,8 +3285,49 @@ def _run_agent_streaming(
                 _checkpoint_stop.set()
             if _ckpt_thread is not None:
                 _ckpt_thread.join(timeout=15)
+            if cancel_event.is_set():
+                with _agent_lock:
+                    _finalize_cancelled_turn(s, ephemeral=False)
+                    try:
+                        append_turn_journal_event_for_stream(
+                            s.session_id,
+                            stream_id,
+                            {
+                                "event": "interrupted",
+                                "created_at": time.time(),
+                                "reason": "cancelled",
+                            },
+                        )
+                    except Exception:
+                        logger.debug("Failed to append cancelled turn journal event", exc_info=True)
+                put('cancel', {'message': 'Cancelled by user'})
+                return
             with _agent_lock:
+                if not ephemeral and not _stream_writeback_is_current(s, stream_id):
+                    logger.info(
+                        "Skipping stale stream writeback for session %s stream %s; active_stream_id=%s",
+                        getattr(s, 'session_id', session_id),
+                        stream_id,
+                        getattr(s, 'active_stream_id', None),
+                    )
+                    return
                 _result_messages = result.get('messages') or _previous_context_messages
+                if cancel_event.is_set():
+                    _finalize_cancelled_turn(s, ephemeral=False)
+                    try:
+                        append_turn_journal_event_for_stream(
+                            s.session_id,
+                            stream_id,
+                            {
+                                "event": "interrupted",
+                                "created_at": time.time(),
+                                "reason": "cancelled",
+                            },
+                        )
+                    except Exception:
+                        logger.debug("Failed to append cancelled turn journal event", exc_info=True)
+                    put('cancel', {'message': 'Cancelled by user'})
+                    return
                 _next_context_messages = _restore_reasoning_metadata(
                     _previous_context_messages,
                     _result_messages,
@@ -3104,6 +3366,23 @@ def _run_agent_streaming(
                 )
                 # _token_sent tracks whether on_token() was called (any streamed text)
                 if not _assistant_added and not _token_sent:
+                    if cancel_event.is_set():
+                        _finalize_cancelled_turn(s, ephemeral=ephemeral)
+                        if not ephemeral:
+                            try:
+                                append_turn_journal_event_for_stream(
+                                    s.session_id,
+                                    stream_id,
+                                    {
+                                        "event": "interrupted",
+                                        "created_at": time.time(),
+                                        "reason": "cancelled",
+                                    },
+                                )
+                            except Exception:
+                                logger.debug("Failed to append cancelled turn journal event", exc_info=True)
+                        put('cancel', {'message': 'Cancelled by user'})
+                        return
                     _last_err = getattr(agent, '_last_error', None) or result.get('error') or ''
                     _err_str = str(_last_err) if _last_err else ''
                     _classification = _classify_provider_error(
@@ -3255,6 +3534,10 @@ def _run_agent_streaming(
                         }
                         if _error_payload.get('details'):
                             _error_message['provider_details'] = _error_payload['details']
+                        if _err_type == 'cancelled':
+                            _error_message['provider_details_label'] = 'Cancellation details'
+                        elif _err_type == 'interrupted':
+                            _error_message['provider_details_label'] = 'Interruption details'
                         s.messages.append(_error_message)
                         try:
                             s.save()
@@ -3345,7 +3628,9 @@ def _run_agent_streaming(
                         or _compression_summary_from_messages(s.context_messages)
                     )
                     put('compressed', {
+                        'session_id': s.session_id,
                         'message': 'Context auto-compressed to continue the conversation',
+                        'usage': _live_usage_snapshot(),
                     })
 
                 # Stamp 'timestamp' on any messages that don't have one yet
@@ -3542,7 +3827,39 @@ def _run_agent_streaming(
                             )
                         except Exception:
                             logger.debug("Failed to append assistant_started turn journal event", exc_info=True)
+                if cancel_event.is_set():
+                    _finalize_cancelled_turn(s, ephemeral=False)
+                    try:
+                        append_turn_journal_event_for_stream(
+                            s.session_id,
+                            stream_id,
+                            {
+                                "event": "interrupted",
+                                "created_at": time.time(),
+                                "reason": "cancelled",
+                            },
+                        )
+                    except Exception:
+                        logger.debug("Failed to append cancelled turn journal event", exc_info=True)
+                    put('cancel', {'message': 'Cancelled by user'})
+                    return
                 s.save()
+                if cancel_event.is_set():
+                    _finalize_cancelled_turn(s, ephemeral=False)
+                    try:
+                        append_turn_journal_event_for_stream(
+                            s.session_id,
+                            stream_id,
+                            {
+                                "event": "interrupted",
+                                "created_at": time.time(),
+                                "reason": "cancelled",
+                            },
+                        )
+                    except Exception:
+                        logger.debug("Failed to append cancelled turn journal event", exc_info=True)
+                    put('cancel', {'message': 'Cancelled by user'})
+                    return
                 if not ephemeral:
                     try:
                         append_turn_journal_event_for_stream(
@@ -3799,12 +4116,38 @@ def _run_agent_streaming(
             err_str = _stripped
         _exc_lower = err_str.lower()
         _classification = _classify_provider_error(err_str, e)
+        if cancel_event.is_set():
+            if s is not None:
+                if _checkpoint_stop is not None:
+                    _checkpoint_stop.set()
+                if _ckpt_thread is not None:
+                    _ckpt_thread.join(timeout=15)
+                _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
+                with _lock_ctx:
+                    _finalize_cancelled_turn(s, ephemeral=ephemeral)
+                    if not ephemeral:
+                        try:
+                            append_turn_journal_event_for_stream(
+                                s.session_id,
+                                stream_id,
+                                {
+                                    "event": "interrupted",
+                                    "created_at": time.time(),
+                                    "reason": "cancelled",
+                                },
+                            )
+                        except Exception:
+                            logger.debug("Failed to append cancelled turn journal event", exc_info=True)
+            put('cancel', {'message': 'Cancelled by user'})
+            return
         _exc_is_quota = _classification['type'] == 'quota_exhausted'
         # Exception quota text still includes: 'more credits' in _exc_lower, 'can only afford' in _exc_lower, 'fewer max_tokens' in _exc_lower.
         # Rate-limit detection remains guarded as: (not _exc_is_quota).
         _exc_is_rate_limit = (_classification['type'] == 'rate_limit') and (not _exc_is_quota)
         _exc_is_auth = _classification['type'] == 'auth_mismatch'  # detects '401' and 'unauthorized' via _classify_provider_error.
         _exc_is_not_found = _classification['type'] == 'model_not_found'  # detects '404', 'not found', 'does not exist', and 'invalid model'.
+        _exc_is_cancelled = _classification['type'] == 'cancelled'
+        _exc_is_interrupted = _classification['type'] == 'interrupted'
 
         # The user hint still points to Settings / `hermes model` from _classify_provider_error().
         if _exc_is_quota:
@@ -3870,6 +4213,14 @@ def _run_agent_streaming(
                                 _ckpt_thread.join(timeout=15)
                             _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
                             with _lock_ctx:
+                                if not ephemeral and not _stream_writeback_is_current(s, stream_id):
+                                    logger.info(
+                                        "Skipping stale stream self-heal writeback for session %s stream %s; active_stream_id=%s",
+                                        getattr(s, 'session_id', session_id),
+                                        stream_id,
+                                        getattr(s, 'active_stream_id', None),
+                                    )
+                                    return
                                 _result_messages = _heal_result.get('messages') or _previous_context_messages
                                 _next_context_messages = _restore_reasoning_metadata(
                                     _previous_context_messages, _result_messages,
@@ -3897,6 +4248,10 @@ def _run_agent_streaming(
             _exc_label, _exc_type, _exc_hint = (
                 _classification['label'], _classification['type'], _classification['hint'],
             )
+        elif _exc_is_cancelled or _exc_is_interrupted:
+            _exc_label, _exc_type, _exc_hint = (
+                _classification['label'], _classification['type'], _classification['hint'],
+            )
         else:
             _exc_label, _exc_type, _exc_hint = 'Error', 'error', ''
 
@@ -3911,6 +4266,14 @@ def _run_agent_streaming(
             # API calls so the LLM never sees its own error as prior context on the next turn.
             _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
             with _lock_ctx:
+                if not ephemeral and not _stream_writeback_is_current(s, stream_id):
+                    logger.info(
+                        "Skipping stale stream error writeback for session %s stream %s; active_stream_id=%s",
+                        getattr(s, 'session_id', session_id),
+                        stream_id,
+                        getattr(s, 'active_stream_id', None),
+                    )
+                    return
                 _materialize_pending_user_turn_before_error(s)
                 s.active_stream_id = None
                 s.pending_user_message = None
@@ -3924,6 +4287,10 @@ def _run_agent_streaming(
                 }
                 if _error_payload.get('details'):
                     _error_message['provider_details'] = _error_payload['details']
+                if _exc_type == 'cancelled':
+                    _error_message['provider_details_label'] = 'Cancellation details'
+                elif _exc_type == 'interrupted':
+                    _error_message['provider_details_label'] = 'Interruption details'
                 s.messages.append(_error_message)
                 try:
                     s.save()
@@ -4127,13 +4494,12 @@ def cancel_stream(stream_id: str) -> bool:
         except Exception:
             logger.debug("Failed to clear clarify prompt during cancel")
 
-        # Put a cancel sentinel into the queue so the SSE handler wakes up
+        # Capture the queue while the stream still exists, but do not emit the
+        # terminal cancel event until the session cleanup below confirms the turn
+        # is still active. Otherwise a late Stop click can race with a successful
+        # worker save and show cancel in the client while persistence says done.
         q = streams.get(stream_id)
-        if q:
-            try:
-                q.put_nowait(('cancel', {'message': 'Cancelled by user'}))
-            except Exception:
-                logger.debug("Failed to put cancel event to queue")
+        _emit_cancel_event = True
 
         # ── Eager session lock release (fixes #653) ──────────────────────────
         # Pop stream state now so the 409 guard in routes.py sees the session
@@ -4183,6 +4549,22 @@ def cancel_stream(stream_id: str) -> bool:
         with _get_session_agent_lock(_cancel_session_id):
             try:
                 _cs = get_session(_cancel_session_id)
+                if not isinstance(getattr(_cs, 'messages', None), list):
+                    _cs.messages = []
+                if not _stream_writeback_is_current(_cs, stream_id):
+                    # The stream has rotated to a different stream id (newer
+                    # turn started, or the worker already finalized this one).
+                    # Skip the cancel-marker append AND suppress the terminal
+                    # cancel event so we don't contradict a possibly-already-
+                    # delivered done payload (#2151 + #2154 / PR #2136).
+                    logger.info(
+                        "Skipping stale cancel writeback for session %s stream %s; active_stream_id=%s",
+                        _cancel_session_id,
+                        stream_id,
+                        getattr(_cs, 'active_stream_id', None),
+                    )
+                    _emit_cancel_event = False
+                    return True
                 # ── Preserve the user's typed message before clearing pending state (#1298) ──
                 # The agent's internal messages list (where the user message was appended at
                 # the start of run_conversation()) may not have been merged back into
@@ -4276,7 +4658,35 @@ def cancel_stream(stream_id: str) -> bool:
                 # reasoning-only or tool-only stream produced NO partial message).
                 _has_reasoning = bool(_cancel_reasoning and _cancel_reasoning.strip())
                 _has_tools = bool(_cancel_tool_calls)
-                if _stripped or _has_reasoning or _has_tools:
+                _cancel_marker_exists = _session_has_cancel_marker(_cs)
+                _cancel_marker_idx = len(_cs.messages)
+                if _cancel_marker_exists:
+                    for _idx in range(len(_cs.messages) - 1, -1, -1):
+                        _m = _cs.messages[_idx]
+                        if not isinstance(_m, dict) or _m.get('role') != 'assistant':
+                            continue
+                        _content = str(_m.get('content') or '').strip().lower()
+                        if any(pattern in _content for pattern in _CANCEL_MARKER_PATTERNS):
+                            _cancel_marker_idx = _idx
+                            break
+                _partial_already_present = False
+                if _stripped:
+                    for _m in _cs.messages:
+                        # Stage-350 Opus SHOULD-FIX (#2151): only dedup
+                        # against actual prior _partial markers from the
+                        # same stream, with exact content match. The original
+                        # substring check (`_stripped in _existing or
+                        # _existing in _stripped`) was too broad — any short
+                        # prior assistant reply (e.g. "OK", "Here is the
+                        # answer:") becomes a substring of many later partial
+                        # bodies and could silently drop the new partial,
+                        # resurrecting the #893 data-loss bug on long sessions.
+                        if not isinstance(_m, dict) or not _m.get('_partial'):
+                            continue
+                        if str(_m.get('content') or '').strip() == _stripped:
+                            _partial_already_present = True
+                            break
+                if (_stripped or _has_reasoning or _has_tools) and not _partial_already_present:
                     _partial_msg: dict = {
                         'role': 'assistant',
                         'content': _stripped,  # may be empty for reasoning/tool-only turns
@@ -4303,18 +4713,27 @@ def cancel_stream(stream_id: str) -> bool:
                         # alongside the regular tool_calls path.
                         # (Opus pre-release review pass 2 of v0.50.251.)
                         _partial_msg['_partial_tool_calls'] = list(_cancel_tool_calls)
-                    _cs.messages.append(_partial_msg)
+                    _cs.messages.insert(_cancel_marker_idx, _partial_msg)
                 # Cancel marker — flagged _error=True so it is stripped from conversation
                 # history on the next turn (prevents model from seeing "Task cancelled."
                 # as a prior assistant reply).
-                _cs.messages.append({
-                    'role': 'assistant',
-                    'content': '*Task cancelled.*',
-                    '_error': True,
-                    'timestamp': int(time.time()),
-                })
+                if not _cancel_marker_exists:
+                    _cs.messages.append({
+                        'role': 'assistant',
+                        'content': _cancelled_turn_content('Task cancelled.'),
+                        '_error': True,
+                        'provider_details': 'Task cancelled.',
+                        'provider_details_label': 'Cancellation details',
+                        'timestamp': int(time.time()),
+                    })
                 _cs.save()
             except Exception:
                 logger.debug("Failed to clear session state on cancel for %s", _cancel_session_id)
+
+    if _emit_cancel_event and q:
+        try:
+            q.put_nowait(('cancel', {'message': 'Cancelled by user'}))
+        except Exception:
+            logger.debug("Failed to put cancel event to queue")
 
     return True

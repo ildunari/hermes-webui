@@ -51,9 +51,11 @@ _load_repo_dotenv_preserving_env() {
   set +a
 
   local assignment
-  for assignment in "${preserved[@]}"; do
-    export "${assignment}"
-  done
+  if [[ ${#preserved[@]} -gt 0 ]]; then
+    for assignment in "${preserved[@]}"; do
+      export "${assignment}"
+    done
+  fi
 }
 
 _find_python() {
@@ -127,11 +129,12 @@ _build_bootstrap_args() {
 }
 
 _write_state() {
-  local pid="$1" host="$2" port="$3"
+  local pid="$1" host="$2" port="$3" python_exe="${4:-}"
   local state_dir="${HERMES_WEBUI_STATE_DIR:-${DEFAULT_STATE_DIR}}"
   {
     printf 'PID=%q\n' "${pid}"
     printf 'REPO_ROOT=%q\n' "${REPO_ROOT}"
+    printf 'PYTHON_EXE=%q\n' "${python_exe}"
     printf 'HOST=%q\n' "${host}"
     printf 'PORT=%q\n' "${port}"
     printf 'LOG_FILE=%q\n' "${LOG_FILE}"
@@ -166,14 +169,15 @@ _proc_args() {
 }
 
 _is_owned_webui_pid() {
-  local pid="$1" args state_repo=""
+  local pid="$1" args state_repo="" state_python=""
   [[ -f "${STATE_FILE}" ]] || return 1
   _load_state_if_present
   state_repo="${REPO_ROOT:-}"
+  state_python="${PYTHON_EXE:-}"
   [[ "${state_repo}" == "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" ]] || return 1
   args="$(_proc_args "${pid}")"
   [[ -n "${args}" ]] || return 1
-  [[ "${args}" == *"${state_repo}/bootstrap.py"* || "${args}" == *"${state_repo}/server.py"* || "${args}" == *"${state_repo}/start.sh"* ]]
+  [[ "${args}" == *"${state_repo}/bootstrap.py"* || "${args}" == *"${state_repo}/server.py"* || "${args}" == *"${state_repo}/start.sh"* || ( -n "${state_python}" && "${args}" == *"${state_python}"* ) ]]
 }
 
 _current_pid() {
@@ -220,7 +224,7 @@ start_cmd() {
   pid=$!
 
   printf '%s\n' "${pid}" > "${PID_FILE}"
-  _write_state "${pid}" "${CTL_HOST}" "${CTL_PORT}"
+  _write_state "${pid}" "${CTL_HOST}" "${CTL_PORT}" "${python_exe}"
   sleep 0.15
   if ! _is_alive "${pid}"; then
     echo "[ctl] Hermes WebUI failed to stay running. Log: ${LOG_FILE}" >&2

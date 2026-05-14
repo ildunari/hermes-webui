@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import inspect
 import os
+import sys
 import threading
+import types
 import urllib.error
 from datetime import datetime, timezone
 from io import BytesIO
@@ -275,6 +278,154 @@ def test_codex_account_usage_unavailable_is_sanitized(monkeypatch, tmp_path):
     assert "secret" not in repr(result).lower()
 
 
+def test_codex_account_usage_subprocess_falls_back_to_credential_pool(monkeypatch, capsys):
+    """Codex quota probes should use credential_pool credentials when legacy auth misses."""
+    import api.providers as providers
+
+    def b64url(payload: bytes) -> str:
+        return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+    token = ".".join((
+        b64url(b'{"alg":"none","typ":"JWT"}'),
+        b64url(json.dumps({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-test-123",
+            },
+        }).encode("utf-8")),
+        b64url(b"signature"),
+    ))
+
+    fetch_calls = []
+    load_pool_calls = []
+    selected = []
+    seen = {}
+
+    agent_mod = types.ModuleType("agent")
+    agent_mod.__path__ = []
+    account_usage_mod = types.ModuleType("agent.account_usage")
+    credential_pool_mod = types.ModuleType("agent.credential_pool")
+
+    def fake_fetch_account_usage(provider, *, base_url=None, api_key=None):
+        fetch_calls.append((provider, base_url, api_key))
+        return None
+
+    class FakePool:
+        def select(self):
+            selected.append(True)
+            return SimpleNamespace(
+                runtime_api_key=token,
+                runtime_base_url="https://chatgpt.com/backend-api/codex",
+            )
+
+    def fake_load_pool(provider):
+        load_pool_calls.append(provider)
+        return FakePool()
+
+    def fake_urlopen(req, timeout):
+        seen["url"] = req.full_url
+        seen["timeout"] = timeout
+        seen["headers"] = {key.lower(): value for key, value in req.header_items()}
+        payload = {
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {"used_percent": 15, "reset_at": 1_900_000_000},
+                "secondary_window": {"used_percent": 40, "reset_at": "2030-03-24T12:30:00Z"},
+            },
+            "credits": {"has_credits": True, "balance": 12.5},
+        }
+        return _FakeResponse(json.dumps(payload).encode("utf-8"))
+
+    account_usage_mod.fetch_account_usage = fake_fetch_account_usage
+    credential_pool_mod.load_pool = fake_load_pool
+    monkeypatch.setitem(sys.modules, "agent", agent_mod)
+    monkeypatch.setitem(sys.modules, "agent.account_usage", account_usage_mod)
+    monkeypatch.setitem(sys.modules, "agent.credential_pool", credential_pool_mod)
+    monkeypatch.setattr(providers.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(sys, "argv", ["quota-probe", "openai-codex", ""])
+
+    exec(providers._ACCOUNT_USAGE_SUBPROCESS_CODE, {"__name__": "__main__"})
+
+    output = capsys.readouterr().out.strip()
+    snapshot = json.loads(output)
+
+    assert fetch_calls == [("openai-codex", None, None)]
+    assert load_pool_calls == ["openai-codex"]
+    assert selected == [True]
+    assert seen["url"] == "https://chatgpt.com/backend-api/wham/usage"
+    assert seen["timeout"] == 15.0
+    headers = seen["headers"]
+    assert headers["authorization"] == f"Bearer {token}"
+    assert headers["accept"] == "application/json"
+    assert headers["originator"] == "codex_cli_rs"
+    assert headers["user-agent"].startswith("codex_cli_rs/")
+    assert headers["chatgpt-account-id"] == "acct-test-123"
+    assert snapshot["provider"] == "openai-codex"
+    assert snapshot["source"] == "usage_api"
+    assert snapshot["plan"] == "Pro"
+    assert snapshot["windows"][0]["label"] == "Session"
+    assert snapshot["windows"][0]["used_percent"] == 15.0
+    assert snapshot["windows"][1]["label"] == "Weekly"
+    assert snapshot["details"] == ["Credits balance: $12.50"]
+    assert snapshot["available"] is True
+    assert token not in output
+
+
+def test_codex_account_usage_subprocess_keeps_legacy_reason_when_pool_misses(monkeypatch, capsys):
+    """A failed pool fallback should not discard the legacy unavailable reason."""
+    import api.providers as providers
+
+    fetch_calls = []
+    load_pool_calls = []
+
+    agent_mod = types.ModuleType("agent")
+    agent_mod.__path__ = []
+    account_usage_mod = types.ModuleType("agent.account_usage")
+    credential_pool_mod = types.ModuleType("agent.credential_pool")
+
+    def fake_fetch_account_usage(provider, *, base_url=None, api_key=None):
+        fetch_calls.append((provider, base_url, api_key))
+        return SimpleNamespace(
+            provider="openai-codex",
+            source="usage_api",
+            title="Account limits",
+            plan=None,
+            windows=(),
+            details=(),
+            available=False,
+            unavailable_reason="Codex account limits are not available for this credential.",
+            fetched_at=datetime(2030, 3, 17, 12, 30, tzinfo=timezone.utc),
+        )
+
+    class EmptyPool:
+        def select(self):
+            return None
+
+    def fake_load_pool(provider):
+        load_pool_calls.append(provider)
+        return EmptyPool()
+
+    def explode_urlopen(*_args, **_kwargs):
+        raise AssertionError("no network call should happen when the pool has no selected entry")
+
+    account_usage_mod.fetch_account_usage = fake_fetch_account_usage
+    credential_pool_mod.load_pool = fake_load_pool
+    monkeypatch.setitem(sys.modules, "agent", agent_mod)
+    monkeypatch.setitem(sys.modules, "agent.account_usage", account_usage_mod)
+    monkeypatch.setitem(sys.modules, "agent.credential_pool", credential_pool_mod)
+    monkeypatch.setattr(providers.urllib.request, "urlopen", explode_urlopen)
+    monkeypatch.setattr(sys, "argv", ["quota-probe", "openai-codex", ""])
+
+    exec(providers._ACCOUNT_USAGE_SUBPROCESS_CODE, {"__name__": "__main__"})
+
+    snapshot = json.loads(capsys.readouterr().out.strip())
+
+    assert fetch_calls == [("openai-codex", None, None)]
+    assert load_pool_calls == ["openai-codex"]
+    assert snapshot["available"] is False
+    assert snapshot["unavailable_reason"] == "Codex account limits are not available for this credential."
+    assert snapshot["fetched_at"] == "2030-03-17T12:30:00Z"
+
+
 def test_anthropic_oauth_usage_unavailable_reason_is_reported(monkeypatch, tmp_path):
     """Hermes Agent can report why account limits are not available."""
     monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
@@ -390,7 +541,8 @@ def test_provider_quota_route_is_registered():
 def test_provider_quota_card_is_rendered_in_providers_panel():
     """The Providers panel should show active provider quota/status before cards."""
     panels = (ROOT / "static" / "panels.js").read_text(encoding="utf-8")
-    assert "api('/api/provider/quota')" in panels
+    assert "_fetchProviderQuotaStatus(false)" in panels
+    assert "'/api/provider/quota'" in panels
     assert "function _buildProviderQuotaCard" in panels
     assert "Active provider quota" in panels
     assert "provider-quota-card" in panels
@@ -398,6 +550,21 @@ def test_provider_quota_card_is_rendered_in_providers_panel():
     assert "remaining_percent" in panels
     assert "provider-quota-details" in panels
     assert "5-hour limit" in panels
+
+
+def test_provider_quota_card_has_manual_refresh_control():
+    """The quota card should let users force an immediate fresh usage lookup."""
+    panels = (ROOT / "static" / "panels.js").read_text(encoding="utf-8")
+    assert "function _refreshProviderQuota" in panels
+    assert "function _fetchProviderQuotaStatus" in panels
+    assert "refresh=1" in panels
+    assert "cache:'no-store'" in panels
+    assert "data-provider-quota-refresh" in panels
+    assert "Refresh usage" in panels
+    assert "Provider usage refreshed" in panels
+    assert "Provider usage refresh failed" in panels
+    assert "card.isConnected&&button" in panels
+    assert "Last checked" in panels
 
 
 def test_provider_quota_styles_exist():
@@ -411,6 +578,9 @@ def test_provider_quota_styles_exist():
         ".provider-quota-card-invalid_key",
         ".provider-quota-details",
         ".provider-quota-window",
+        ".provider-quota-actions",
+        ".provider-quota-refresh",
+        ".provider-quota-checked",
     ):
         assert token in css
 

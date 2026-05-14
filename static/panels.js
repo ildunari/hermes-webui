@@ -425,11 +425,13 @@ async function loadCrons(animate) {
       item.id = 'cron-' + job.id;
       const status = _cronStatusMeta(job);
       const isNewRun = _cronNewJobIds.has(String(job.id));
+      const isAgentMode = !job.no_agent;
       const profileLabel = _cronProfileLabel(job.profile);
       const profileTitle = _cronProfileTitle(job.profile);
       item.innerHTML = `
         <div class="cron-header">
           ${isNewRun ? '<span class="cron-new-dot" title="New run"></span>' : ''}
+          ${isAgentMode ? '<span class="cron-agent-badge" title="Agent mode">🤖</span>' : ''}
           <span class="cron-name" title="${esc(job.name)}">${esc(job.name)}</span>
           <span class="cron-profile-badge" title="${esc(profileTitle)}">${esc(profileLabel)}</span>
           <span class="cron-status ${status.listClass}">${esc(status.label)}</span>
@@ -468,6 +470,11 @@ function _renderCronDetail(job){
   const deliver = job.deliver || 'local';
   const isNoAgent = !!job.no_agent;
   const cronJobMode = isNoAgent ? 'no-agent' : 'agent';
+  const modelProvider =
+    job.provider && job.model ? `${esc(job.provider)}/${esc(job.model)}` :
+    job.model ? esc(job.model) :
+    job.provider ? esc(job.provider) :
+    isNoAgent ? '' : 'default';
   const script = job.script || '';
   const profileLabel = _cronProfileLabel(job.profile);
   const profileTitle = _cronProfileTitle(job.profile);
@@ -487,6 +494,7 @@ function _renderCronDetail(job){
           <button type="button" class="cron-btn" onclick="copyCurrentCronDiagnostics()">${esc(t('cron_attention_copy_diagnostics'))}</button>
         </div>
       </div>` : '';
+  const toastNotifications = job.toast_notifications !== false;
   body.innerHTML = `
     <div class="main-view-content">
       ${attentionBanner}
@@ -497,9 +505,10 @@ function _renderCronDetail(job){
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_next'))}</div><div class="detail-row-value">${esc(nextRun)}</div></div>
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_last'))}</div><div class="detail-row-value">${esc(lastRun)}</div></div>
         <div class="detail-row"><div class="detail-row-label">Deliver</div><div class="detail-row-value">${esc(deliver)}</div></div>
-        <div class="detail-row"><div class="detail-row-label">Mode</div><div class="detail-row-value"><span class="detail-badge" id="cronJobMode">${esc(cronJobMode)}</span></div></div>
+        <div class="detail-row"><div class="detail-row-label">Mode</div><div class="detail-row-value"><span class="detail-badge" id="cronJobMode">${esc(cronJobMode)}</span>${modelProvider ? ` <code>${modelProvider}</code>` : ''}</div></div>
         ${isNoAgent ? `<div class="detail-row"><div class="detail-row-label">No-agent script</div><div class="detail-row-value"><code>${esc(script || '—')}</code></div></div>` : ''}
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_profile_label') || 'Profile')}</div><div class="detail-row-value"><span class="detail-badge active" title="${esc(profileTitle)}">${esc(profileLabel)}</span></div></div>
+        <div class="detail-row"><div class="detail-row-label">${esc(t('cron_toast_notifications_label') || 'Completion toasts')}</div><div class="detail-row-value"><span class="detail-badge ${toastNotifications ? 'active' : ''}">${esc(toastNotifications ? (t('cron_toast_notifications_enabled') || 'Enabled') : (t('cron_toast_notifications_disabled') || 'Disabled'))}</span></div></div>
         <div class="detail-row"><div class="detail-row-label">Skills</div><div class="detail-row-value">${esc(skills)}</div></div>
         ${lastError}
       </div>
@@ -683,6 +692,7 @@ function duplicateCurrentCron(){
     prompt: job.prompt || '',
     deliver: job.deliver || 'local',
     profile: job.profile || '',
+    toast_notifications: job.toast_notifications !== false,
     isEdit: false,
   });
   if (!_cronSkillsCache) {
@@ -716,7 +726,7 @@ function openCronCreate(){
   _cronMode = 'create';
   _cronIsDuplicate = false;
   _cronSelectedSkills = [];
-  _renderCronForm({ name:'', schedule:'', prompt:'', deliver:'local', profile:'', isEdit:false });
+  _renderCronForm({ name:'', schedule:'', prompt:'', deliver:'local', profile:'', toast_notifications:true, isEdit:false });
   _cronSkillsCache = null;
   api('/api/skills').then(d=>{_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
   loadCronProfiles().then(()=>_refreshCronProfileSelect('')).catch(()=>{});
@@ -734,6 +744,7 @@ function openCronEdit(job){
     prompt: job.prompt || '',
     deliver: job.deliver || 'local',
     profile: job.profile || '',
+    toast_notifications: job.toast_notifications !== false,
     no_agent: !!job.no_agent,
     script: job.script || '',
     isEdit: true,
@@ -746,12 +757,13 @@ function openCronEdit(job){
   loadCronProfiles().then(()=>_refreshCronProfileSelect(job.profile || '')).catch(()=>{});
 }
 
-function _renderCronForm({ name, schedule, prompt, deliver, profile, no_agent=false, script='', isEdit }){
+function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notifications=true, no_agent=false, script='', isEdit }){
   const title = $('taskDetailTitle');
   const body = $('taskDetailBody');
   const empty = $('taskDetailEmpty');
   if (!body || !title) return;
   const isNoAgent = !!no_agent;
+  const toastNotifications = toast_notifications !== false;
   title.textContent = isEdit ? (t('edit') + ' · ' + (name || schedule || t('scheduled_jobs'))) : t('new_job');
   const deliverOpt = (v,l) => `<option value="${v}"${deliver===v?' selected':''}>${esc(l)}</option>`;
   body.innerHTML = `
@@ -787,6 +799,13 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, no_agent=fa
             ${_cronProfileOptions(profile)}
           </select>
           <div class="detail-form-hint">${esc(t('cron_profile_server_default_hint') || 'Uses the WebUI server default profile at run time')}</div>
+        </div>
+        <div class="detail-form-row">
+          <label for="cronFormToastNotifications">${esc(t('cron_toast_notifications_label') || 'Completion toasts')}</label>
+          <label class="detail-form-check" for="cronFormToastNotifications">
+            <input type="checkbox" id="cronFormToastNotifications" ${toastNotifications ? 'checked' : ''}>
+            <span>${esc(t('cron_toast_notifications_hint') || 'Show a toast when this cron finishes.')}</span>
+          </label>
         </div>
         <div class="detail-form-row">
           <label for="cronFormSkillSearch">${esc(t('cron_skills_label') || 'Skills')}</label>
@@ -879,6 +898,7 @@ async function saveCronForm(){
   const promptEl=$('cronFormPrompt');
   const delivEl=$('cronFormDeliver');
   const profileEl=$('cronFormProfile');
+  const toastEl=$('cronFormToastNotifications');
   const errEl=$('cronFormError');
   if(!schEl||!promptEl||!errEl) return;
   const name=(nameEl?nameEl.value:'').trim();
@@ -886,13 +906,14 @@ async function saveCronForm(){
   const prompt=promptEl.value.trim();
   const deliver=delivEl?delivEl.value:'local';
   const profile=profileEl?profileEl.value:'';
+  const toastNotifications=toastEl?!!toastEl.checked:true;
   const isNoAgent = !!(_cronPreFormDetail && _cronPreFormDetail.no_agent);
   errEl.style.display='none';
   if(!schedule){errEl.textContent=t('cron_schedule_required_example');errEl.style.display='';return;}
   if(!isNoAgent && !prompt){errEl.textContent=t('cron_prompt_required');errEl.style.display='';return;}
   try{
     if (_editingCronId) {
-      const updates = {job_id: _editingCronId, schedule, profile: profile};
+      const updates = {job_id: _editingCronId, schedule, profile: profile, toast_notifications: toastNotifications};
       if (!isNoAgent) updates.prompt = prompt;
       if (name) updates.name = name;
       await api('/api/crons/update', {method:'POST', body: JSON.stringify(updates)});
@@ -905,7 +926,7 @@ async function saveCronForm(){
       if (job) openCronDetail(editedId);
       return;
     }
-    const body={schedule,prompt,deliver,profile: profile};
+    const body={schedule,prompt,deliver,profile: profile, toast_notifications: toastNotifications};
     if(_cronIsDuplicate) body.enabled=false;
     if(name)body.name=name;
     if(_cronSelectedSkills.length)body.skills=_cronSelectedSkills;
@@ -2904,6 +2925,66 @@ function _renderLlmWikiStatus(d) {
     </div>`;
 }
 
+/**
+ * Bucket daily token rows for chart display.
+ * Returns rows unchanged when length <= 30 (per-day resolution).
+ * For longer ranges, groups consecutive days into buckets:
+ *   31–90 days → 2-day buckets
+ *   91–180 days → 3-day buckets
+ *   181–365 days → 8-day buckets
+ * Result is always <= ~52 bars.
+ * Each bucket row has:
+ *   - label: short label for axis (e.g. MM-DD or MM-DD–MM-DD)
+ *   - title: full tooltip title (e.g. 2026-01-01 – 2026-01-05)
+ *   - date: first date in bucket (used for date label slicing)
+ *   - input_tokens, output_tokens, sessions, cost: summed across bucket
+ */
+function _bucketDailyTokensForChart(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const len = rows.length;
+  if (len <= 30) return rows;  // per-day resolution for 7/30-day ranges
+
+  // Target <= 75 bars; derive bucket size
+  let bucketSize;
+  if (len <= 90) {
+    bucketSize = 2;
+  } else if (len <= 180) {
+    bucketSize = 3;
+  } else if (len <= 365) {
+    bucketSize = 8;  // <=52 bars for 365 days (ceil(365/8)=46)
+  } else {
+    bucketSize = 8;  // fallback for >365 (shouldn't occur in practice)
+  }
+
+  const result = [];
+  for (let i = 0; i < len; i += bucketSize) {
+    const slice = rows.slice(i, i + bucketSize);
+    const input_tokens = slice.reduce((s, r) => s + Number(r.input_tokens || 0), 0);
+    const output_tokens = slice.reduce((s, r) => s + Number(r.output_tokens || 0), 0);
+    const sessions = slice.reduce((s, r) => s + Number(r.sessions || 0), 0);
+    const cost = slice.reduce((s, r) => s + Number(r.cost || 0), 0);
+
+    const firstDate = slice[0].date;
+    const lastDate = slice[slice.length - 1].date;
+
+    // Label: short form for axis
+    const firstLabel = String(firstDate).slice(5);  // MM-DD
+    const lastLabel = String(lastDate).slice(5);
+    const label = (firstDate === lastDate) ? firstLabel : (firstLabel + '–' + lastLabel);
+
+    result.push({
+      label,
+      title: firstDate + (firstDate !== lastDate ? ' – ' + lastDate : ''),
+      date: firstDate,
+      input_tokens,
+      output_tokens,
+      sessions,
+      cost,
+    });
+  }
+  return result;
+}
+
 function _renderInsights(d, box, wikiStatus) {
   const fmtNum = n => Number(n || 0).toLocaleString();
   const fmtCost = c => {
@@ -2923,21 +3004,24 @@ function _renderInsights(d, box, wikiStatus) {
     { label: t('insights_cost'), value: fmtCost(d.total_cost), icon: li('dollar-sign', 18) },
   ];
 
-  // Daily token trend
+  // Daily token trend — bucket long ranges to avoid horizontal overflow
   const dailyTokens = Array.isArray(d.daily_tokens) ? d.daily_tokens : [];
+  const chartRows = _bucketDailyTokensForChart(dailyTokens);
   let dailyHtml = '';
-  if (dailyTokens.length) {
-    const maxDailyTokens = Math.max(...dailyTokens.map(r => Number(r.input_tokens || 0) + Number(r.output_tokens || 0)), 1);
-    const labelEvery = Math.max(Math.ceil(dailyTokens.length / 7), 1);
+  if (chartRows.length) {
+    const maxDailyTokens = Math.max(...chartRows.map(r => Number(r.input_tokens || 0) + Number(r.output_tokens || 0)), 1);
+    const labelEvery = Math.max(Math.ceil(chartRows.length / 7), 1);
     dailyHtml = `<div class="insights-card"><div class="insights-card-title">${esc(t('insights_daily_tokens'))}</div><div class="insights-daily-token-chart">` +
-      dailyTokens.map((r, idx) => {
+      chartRows.map((r, idx) => {
         const input = Number(r.input_tokens || 0);
         const output = Number(r.output_tokens || 0);
         const inputPct = Math.max((input / maxDailyTokens) * 100, input ? 2 : 0).toFixed(1);
         const outputPct = Math.max((output / maxDailyTokens) * 100, output ? 2 : 0).toFixed(1);
-        const showLabel = idx === 0 || idx === dailyTokens.length - 1 || idx % labelEvery === 0;
-        const title = `${r.date} · ${fmtTokens(input)} ${t('insights_input_tokens')} · ${fmtTokens(output)} ${t('insights_output_tokens')} · ${fmtCost(r.cost)} · ${fmtNum(r.sessions)} ${t('insights_sessions')}`;
-        return `<div class="insights-daily-bar" title="${esc(title)}"><div class="insights-daily-stack" aria-label="${esc(title)}"><div class="insights-daily-bar-output" style="height:${outputPct}%"></div><div class="insights-daily-bar-input" style="height:${inputPct}%"></div></div><span>${showLabel ? esc(String(r.date).slice(5)) : ''}</span></div>`;
+        const showLabel = idx === 0 || idx === chartRows.length - 1 || idx % labelEvery === 0;
+        const titleDate = r.title || r.date;
+        const title = `${titleDate} · ${fmtTokens(input)} ${t('insights_input_tokens')} · ${fmtTokens(output)} ${t('insights_output_tokens')} · ${fmtCost(r.cost)} · ${fmtNum(r.sessions)} ${t('insights_sessions')}`;
+        const labelText = r.label !== undefined ? r.label : String(r.date).slice(5);
+        return `<div class="insights-daily-bar" title="${esc(title)}"><div class="insights-daily-stack" aria-label="${esc(title)}"><div class="insights-daily-bar-output" style="height:${outputPct}%"></div><div class="insights-daily-bar-input" style="height:${inputPct}%"></div></div><span>${showLabel ? esc(labelText) : ''}</span></div>`;
       }).join('') +
       `</div><div class="insights-daily-legend"><span><i class="insights-daily-legend-input"></i>${esc(t('insights_input_tokens'))}</span><span><i class="insights-daily-legend-output"></i>${esc(t('insights_output_tokens'))}</span></div></div>`;
   } else {
@@ -3009,7 +3093,7 @@ function _renderInsights(d, box, wikiStatus) {
       ${overviewCards.map(c => `<div class="insights-stat"><div class="insights-stat-icon">${c.icon}</div><div class="insights-stat-info"><div class="insights-stat-value">${c.value}</div><div class="insights-stat-label">${esc(c.label)}</div></div></div>`).join('')}
     </div>
     ${dailyHtml}
-    <div class="insights-row">
+    <div class="insights-row insights-usage-grid">
       ${tokenCards}
       ${modelsHtml}
     </div>
@@ -4993,6 +5077,8 @@ function _preferencesPayloadFromUi(){
   if(syncCb) payload.sync_to_insights=syncCb.checked;
   const updateCb=$('settingsCheckUpdates');
   if(updateCb) payload.check_for_updates=updateCb.checked;
+  const whatsNewSummaryCb=$('settingsWhatsNewSummary');
+  if(whatsNewSummaryCb) payload.whats_new_summary_enabled=whatsNewSummaryCb.checked;
   const soundCb=$('settingsSoundEnabled');
   if(soundCb) payload.sound_enabled=soundCb.checked;
   const notifCb=$('settingsNotificationsEnabled');
@@ -5226,6 +5312,8 @@ async function loadSettingsPanel(){
     if(syncCb){syncCb.checked=!!settings.sync_to_insights;syncCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const updateCb=$('settingsCheckUpdates');
     if(updateCb){updateCb.checked=settings.check_for_updates!==false;updateCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const whatsNewSummaryCb=$('settingsWhatsNewSummary');
+    if(whatsNewSummaryCb){whatsNewSummaryCb.checked=!!settings.whats_new_summary_enabled;whatsNewSummaryCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const soundCb=$('settingsSoundEnabled');
     if(soundCb){soundCb.checked=!!settings.sound_enabled;soundCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     // TTS settings (localStorage-only, no server round-trip needed)
@@ -5408,13 +5496,20 @@ function _buildPluginCard(plugin){
 
 const _providerCardEls = new Map(); // providerId → {card, statusDot, input, saveBtn, removeBtn}
 
+async function _fetchProviderQuotaStatus(force=false){
+  const endpoint=force?`/api/provider/quota?refresh=1&ts=${Date.now()}`:'/api/provider/quota';
+  const status=await api(endpoint,{cache:'no-store'});
+  if(status&&typeof status==='object') status.client_fetched_at=new Date().toISOString();
+  return status;
+}
+
 async function loadProvidersPanel(){
   const list=$('providersList');
   const empty=$('providersEmpty');
   if(!list) return;
   try{
     const data=await api('/api/providers');
-    const quota=await api('/api/provider/quota').catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||'Quota status unavailable'}));
+    const quota=await _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||'Quota status unavailable',client_fetched_at:new Date().toISOString()}));
     const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth);
     list.innerHTML='';
     _providerCardEls.clear();
@@ -5433,6 +5528,40 @@ async function loadProvidersPanel(){
   }catch(e){
     list.innerHTML='<div style="color:var(--error);padding:12px;font-size:13px">Failed to load providers: '+e.message+'</div>';
   }
+}
+
+async function _refreshProviderQuota(card,button){
+  if(!card) return;
+  if(button){
+    button.disabled=true;
+    button.textContent='Refreshing…';
+    button.setAttribute('aria-busy','true');
+  }
+  let failed=false;
+  let next;
+  try{
+    next=await _fetchProviderQuotaStatus(true);
+    failed=next&&next.ok===false;
+  }catch(e){
+    failed=true;
+    next={ok:false,status:'unavailable',quota:null,message:e.message||'Quota status unavailable',client_fetched_at:new Date().toISOString()};
+  }
+  try{
+    const fresh=_buildProviderQuotaCard(next);
+    if(fresh){
+      card.replaceWith(fresh);
+      if(typeof showToast==='function') showToast(failed?'Provider usage refresh failed':'Provider usage refreshed');
+      return;
+    }
+  }catch(e){
+    failed=true;
+  }
+  if(card.isConnected&&button){
+    button.disabled=false;
+    button.textContent='Refresh usage';
+    button.removeAttribute('aria-busy');
+  }
+  if(typeof showToast==='function') showToast('Provider usage refresh failed');
 }
 
 function _formatProviderQuotaMoney(value){
@@ -5464,6 +5593,15 @@ function _formatProviderQuotaWindowLabel(accountLimits,w){
     if(raw.toLowerCase()==='weekly') return 'Weekly limit';
   }
   return raw||'Window';
+}
+
+function _formatProviderQuotaLastChecked(status){
+  const accountLimits=status&&status.account_limits;
+  const value=(accountLimits&&accountLimits.fetched_at)||status&&status.client_fetched_at;
+  if(!value) return 'Last checked after refresh';
+  const d=new Date(value);
+  if(Number.isNaN(d.getTime())) return 'Last checked after refresh';
+  try{return 'Last checked '+d.toLocaleString();}catch(e){return 'Last checked '+value;}
 }
 
 function _buildProviderQuotaCard(status){
@@ -5513,11 +5651,17 @@ function _buildProviderQuotaCard(status){
       <div>
         <div class="provider-quota-title">Active provider quota</div>
         <div class="provider-quota-subtitle">${esc(provider)}</div>
+        <div class="provider-quota-checked">${esc(_formatProviderQuotaLastChecked(status))}</div>
       </div>
-      <span class="provider-quota-badge">${esc(state.replace(/_/g,' '))}</span>
+      <div class="provider-quota-actions">
+        <span class="provider-quota-badge">${esc(state.replace(/_/g,' '))}</span>
+        <button class="provider-quota-refresh" type="button" data-provider-quota-refresh title="Refresh provider usage limits now">Refresh usage</button>
+      </div>
     </div>
     <div class="provider-quota-body">${body}</div>
   `;
+  const refreshBtn=card.querySelector('[data-provider-quota-refresh]');
+  if(refreshBtn) refreshBtn.addEventListener('click',()=>_refreshProviderQuota(card,refreshBtn));
   return card;
 }
 
@@ -5802,6 +5946,7 @@ function _applySavedSettingsUi(saved, body, opts){
   window._showCliSessions=showCliSessions;
   window._soundEnabled=body.sound_enabled;
   window._notificationsEnabled=body.notifications_enabled;
+  window._whatsNewSummaryEnabled=!!body.whats_new_summary_enabled;
   window._showThinking=body.show_thinking!==false;
   window._simplifiedToolCalling=body.simplified_tool_calling!==false;
   window._sessionJumpButtonsEnabled=!!body.session_jump_buttons;
@@ -5863,6 +6008,7 @@ async function checkUpdatesNow(){
         if(typeof _showUpdateBanner==='function') _showUpdateBanner(data);
       } else {
         if(status){status.textContent=t('settings_up_to_date');status.style.color='var(--success)';}
+        if(typeof _showUpdateBanner==='function') _showUpdateBanner(data);
       }
     }
   } catch(e){
@@ -5914,6 +6060,7 @@ async function saveSettings(andClose){
   body.show_cli_sessions=showCliSessions;
   body.sync_to_insights=!!($('settingsSyncInsights')||{}).checked;
   body.check_for_updates=!!($('settingsCheckUpdates')||{}).checked;
+  body.whats_new_summary_enabled=!!($('settingsWhatsNewSummary')||{}).checked;
   body.sound_enabled=!!($('settingsSoundEnabled')||{}).checked;
   body.notifications_enabled=!!($('settingsNotificationsEnabled')||{}).checked;
   body.show_thinking=window._showThinking!==false;
@@ -6011,7 +6158,9 @@ function startCronPolling(){
       const data=await api(`/api/crons/recent?since=${_cronPollSince}`);
       if(data.completions&&data.completions.length>0){
         for(const c of data.completions){
-          showToast(t('cron_completion_status', c.name, c.status==='error' ? t('status_failed') : t('status_completed')),4000);
+          if(c.toast_notifications !== false){
+            showToast(t('cron_completion_status', c.name, c.status==='error' ? t('status_failed') : t('status_completed')),4000);
+          }
           _cronPollSince=Math.max(_cronPollSince,c.completed_at);
           if(c.job_id) _cronNewJobIds.add(String(c.job_id));
         }
@@ -6150,6 +6299,10 @@ function loadMcpServers(){
   }).catch(()=>{list.innerHTML=`<div class="mcp-error-state" style="color:#ef4444;font-size:12px;padding:6px 0">${esc(t('mcp_load_failed'))}</div>`});
 }
 let _mcpToolsCache=[];
+let _mcpToolsMeta={};
+let _mcpToolsPage=1;
+let _mcpToolsPageSize=5;
+const MCP_TOOLS_PAGE_SIZE_OPTIONS=[5,10,20,40];
 function _filterMcpToolsForSearch(tools, query){
   const q=(query||'').trim().toLowerCase();
   if(!q) return Array.isArray(tools)?tools:[];
@@ -6166,16 +6319,56 @@ function _mcpToolSchemaText(schemaSummary){
     return `${p.name}${req}: ${p.type||'unknown'}${desc}`;
   }).join('\n');
 }
-function _renderMcpTools(tools, query){
-  const list=$('mcpToolList');
-  if(!list) return;
-  const filtered=_filterMcpToolsForSearch(tools, query);
-  if(!filtered.length){
-    const key=query?'mcp_tools_no_matches':'mcp_tools_no_tools';
-    list.innerHTML=`<div class="mcp-tool-empty-state" style="color:var(--muted);font-size:12px;padding:6px 0">${esc(t(key))}</div>`;
+function _mcpToolsSummary(total, filtered, page, pages, query){
+  const trimmedQuery=(query||'').trim();
+  if(!filtered){
+    if(trimmedQuery) return t('mcp_tools_summary_no_matches',trimmedQuery,total);
+    return total?t('mcp_tools_summary_none'):'';
+  }
+  const pageSize=_mcpToolsPageSize||5;
+  const start=(page-1)*pageSize+1;
+  const end=Math.min(filtered,page*pageSize);
+  const searchNote=trimmedQuery?t('mcp_tools_summary_matching',trimmedQuery):'';
+  const totalNote=filtered===total?'':t('mcp_tools_summary_total_note',total);
+  return t('mcp_tools_summary_showing',start,end,filtered,searchNote,totalNote,page,pages);
+}
+function _mcpToolPageSizeControl(){
+  const options=MCP_TOOLS_PAGE_SIZE_OPTIONS.map(size=>`<option value="${size}" ${size===_mcpToolsPageSize?'selected':''}>${size}</option>`).join('');
+  return `<label class="mcp-tool-page-size">${esc(t('mcp_tools_page_size_prefix'))} <select aria-label="${esc(t('mcp_tools_per_page_aria'))}" onchange="setMcpToolsPageSize(this.value)">${options}</select> ${esc(t('mcp_tools_page_size_suffix'))}</label>`;
+}
+function _mcpToolsEmptyMessage(query){
+  const base=esc(t(query?'mcp_tools_no_matches':'mcp_tools_no_tools'));
+  const unavailable=Array.isArray(_mcpToolsMeta.unavailable_servers)?_mcpToolsMeta.unavailable_servers:[];
+  if(query||!unavailable.length) return base;
+  return `${base}<br><span class="mcp-tool-empty-detail">${esc(t('mcp_tools_inactive_configured_servers',unavailable.join(', ')))}</span>`;
+}
+function _renderMcpToolPager(filteredCount, page, pages){
+  const pager=$('mcpToolPager');
+  if(!pager) return;
+  if(pages<=1){
+    pager.innerHTML='';
     return;
   }
-  list.innerHTML=filtered.map(tool=>{
+  pager.innerHTML=`<button type="button" class="mcp-tool-page-btn" onclick="setMcpToolsPage(${page-1})" ${page<=1?'disabled':''} aria-label="${esc(t('mcp_tools_previous_page_aria'))}">${esc(t('mcp_tools_previous_page'))}</button>
+    <span class="mcp-tool-page-label">${page} / ${pages}</span>
+    <button type="button" class="mcp-tool-page-btn" onclick="setMcpToolsPage(${page+1})" ${page>=pages?'disabled':''} aria-label="${esc(t('mcp_tools_next_page_aria'))}">${esc(t('mcp_tools_next_page'))}</button>`;
+}
+function _renderMcpTools(tools, query){
+  const list=$('mcpToolList');
+  const toolbar=$('mcpToolToolbar');
+  if(!list) return;
+  const filtered=_filterMcpToolsForSearch(tools, query);
+  const total=Array.isArray(tools)?tools.length:0;
+  const pages=Math.max(1,Math.ceil(filtered.length/_mcpToolsPageSize));
+  _mcpToolsPage=Math.min(Math.max(1,_mcpToolsPage||1),pages);
+  if(toolbar) toolbar.innerHTML=`<span class="mcp-tool-summary">${esc(_mcpToolsSummary(total,filtered.length,_mcpToolsPage,pages,query))}</span>${_mcpToolPageSizeControl()}`;
+  _renderMcpToolPager(filtered.length,_mcpToolsPage,pages);
+  if(!filtered.length){
+    list.innerHTML=`<div class="mcp-tool-empty-state" style="color:var(--muted);font-size:12px;padding:6px 0">${_mcpToolsEmptyMessage(query)}</div>`;
+    return;
+  }
+  const visible=filtered.slice((_mcpToolsPage-1)*_mcpToolsPageSize,_mcpToolsPage*_mcpToolsPageSize);
+  list.innerHTML=visible.map(tool=>{
     const status=tool.status||'unknown';
     const statusBadge=`<span class="mcp-status-badge mcp-status-${esc(status)}">${esc(_mcpStatusLabel(status))}</span>`;
     const schemaText=_mcpToolSchemaText(tool.schema_summary);
@@ -6190,16 +6383,42 @@ function _renderMcpTools(tools, query){
     </div>`;
   }).join('');
 }
-function filterMcpTools(){
+function setMcpToolsPage(page){
+  _mcpToolsPage=page;
   const input=$('mcpToolSearch');
   _renderMcpTools(_mcpToolsCache,input?input.value:'');
+  const list=$('mcpToolList');
+  if(list) list.scrollTop=0;
+}
+function setMcpToolsPageSize(size){
+  const next=Number(size);
+  if(!MCP_TOOLS_PAGE_SIZE_OPTIONS.includes(next)) return;
+  _mcpToolsPageSize=next;
+  _mcpToolsPage=1;
+  const input=$('mcpToolSearch');
+  _renderMcpTools(_mcpToolsCache,input?input.value:'');
+  const list=$('mcpToolList');
+  if(list) list.scrollTop=0;
+}
+function filterMcpTools(){
+  _mcpToolsPage=1;
+  const input=$('mcpToolSearch');
+  _renderMcpTools(_mcpToolsCache,input?input.value:'');
+  const list=$('mcpToolList');
+  if(list) list.scrollTop=0;
 }
 function loadMcpTools(){
   const list=$('mcpToolList');
+  const toolbar=$('mcpToolToolbar');
+  const pager=$('mcpToolPager');
   if(!list) return;
+  if(toolbar) toolbar.textContent='';
+  if(pager) pager.innerHTML='';
   list.innerHTML=`<div style="color:var(--muted);font-size:12px;padding:6px 0">${esc(t('loading'))}</div>`;
   api('/api/mcp/tools').then(r=>{
     _mcpToolsCache=(r&&Array.isArray(r.tools))?r.tools:[];
+    _mcpToolsMeta=r||{};
+    _mcpToolsPage=1;
     filterMcpTools();
   }).catch(()=>{list.innerHTML=`<div class="mcp-tool-error-state" style="color:#ef4444;font-size:12px;padding:6px 0">${esc(t('mcp_tools_load_failed'))}</div>`});
 }

@@ -41,7 +41,7 @@ _tls = threading.local()
 _SKILL_HOME_MODULES = ("tools.skills_tool", "tools.skill_manager_tool")
 
 
-def _patch_skill_home_modules(home: Path) -> None:
+def patch_skill_home_modules(home: Path) -> None:
     """Patch imported skill modules that cache HERMES_HOME at import time."""
     for module_name in _SKILL_HOME_MODULES:
         module = sys.modules.get(module_name)
@@ -628,7 +628,7 @@ def _set_hermes_home(home: Path):
     """Set HERMES_HOME env var and monkey-patch cached module-level paths."""
     os.environ['HERMES_HOME'] = str(home)
 
-    _patch_skill_home_modules(home)
+    patch_skill_home_modules(home)
 
     # Patch cron/jobs module-level cache
     try:

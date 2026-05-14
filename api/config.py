@@ -1576,10 +1576,25 @@ def resolve_model_provider(model_id: str) -> tuple:
         and not config_provider.startswith('custom:')
     )
     _default_model = model_cfg.get('default') if isinstance(model_cfg, dict) else None
+    # Owns model if it appears in the static catalog for the configured provider.
+    _provider_models_set: set[str] = set()
+    if (
+        config_provider is not None
+        and config_provider in _PROVIDER_MODELS
+        and isinstance(_PROVIDER_MODELS[config_provider], list)
+    ):
+        _provider_models_set = {
+            m.get('id', '') for m in _PROVIDER_MODELS[config_provider]
+            if isinstance(m, dict) and isinstance(m.get('id'), str)
+        }
     _skip_custom_providers = (
         _is_explicit_non_custom_provider
-        and _default_model is not None
-        and model_id == _default_model
+        and (
+            # Guard 1: model is the configured default (existing behaviour).
+            (_default_model is not None and model_id == _default_model)
+            # Guard 2: model is owned by the configured non-custom provider.
+            or model_id in _provider_models_set
+        )
     )
     custom_providers = cfg.get('custom_providers', [])
     if isinstance(custom_providers, list) and not _skip_custom_providers:
@@ -1644,20 +1659,21 @@ def resolve_model_provider(model_id: str) -> tuple:
         # anthropic/claude-sonnet-4.6). Never strip the prefix for OpenRouter.
         if config_provider == "openrouter":
             return model_id, "openrouter", config_base_url
+        # Portal providers (Nous, OpenCode, NVIDIA NIM) serve models from multiple
+        # upstream namespaces — check them BEFORE the prefix-strip branch so that
+        # a model id whose prefix happens to equal the config_provider (e.g.
+        # nvidia/nemotron-... on NVIDIA NIM) still keeps the full namespaced path.
+        # The earlier ordering ran this guard AFTER the prefix-strip, so it never
+        # fired in the prefix==config_provider case, causing HTTP 404 from the
+        # portal which requires the full provider/model id (#2177; sibling of
+        # #854 / #894 for Nous, where this guard was originally added).
+        _PORTAL_PROVIDERS = {"nous", "opencode-zen", "opencode-go", "nvidia"}
+        if config_provider in _PORTAL_PROVIDERS:
+            return model_id, config_provider, config_base_url
         # If prefix matches config provider exactly, strip it and use that provider directly.
         # e.g. config=anthropic, model=anthropic/claude-... → bare name to anthropic API
         if config_provider and prefix == config_provider:
             return bare, config_provider, config_base_url
-        # Portal providers (Nous, OpenCode) serve models from multiple upstream
-        # namespaces — check them BEFORE the config_base_url branch so that a
-        # Nous user whose config.yaml also has a base_url doesn't accidentally
-        # fall into the prefix-stripping path (#894: minimax/minimax-m2.7 → bare
-        # name sent to Nous → 404 because Nous requires the full namespace path).
-        # NVIDIA NIM also serves models from multiple namespaces (qwen, nvidia, etc.)
-        # and requires the full model path.
-        _PORTAL_PROVIDERS = {"nous", "opencode-zen", "opencode-go", "nvidia"}
-        if config_provider in _PORTAL_PROVIDERS:
-            return model_id, config_provider, config_base_url
         # The OpenAI Codex provider uses a real base_url, but its default
         # ChatGPT endpoint cannot serve OpenRouter-style provider/model IDs.
         # Keep that narrow exception before the custom endpoint protection so
@@ -3500,7 +3516,9 @@ def get_available_models() -> dict:
                         if isinstance(cfg_models, dict):
                             raw_models = [{"id": k, "label": k} for k in cfg_models.keys()]
                         elif isinstance(cfg_models, list):
-                            raw_models = [{"id": k, "label": k} for k in cfg_models]
+                            raw_models = [{"id": k["id"] if isinstance(k, dict) else k,
+                                            "label": k.get("label", k["id"]) if isinstance(k, dict) else k}
+                                           for k in cfg_models]
 
                     if not raw_models:
                         raw_models = _models_from_live_provider_ids(
@@ -3891,6 +3909,7 @@ _SETTINGS_DEFAULTS = {
     "show_cli_sessions": False,  # merge CLI sessions from state.db into the sidebar
     "sync_to_insights": False,  # mirror WebUI token usage to state.db for /insights
     "check_for_updates": True,  # check if webui/agent repos are behind upstream
+    "whats_new_summary_enabled": False,  # show an LLM-written What's New summary before diff links
     "theme": "dark",  # light | dark | system
     "skin": "default",  # accent color skin: default | ares | mono | slate | poseidon | sisyphus | charizard
     "font_size": "default",  # small | default | large
@@ -4019,6 +4038,7 @@ _SETTINGS_BOOL_KEYS = {
     "show_cli_sessions",
     "sync_to_insights",
     "check_for_updates",
+    "whats_new_summary_enabled",
     "sound_enabled",
     "notifications_enabled",
     "show_thinking",
@@ -4039,15 +4059,18 @@ def save_settings(settings: dict) -> dict:
     theme_was_explicit = False
     skin_was_explicit = False
     # Handle _set_password: hash and store as password_hash
+    _password_changed = False
     raw_pw = settings.pop("_set_password", None)
     if raw_pw and isinstance(raw_pw, str) and raw_pw.strip():
         # Use PBKDF2 from auth module (600k iterations) -- never raw SHA-256
         from api.auth import _hash_password
 
         current["password_hash"] = _hash_password(raw_pw.strip())
+        _password_changed = True
     # Handle _clear_password: explicitly disable auth
     if settings.pop("_clear_password", False):
         current["password_hash"] = None
+        _password_changed = True
     for k, v in settings.items():
         if k in _SETTINGS_ALLOWED_KEYS:
             if k == "theme":
@@ -4089,6 +4112,12 @@ def save_settings(settings: dict) -> dict:
         json.dumps(persisted, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    # Invalidate the in-memory password hash cache so the next call to
+    # get_password_hash() picks up the new value from disk immediately.
+    if _password_changed:
+        from api.auth import _invalidate_password_hash_cache
+
+        _invalidate_password_hash_cache()
     # Update runtime defaults so new sessions use them immediately
     global DEFAULT_WORKSPACE
     if "default_workspace" in current:

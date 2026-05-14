@@ -18,6 +18,12 @@ cutting infrastructure.
   questions, Rollout plan. Skip what doesn't apply.
 - An RFC is a starting point for review. Comments and revisions land via PR
   edits, not separate discussion threads.
+- An RFC documents a design direction. It is **not** an invitation to file
+  implementation PRs against fragments of it. Before opening any PR that
+  implements an accepted RFC, confirm with a maintainer in the tracking
+  issue that the implementation slice is wanted and that no other
+  contributor is already building it. Speculative implementations of RFC
+  fragments without a confirmed integration site will be held.
 
 ## When to file an RFC
 
@@ -32,5 +38,8 @@ First-time contributor RFCs should be discussed in an issue before opening a PR.
 
 ## Current RFCs
 
+- [`hermes-run-adapter-contract.md`](hermes-run-adapter-contract.md) — Event/control
+  compatibility contract and gap matrix for moving WebUI chat runs to Hermes-owned
+  runtime execution.
 - [`turn-journal.md`](turn-journal.md) — Crash-safe WebUI turn journal for
   recovering interrupted chat submissions.

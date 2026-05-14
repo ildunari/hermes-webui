@@ -29,6 +29,81 @@ def read(rel):
 # ── api/updates.py ────────────────────────────────────────────────────────────
 
 class TestUpdateChecker:
+    def test_build_compare_url_requires_all_pieces(self):
+        import api.updates as upd
+
+        assert upd._build_compare_url(
+            'https://github.com/nesquena/hermes-webui', 'abc1234', 'def5678'
+        ) == 'https://github.com/nesquena/hermes-webui/compare/abc1234...def5678'
+        assert upd._build_compare_url(None, 'abc1234', 'def5678') is None
+        assert upd._build_compare_url('https://github.com/nesquena/hermes-webui', None, 'def5678') is None
+        assert upd._build_compare_url('https://github.com/nesquena/hermes-webui', 'abc1234', None) is None
+
+    def test_build_compare_url_rejects_unsafe_remote_urls(self):
+        import api.updates as upd
+
+        assert upd._build_compare_url('javascript:alert(1)', 'abc1234', 'def5678') is None
+        assert upd._build_compare_url('file:///tmp/hermes-webui', 'abc1234', 'def5678') is None
+        assert upd._build_compare_url('https:github.com/nesquena/hermes-webui', 'abc1234', 'def5678') is None
+        assert upd._build_compare_url('https://github.com/nesquena/hermes-webui', 'abc1234', 'def5678')
+
+    def test_check_repo_includes_compare_url_from_normalized_remote_and_merge_base(self, tmp_path, monkeypatch):
+        import api.updates as upd
+
+        (tmp_path / '.git').mkdir()
+
+        def fake_run(args, cwd, timeout=10):
+            if args[0] == 'fetch':
+                return '', True
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'origin/master', True
+            if args[:2] == ['rev-list', '--count']:
+                return '2', True
+            if args[0] == 'merge-base':
+                return 'abcdef1234567890', True
+            if args[:3] == ['rev-parse', '--short', 'abcdef1234567890']:
+                return 'abcdef1', True
+            if args[:3] == ['rev-parse', '--short', 'origin/master']:
+                return 'def5678', True
+            if args[:2] == ['remote', 'get-url']:
+                return 'git@github.com:NousResearch/hermes-agent.git', True
+            return '', True
+
+        monkeypatch.setattr(upd, '_run_git', fake_run)
+        result = upd._check_repo(tmp_path, 'agent')
+
+        assert result['repo_url'] == 'https://github.com/NousResearch/hermes-agent'
+        assert result['current_sha'] == 'abcdef1'
+        assert result['latest_sha'] == 'def5678'
+        assert result['compare_url'] == 'https://github.com/NousResearch/hermes-agent/compare/abcdef1...def5678'
+
+    def test_check_repo_omits_compare_url_when_merge_base_missing(self, tmp_path, monkeypatch):
+        import api.updates as upd
+
+        (tmp_path / '.git').mkdir()
+
+        def fake_run(args, cwd, timeout=10):
+            if args[0] == 'fetch':
+                return '', True
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'origin/master', True
+            if args[:2] == ['rev-list', '--count']:
+                return '2', True
+            if args[0] == 'merge-base':
+                return 'fatal: no merge base', False
+            if args[:3] == ['rev-parse', '--short', 'origin/master']:
+                return 'def5678', True
+            if args[:2] == ['remote', 'get-url']:
+                return 'https://github.com/nesquena/hermes-webui.git', True
+            return '', True
+
+        monkeypatch.setattr(upd, '_run_git', fake_run)
+        result = upd._check_repo(tmp_path, 'webui')
+
+        assert result['current_sha'] is None
+        assert result['latest_sha'] == 'def5678'
+        assert result['compare_url'] is None
+
     def test_repo_url_strips_only_dot_git_suffix(self, tmp_path, monkeypatch):
         import api.updates as upd
 
@@ -601,6 +676,198 @@ class TestSequentialUpdateRestartCoordination:
         assert execv_called, (
             "restart must still fire when _apply_lock is free"
         )
+
+
+
+class TestUpdateCompareSource:
+    def test_simulated_update_check_payload_includes_both_safe_compare_urls(self):
+        src = read('api/routes.py')
+        assert '"repo_url": "https://github.com/nesquena/hermes-webui"' in src
+        assert '"compare_url": "https://github.com/nesquena/hermes-webui/compare/abc1234...def5678"' in src
+        assert '"repo_url": "https://github.com/NousResearch/hermes-agent"' in src
+        assert '"compare_url": "https://github.com/NousResearch/hermes-agent/compare/aaa0001...bbb0002"' in src
+
+    def test_update_banner_html_uses_multi_target_links_container(self):
+        src = read('static/index.html')
+        assert 'id="updateWhatsNewLinks"' in src
+        assert 'id="updateWhatsNew"' not in src
+
+    def test_update_banner_frontend_uses_data_driven_compare_helpers(self):
+        src = read('static/ui.js')
+        assert 'function _isSafeUpdateCompareUrl(url)' in src
+        assert 'function _updateCompareUrl(info)' in src
+        assert 'function _updateWhatsNewTargets(data)' in src
+        assert 'function _renderUpdateWhatsNewLinks(data)' in src
+        assert "$('updateWhatsNewLinks')" in src
+        assert "compare_url" in src
+        assert "repo_url+'/compare/'+currentSha+'...'+latestSha" in src
+        assert "_isSafeUpdateCompareUrl(compareUrl)?compareUrl:null" in src
+        assert "_renderUpdateWhatsNewLinks(data);" in src
+        assert "data.webui.repo_url" not in src
+        assert "$('updateWhatsNew')" not in src
+
+    def test_update_banner_clears_stale_links_when_no_updates_remain(self):
+        src = read('static/ui.js')
+        start = src.find('function _showUpdateBanner(data)')
+        assert start != -1, "_showUpdateBanner not found"
+        fn = src[start:src.find('function dismissUpdate()', start)]
+        empty_idx = fn.find('if(!parts.length)')
+        assert empty_idx != -1, "_showUpdateBanner must handle empty update payloads"
+        empty_block = fn[empty_idx:fn.find('return;', empty_idx) + len('return;')]
+        assert '_renderUpdateWhatsNewLinks(data);' in empty_block
+        assert "classList.remove('visible')" in empty_block
+
+    def test_manual_up_to_date_check_clears_update_banner(self):
+        src = read('static/panels.js')
+        up_to_date_idx = src.find("settings_up_to_date")
+        assert up_to_date_idx != -1, "manual update up-to-date branch not found"
+        block = src[up_to_date_idx:up_to_date_idx + 300]
+        assert "_showUpdateBanner(data)" in block
+
+
+class TestWhatsNewSummaryToggle:
+    def test_settings_default_and_persistence_allow_whats_new_summary_toggle(self):
+        src = read('api/config.py')
+        assert '"whats_new_summary_enabled": False' in src
+        bool_keys_start = src.find('_SETTINGS_BOOL_KEYS')
+        assert bool_keys_start != -1
+        bool_keys = src[bool_keys_start:src.find('}', bool_keys_start)]
+        assert '"whats_new_summary_enabled"' in bool_keys
+
+    def test_settings_panel_places_summary_toggle_next_to_update_check(self):
+        src = read('static/index.html')
+        check_idx = src.find('id="settingsCheckUpdates"')
+        summary_idx = src.find('id="settingsWhatsNewSummary"')
+        assert check_idx != -1, "settingsCheckUpdates checkbox missing"
+        assert summary_idx != -1, "settingsWhatsNewSummary checkbox missing"
+        assert check_idx < summary_idx, "summary toggle should sit after the update-check toggle"
+        nearby = src[summary_idx:summary_idx + 900]
+        assert 'settings_label_whats_new_summary' in nearby
+        assert 'settings_desc_whats_new_summary' in nearby
+
+    def test_settings_js_loads_saves_and_boots_summary_toggle(self):
+        panels = read('static/panels.js')
+        boot = read('static/boot.js')
+        assert "$('settingsWhatsNewSummary')" in panels
+        assert 'payload.whats_new_summary_enabled' in panels
+        assert 'settings.whats_new_summary_enabled' in panels
+        assert 'body.whats_new_summary_enabled' in panels
+        assert 'window._whatsNewSummaryEnabled' in boot
+        assert 'whats_new_summary_enabled' in boot
+
+    def test_update_banner_summary_flow_keeps_diff_links_after_summary(self):
+        src = read('static/ui.js')
+        assert 'function _renderUpdateSummaryPanel' in src
+        assert 'async function showWhatsNewSummary' in src
+        assert "api('/api/updates/summary'" in src
+        assert 'updateSummaryDiffLinks' in src
+        assert 'Regular diff comparison' in src
+        assert 'updateSummarySections' in src
+        assert 'Generate WebUI update summary' in src
+        assert 'Generate Agent update summary' in src
+        assert 'View generated WebUI update summary' in src
+        assert 'View generated Agent update summary' in src
+        assert 'Re-generate WebUI update summary' in src
+        assert 'Re-generate Agent update summary' in src
+        assert 'window._whatsNewGeneratedSummaries' in src
+        assert 'sessionStorage' in src
+        assert 'hermes-whats-new-generated-summaries' in src
+        assert 'function _loadStoredUpdateSummaries' in src
+        assert 'function _persistGeneratedSummaries' in src
+        assert 'function _pruneGeneratedSummaries' in src
+        assert 'function _updateSummarySignature' in src
+        assert 'function _updateSummaryButtonLabel' in src
+        assert 'showWhatsNewSummary(target.key)' in src
+        assert 'target?{[target]:data[target]}:data' in src
+        assert 'target:target||null' in src
+        assert '_renderUpdateWhatsNewLinks(data,{mode' in src
+        assert 'window._whatsNewSummaryEnabled' in src
+
+    def test_summary_endpoint_and_prompt_are_human_readable_not_technical(self):
+        routes = read('api/routes.py')
+        updates = read('api/updates.py')
+        assert '"/api/updates/summary"' in routes
+        assert 'summarize_update_payload' in routes
+        assert 'def summarize_update_payload' in updates
+        assert 'human-readable' in updates
+        assert 'avoid technical jargon' in updates
+        assert 'regular diff comparison' in updates
+        assert 'Return only bullets' in updates
+        assert 'def _format_update_summary_sections' in updates
+
+    def test_update_summary_formats_llm_text_into_stable_sections(self):
+        from api.updates import summarize_update_payload
+
+        payload = {
+            'webui': {'behind': 2, 'current_sha': 'abc', 'latest_sha': 'def', 'compare_url': 'https://example.test/webui'},
+            'agent': {'behind': 1, 'current_sha': 'aaa', 'latest_sha': 'bbb', 'compare_url': 'https://example.test/agent'},
+        }
+        result = summarize_update_payload(
+            payload,
+            llm_callback=lambda _system, _prompt: 'The settings panel is easier to understand. Update prompts are clearer.',
+            use_cache=False,
+        )
+        assert result['summary_sections'][0]['title'] == "What you'll notice"
+        assert result['summary_sections'][1]['title'] == 'Worth knowing'
+        assert result['summary_sections'][0]['items']
+        assert result['summary_sections'][1]['items']
+        assert 'regular diff comparison' not in ' '.join(result['summary_sections'][1]['items']).lower()
+        assert 'What you\'ll notice' in result['summary']
+        assert 'Worth knowing' in result['summary']
+        assert '- The settings panel is easier to understand.' in result['summary']
+
+    def test_update_summary_cache_reuses_same_update_summary(self):
+        import api.updates as upd
+
+        upd._summary_cache.clear()
+        calls = []
+        payload = {
+            'webui': {'behind': 2, 'current_sha': 'abc', 'latest_sha': 'def', 'compare_url': 'https://example.test/webui'},
+        }
+
+        def fake_llm(_system, _prompt):
+            calls.append(True)
+            return f'- Stable cached summary #{len(calls)}'
+
+        first = upd.summarize_update_payload(payload, llm_callback=fake_llm)
+        second = upd.summarize_update_payload(payload, llm_callback=fake_llm)
+        changed = upd.summarize_update_payload(
+            {'webui': {'behind': 3, 'current_sha': 'abc', 'latest_sha': 'xyz', 'compare_url': 'https://example.test/webui2'}},
+            llm_callback=fake_llm,
+        )
+        assert len(calls) == 2
+        assert second['summary'] == first['summary']
+        assert second['cached'] is True
+        assert changed['summary'] != first['summary']
+    def test_update_summary_can_be_generated_per_target_and_cached_separately(self):
+        import api.updates as upd
+
+        upd._summary_cache.clear()
+        calls = []
+        payload = {
+            'webui': {'behind': 2, 'current_sha': 'web-a', 'latest_sha': 'web-b', 'compare_url': 'https://example.test/webui'},
+            'agent': {'behind': 1, 'current_sha': 'agent-a', 'latest_sha': 'agent-b', 'compare_url': 'https://example.test/agent'},
+        }
+
+        def fake_llm(_system, prompt):
+            calls.append(prompt)
+            if 'Agent:' in prompt:
+                return '- Agent startup is clearer.'
+            return '- WebUI settings are easier to use.'
+
+        webui = upd.summarize_update_payload(payload, target='webui', llm_callback=fake_llm)
+        agent = upd.summarize_update_payload(payload, target='agent', llm_callback=fake_llm)
+        webui_again = upd.summarize_update_payload(payload, target='webui', llm_callback=fake_llm)
+
+        assert len(calls) == 2
+        assert webui['target'] == 'webui'
+        assert agent['target'] == 'agent'
+        assert [t['name'] for t in webui['targets']] == ['webui']
+        assert [t['name'] for t in agent['targets']] == ['agent']
+        assert 'WebUI settings are easier to use.' in webui['summary']
+        assert 'Agent startup is clearer.' in agent['summary']
+        assert webui_again['cached'] is True
+        assert webui_again['summary'] == webui['summary']
 
 
 # ── Regression: force button reset on retry ──────────────────────────────────

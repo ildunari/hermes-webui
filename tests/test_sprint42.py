@@ -213,6 +213,7 @@ class TestRuntimeRouteInjection(unittest.TestCase):
 
         fake_session = FakeSession()
         fake_stream_id = "stream-runtime-route"
+        fake_session.active_stream_id = fake_stream_id
         fake_queue = queue.Queue()
         fake_runtime_module = types.ModuleType("hermes_cli.runtime_provider")
         fake_runtime_module.resolve_runtime_provider = resolve_runtime_provider
@@ -362,7 +363,10 @@ class TestRuntimeRouteInjection(unittest.TestCase):
         fake_hermes_state = types.ModuleType("hermes_state")
         fake_hermes_state.SessionDB = mock.Mock(return_value=object())
 
-        with mock.patch.object(streaming, "get_session", return_value=FakeSession()), \
+        fake_session = FakeSession()
+        fake_session.active_stream_id = fake_stream_id
+
+        with mock.patch.object(streaming, "get_session", return_value=fake_session), \
              mock.patch.object(streaming, "_get_ai_agent", return_value=CapturingAgent), \
              mock.patch.object(streaming, "resolve_model_provider", return_value=("gpt-4o", "openai-codex", None)), \
              mock.patch("api.config.get_config", return_value={}), \
@@ -506,7 +510,10 @@ class TestRuntimeRouteInjection(unittest.TestCase):
         fake_hermes_state = types.ModuleType("hermes_state")
         fake_hermes_state.SessionDB = mock.Mock(return_value=object())
 
-        with mock.patch.object(streaming, "get_session", return_value=FakeSession()), \
+        fake_session = FakeSession()
+        fake_session.active_stream_id = fake_stream_id
+
+        with mock.patch.object(streaming, "get_session", return_value=fake_session), \
              mock.patch.object(streaming, "_get_ai_agent", return_value=CapturingAgent), \
              mock.patch.object(streaming, "resolve_model_provider", return_value=("gpt-5.4", "openai-codex", None)), \
              mock.patch.object(streaming, "get_config", return_value={"clarify": {"timeout": 300}}), \
@@ -841,7 +848,10 @@ class TestCredentialPoolBackwardCompat(unittest.TestCase):
         fake_hermes_state = types.ModuleType("hermes_state")
         fake_hermes_state.SessionDB = mock.Mock(return_value=None)
 
-        with mock.patch.object(streaming, "get_session", return_value=FakeSession()), \
+        fake_session = FakeSession()
+        fake_session.active_stream_id = fake_stream_id
+
+        with mock.patch.object(streaming, "get_session", return_value=fake_session), \
              mock.patch.object(streaming, "_get_ai_agent", return_value=OlderAgent), \
              mock.patch.object(streaming, "resolve_model_provider", return_value=("gpt-4o", "openai", None)), \
              mock.patch("api.config.get_config", return_value={}), \

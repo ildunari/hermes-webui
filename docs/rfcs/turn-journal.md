@@ -93,6 +93,43 @@ assistant_started -> interrupted
 4. After the sidecar save that includes the assistant answer succeeds, append `completed`.
 5. On cancellation or known worker exception, append `interrupted` with a reason.
 
+## Synchronous durability design rationale
+
+The `submitted` event uses synchronous `fsync` on every write today. This is a deliberate tradeoff between latency and crash-safety guarantees:
+
+### Why synchronous for submitted events
+
+The `submitted` event is the durability anchor for the entire recovery story. If the server crashes before the worker starts, the journal must reflect that the user message was received. Async writes risk losing that guarantee: a crash shortly after a non-fsync'd write could leave the journal silent while `pending_user_message` still exists, creating ambiguity during recovery. The current design avoids that ambiguity at the cost of one extra disk round-trip per turn submission.
+
+### Latency expectations by storage type
+
+Reported fsync latency varies significantly across storage backends. Approximate qualitative ranges to keep in mind:
+
+- **SSD (NVM/NVMe)**: Single-digit milliseconds; p99 typically well under 10 ms on modern hardware. Most turn submissions will see sub-5 ms overhead.
+- **Rotational disk (HDD)**: Seek time dominates; p50 ~5–15 ms, p99 can reach 50–100 ms under load. A busy server with many concurrent submissions may see queueing effects.
+- **Docker/overlay filesystems**: fsync latency depends on the container storage driver and the backing host filesystem. Write-through and copy-on-write semantics can introduce additional overhead; p95 may be 10–50 ms in typical containerized deployments, though exact figures vary by configuration and host load.
+
+These ranges are order-of-magnitude guidance, not benchmarks. Exact figures depend on hardware, kernel version, filesystem mount options, and concurrent load. Do not commit specific millisecond claims to documentation without measured evidence.
+
+### Benchmark guidance for maintainers
+
+If evidence suggests the synchronous write is a bottleneck, measure before changing anything:
+
+1. Instrument the `append_turn_journal_event` helper to record wall-clock time for each event type (submitted, worker_started, etc.).
+2. Capture p50/p95/p99 append/fsync latency over a representative workload (e.g., at least 1,000 submitted turns under realistic concurrency).
+3. Isolate the fsync component: on Linux, use `strace -e fsync` or kernel tracing (`ftrace`, `perf`) to confirm where time is spent.
+4. Check for patterns: if most submissions are under 5 ms but the p99 is 200 ms due to occasional disk contention, async writes help the tail but not the median. The tradeoff must be evaluated in context of your recovery guarantees.
+
+### Future follow-up: async lifecycle-event journaling
+
+Making journal writes asynchronous is a valid future optimization, but it requires:
+
+- A reliable flush strategy (e.g., time-bounded flush every N seconds, flush on session close, flush after K pending events).
+- Recovery logic that handles partial flush windows: if a crash occurs before the flush, the last few submitted events may be missing from the journal. Recovery must account for that ambiguity.
+- Tests that verify the flush correctness under crash injection.
+
+Async journal writes are **not** part of the initial implementation. They belong in a follow-up RFC once the synchronous baseline is proven stable and the recovery semantics are well-understood.
+
 ## Startup recovery semantics
 
 On startup, for each journal file:

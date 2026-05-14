@@ -125,10 +125,17 @@ def _account_usage_preexec_fn() -> None:
 
 
 _ACCOUNT_USAGE_SUBPROCESS_CODE = r"""
+import base64
 import json
 import sys
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from urllib import request as urllib_request
 
 from agent.account_usage import fetch_account_usage
+
+
+_CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 
 def _iso(value):
@@ -165,9 +172,185 @@ def _snapshot_payload(snapshot):
     }
 
 
+def _snapshot_available(snapshot):
+    if snapshot is None:
+        return False
+    try:
+        return bool(getattr(snapshot, "available", False))
+    except Exception:
+        return False
+
+
+def _number(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        number = float(text)
+        return int(number) if number.is_integer() else number
+    except Exception:
+        return None
+
+
+def _parse_dt(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _title_case_slug(value):
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return None
+    return cleaned.replace("_", " ").replace("-", " ").title()
+
+
+def _resolve_codex_usage_url(base_url):
+    normalized = str(base_url or "").strip().rstrip("/") or _CODEX_DEFAULT_BASE_URL
+    if normalized.endswith("/codex"):
+        normalized = normalized[: -len("/codex")]
+    if "/backend-api" in normalized:
+        return normalized + "/wham/usage"
+    return normalized + "/api/codex/usage"
+
+
+def _jwt_claims(token):
+    if not isinstance(token, str) or token.count(".") != 2:
+        return {}
+    payload = token.split(".")[1]
+    payload += "=" * ((4 - len(payload) % 4) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8"))
+    except Exception:
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def _codex_usage_headers(access_token):
+    headers = {
+        "Authorization": "Bearer " + access_token,
+        "Accept": "application/json",
+        "User-Agent": "codex_cli_rs/0.0.0 (Hermes WebUI)",
+        "originator": "codex_cli_rs",
+    }
+    auth_claim = _jwt_claims(access_token).get("https://api.openai.com/auth")
+    account_id = None
+    if isinstance(auth_claim, dict):
+        account_id = auth_claim.get("chatgpt_account_id")
+    if isinstance(account_id, str) and account_id.strip():
+        headers["ChatGPT-Account-ID"] = account_id.strip()
+    return headers
+
+
+def _entry_value(entry, *names):
+    for name in names:
+        try:
+            value = getattr(entry, name)
+        except Exception:
+            value = None
+        if value in (None, ""):
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _codex_snapshot_from_usage_payload(payload):
+    if not isinstance(payload, dict):
+        payload = {}
+    rate_limit = payload.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        rate_limit = {}
+    windows = []
+    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+        window = rate_limit.get(key)
+        if not isinstance(window, dict):
+            continue
+        used = _number(window.get("used_percent"))
+        if used is None:
+            continue
+        windows.append(SimpleNamespace(
+            label=label,
+            used_percent=float(used),
+            reset_at=_parse_dt(window.get("reset_at")),
+            detail=None,
+        ))
+
+    details = []
+    credits = payload.get("credits")
+    if isinstance(credits, dict) and credits.get("has_credits"):
+        balance = _number(credits.get("balance"))
+        if balance is not None:
+            details.append("Credits balance: $" + format(float(balance), ".2f"))
+        elif credits.get("unlimited"):
+            details.append("Credits balance: unlimited")
+
+    return SimpleNamespace(
+        provider="openai-codex",
+        source="usage_api",
+        title="Account limits",
+        plan=_title_case_slug(payload.get("plan_type")),
+        windows=tuple(windows),
+        details=tuple(details),
+        available=bool(windows or details),
+        unavailable_reason=None,
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+
+def _fetch_codex_account_usage_from_pool():
+    try:
+        from agent.credential_pool import load_pool
+
+        pool = load_pool("openai-codex")
+        entry = pool.select() if pool is not None else None
+        if entry is None:
+            return None
+        access_token = _entry_value(entry, "runtime_api_key", "access_token")
+        if not access_token:
+            return None
+        base_url = _entry_value(entry, "runtime_base_url", "base_url") or _CODEX_DEFAULT_BASE_URL
+        request = urllib_request.Request(
+            _resolve_codex_usage_url(base_url),
+            headers=_codex_usage_headers(access_token),
+        )
+        with urllib_request.urlopen(request, timeout=15.0) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+        return _codex_snapshot_from_usage_payload(payload)
+    except Exception:
+        return None
+
+
 provider = sys.argv[1]
 api_key = sys.argv[2] or None
-print(json.dumps(_snapshot_payload(fetch_account_usage(provider, api_key=api_key))))
+try:
+    snapshot = fetch_account_usage(provider, api_key=api_key)
+except Exception:
+    snapshot = None
+if str(provider or "").strip().lower() == "openai-codex" and not _snapshot_available(snapshot):
+    fallback_snapshot = _fetch_codex_account_usage_from_pool()
+    if _snapshot_available(fallback_snapshot) or snapshot is None:
+        snapshot = fallback_snapshot
+print(json.dumps(_snapshot_payload(snapshot)))
 """
 
 # SECTION: Provider ↔ env var mapping

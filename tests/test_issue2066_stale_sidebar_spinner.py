@@ -33,7 +33,12 @@ def test_cache_render_purges_stale_non_streaming_inflight_entries():
     assert "if (s && s.session_id) sessionsById.set(s.session_id, s);" in purge_block
     assert "const s = sessionsById.get(sid);" in purge_block
     assert "_allSessionsById" not in purge_block
-    assert "if (s && !s.is_streaming)" in purge_block
+    # Non-streaming sessions that ARE in _allSessions are purged (original #2066
+    # semantics).  Sessions absent from _allSessions are also purged (adds #2092
+    # ghost-entry cleanup); the guard check for !sessionsById.has(sid) must come
+    # before the non-streaming check for code clarity and correctness.
+    assert "if (!sessionsById.has(sid))" in purge_block
+    assert "!s.is_streaming" in purge_block
     assert "delete INFLIGHT[sid];" in purge_block
     assert "clearInflightState(sid);" in purge_block
     assert "_purgeStaleInflightEntries();" in render_block
@@ -62,10 +67,12 @@ console.log(JSON.stringify({{inflight: INFLIGHT, cleared}}));
     result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
     payload = json.loads(result.stdout)
 
+    # With #2092, sessions absent from _allSessions (like `unknown-session`)
+    # are also purged and have clearInflightState called for them.  `done-session`
+    # remains in _allSessions with is_streaming=false so it is still purged too.
     assert payload == {
         "inflight": {
             "running-session": True,
-            "unknown-session": True,
         },
-        "cleared": ["done-session"],
+        "cleared": sorted(["unknown-session", "done-session"]),
     }

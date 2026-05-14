@@ -165,7 +165,7 @@ class TestSysModulesLookupInEnvLock:
                 lock_lines.append(line)
 
         lock_source = "\n".join(lock_lines)
-        assert "_patch_skill_home_modules" in lock_source, (
+        assert "patch_skill_home_modules" in lock_source, (
             "Inside `_ENV_LOCK`, streaming must use the shared skill module "
             "cache patch helper instead of duplicating module-specific logic "
             "(#2023/#2024)"
@@ -179,15 +179,15 @@ class TestSysModulesLookupInEnvLock:
                 node
                 for node in ast.walk(tree)
                 if isinstance(node, ast.FunctionDef)
-                and node.name == "_patch_skill_home_modules"
+                and node.name == "patch_skill_home_modules"
             ),
             None,
         )
-        assert helper is not None, "_patch_skill_home_modules() must be defined"
+        assert helper is not None, "patch_skill_home_modules() must be defined"
 
         helper_source = ast.get_source_segment(source, helper) or ""
         assert "sys.modules.get" in helper_source, (
-            "_patch_skill_home_modules() must use sys.modules.get(), not import, "
+            "patch_skill_home_modules() must use sys.modules.get(), not import, "
             "so env-lock callers do not trigger first-time imports (#2024)"
         )
         assert "HERMES_HOME" in helper_source

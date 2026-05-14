@@ -8,10 +8,14 @@ at most twice per hour regardless of client count.
 Skips repos that are not git checkouts (e.g. Docker baked images where
 .git does not exist).
 """
+import hashlib
+import json
+import re
 import subprocess
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from api.config import REPO_ROOT, STREAMS, STREAMS_LOCK
 
@@ -22,6 +26,7 @@ except ImportError:
     _AGENT_DIR = None
 
 _update_cache = {'webui': None, 'agent': None, 'checked_at': 0}
+_summary_cache = {}
 _cache_lock = threading.Lock()
 _check_in_progress = False
 _apply_lock = threading.Lock()   # prevents concurrent stash/pull/pop on same repo
@@ -169,6 +174,16 @@ def _normalize_remote_url(remote_url):
     return remote_url.rstrip('/')
 
 
+def _build_compare_url(repo_url, current_sha, latest_sha):
+    """Return a safe browser compare URL, or None when any piece is missing."""
+    if not (repo_url and current_sha and latest_sha):
+        return None
+    parsed = urlparse(repo_url)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        return None
+    return f"{repo_url}/compare/{current_sha}...{latest_sha}"
+
+
 def _split_remote_ref(ref):
     """Split 'origin/branch-name' into ('origin', 'branch-name').
 
@@ -262,6 +277,7 @@ def _check_repo(path, name):
         'latest_sha': latest,
         'branch': compare_ref,
         'repo_url': remote_url,
+        'compare_url': _build_compare_url(remote_url, current, latest),
     }
 
 
@@ -287,6 +303,234 @@ def check_for_updates(force=False):
             return dict(_update_cache)
     finally:
         _check_in_progress = False
+
+
+def _repo_path_for_update_target(target: str):
+    if target == 'webui':
+        return REPO_ROOT
+    if target == 'agent':
+        return _AGENT_DIR
+    return None
+
+
+def _commit_subjects_for_update(info: dict, *, limit: int = 24) -> list[str]:
+    """Return commit subjects for an update range, if the local git refs exist."""
+    if not isinstance(info, dict):
+        return []
+    target = info.get('name')
+    if target not in ('webui', 'agent'):
+        target = 'webui' if info.get('repo_url', '').endswith('hermes-webui') else target
+    path = _repo_path_for_update_target(target)
+    if path is None or not (Path(path) / '.git').exists():
+        return []
+    current = str(info.get('current_sha') or '').strip()
+    latest = str(info.get('latest_sha') or '').strip()
+    if not (current and latest):
+        return []
+    out, ok = _run_git(['log', '--format=%s', f'{current}..{latest}', f'-n{limit}'], path, timeout=5)
+    if not ok or not out:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _summary_cache_key(updates: dict, details: list[dict]) -> str:
+    """Stable key for the exact update range being summarized."""
+    payload = []
+    for item in details:
+        payload.append({
+            'name': item.get('name'),
+            'behind': item.get('behind'),
+            'current_sha': item.get('current_sha'),
+            'latest_sha': item.get('latest_sha'),
+            'compare_url': item.get('compare_url'),
+        })
+    blob = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
+def _clean_summary_bullet(line: str) -> str:
+    line = re.sub(r'^\s*(?:[-*•]+|\d+[.)])\s*', '', str(line or '')).strip()
+    line = re.sub(r'\s+', ' ', line)
+    if not line:
+        return ''
+    if line[-1] not in '.!?':
+        line += '.'
+    return line[:240]
+
+
+def _summary_bullets_from_text(text: str, *, fallback_items: list[str]) -> list[str]:
+    raw = str(text or '').strip()
+    candidates = []
+    for line in raw.splitlines():
+        cleaned = _clean_summary_bullet(line)
+        if cleaned:
+            candidates.append(cleaned)
+    if len(candidates) <= 1 and raw:
+        candidates = [_clean_summary_bullet(part) for part in re.split(r'(?<=[.!?])\s+', raw)]
+        candidates = [item for item in candidates if item]
+    if not candidates:
+        candidates = [_clean_summary_bullet(item) for item in fallback_items]
+    seen = set()
+    bullets = []
+    for item in candidates:
+        key = item.lower()
+        if item and key not in seen:
+            bullets.append(item)
+            seen.add(key)
+        if len(bullets) >= 5:
+            break
+    return bullets or ['Updates are available.']
+
+
+def _fallback_update_bullets(details: list[dict]) -> list[str]:
+    bullets = []
+    for item in details:
+        label = item.get('label') or item.get('name') or 'Hermes'
+        behind = item.get('behind') or 0
+        commits = item.get('commits') or []
+        if commits:
+            highlights = '; '.join(commits[:3])
+            bullets.append(f"{label} has {behind} update(s), including: {highlights}.")
+        else:
+            bullets.append(f"{label} has {behind} update(s) available.")
+    return bullets or ['Updates are available.']
+
+
+def _worth_knowing_bullets(details: list[dict]) -> list[str]:
+    targets = [
+        f"{item.get('label') or item.get('name') or 'Hermes'} ({item.get('behind') or 0} update{'s' if (item.get('behind') or 0) != 1 else ''})"
+        for item in details
+        if item.get('behind')
+    ]
+    if len(targets) > 1:
+        return ['This summary combines updates from ' + ' and '.join(targets) + '.']
+    if targets:
+        return ['This summary covers ' + targets[0] + '.']
+    return ['No update details were available to summarize.']
+
+
+def _format_update_summary_sections(summary_text: str, details: list[dict]) -> tuple[list[dict], str]:
+    bullets = _summary_bullets_from_text(summary_text, fallback_items=_fallback_update_bullets(details))
+    if len(bullets) > 1:
+        notice_items = bullets[:3]
+        worth_items = bullets[3:] or bullets[1:]
+    else:
+        notice_items = bullets
+        worth_items = []
+    worth_items = worth_items[:2] or _worth_knowing_bullets(details)
+    sections = [
+        {
+            'title': "What you'll notice",
+            'items': notice_items,
+        },
+        {
+            'title': 'Worth knowing',
+            'items': worth_items,
+        },
+    ]
+    lines = []
+    for section in sections:
+        lines.append(section['title'])
+        lines.extend(f"- {item}" for item in section['items'])
+        lines.append('')
+    return sections, '\n'.join(lines).strip()
+
+
+def _fallback_update_summary(updates: dict, details: list[dict]) -> str:
+    _sections, summary = _format_update_summary_sections('', details)
+    return summary
+
+
+def _update_summary_prompt(details: list[dict]) -> tuple[str, str]:
+    system = (
+        "You write human-readable release summaries for Hermes users. "
+        "Focus on what the user will notice in the product. Keep it simple, specific, and short. "
+        "avoid technical jargon, implementation details, SHA names, branch names, and file paths unless necessary. "
+        "Return only bullets. Do not include headings, markdown tables, intro paragraphs, or closing notes."
+    )
+    user_lines = [
+        "Summarize these available updates as 3-5 concise bullets.",
+        "Use everyday language and explain visible behavior changes, not code mechanics.",
+        "Return only bullets; the WebUI will add the fixed section headings separately.",
+        "",
+    ]
+    for item in details:
+        user_lines.append(f"{item['label']}: {item['behind']} commit(s) behind")
+        commits = item.get('commits') or []
+        if commits:
+            user_lines.extend(f"- {subject}" for subject in commits)
+        else:
+            user_lines.append("- No local commit subjects available; summarize only the update count.")
+        user_lines.append("")
+    return system, '\n'.join(user_lines)
+
+
+def summarize_update_payload(updates: dict, llm_callback=None, *, target: str | None = None, use_cache: bool = True) -> dict:
+    """Build a human-readable What's New summary and keep regular diff comparison links.
+
+    ``llm_callback`` receives ``(system_prompt, user_prompt)`` and returns text.
+    The caller may wire that to AIAgent; this module keeps a deterministic
+    fallback so the banner remains useful when no LLM provider is configured.
+    Summaries are cached per exact update range so refreshes do not generate
+    slightly different wording for the same available updates.
+    """
+    if not isinstance(updates, dict):
+        updates = {}
+    requested_target = target if target in ('webui', 'agent') else None
+    details = []
+    for key, label in (('webui', 'WebUI'), ('agent', 'Agent')):
+        if requested_target and key != requested_target:
+            continue
+        info = updates.get(key)
+        if not isinstance(info, dict) or int(info.get('behind') or 0) <= 0:
+            continue
+        item = {
+            'name': key,
+            'label': label,
+            'behind': int(info.get('behind') or 0),
+            'current_sha': info.get('current_sha'),
+            'latest_sha': info.get('latest_sha'),
+            'compare_url': info.get('compare_url'),
+            'commits': _commit_subjects_for_update({'name': key, **info}),
+        }
+        details.append(item)
+    cache_key = _summary_cache_key(updates, details)
+    if use_cache:
+        with _cache_lock:
+            cached = _summary_cache.get(cache_key)
+        if cached:
+            result = dict(cached)
+            result['cached'] = True
+            return result
+
+    generated_by = 'fallback'
+    candidate = ''
+    if details and callable(llm_callback):
+        system, prompt = _update_summary_prompt(details)
+        try:
+            candidate = (llm_callback(system, prompt) or '').strip()
+            if candidate:
+                generated_by = 'llm'
+        except Exception:
+            candidate = ''
+    sections, summary = _format_update_summary_sections(candidate, details)
+    result = {
+        'ok': True,
+        'summary': summary,
+        'summary_sections': sections,
+        'generated_by': generated_by,
+        'cached': False,
+        'cache_key': cache_key,
+        'target': requested_target,
+        'targets': details,
+    }
+    if use_cache:
+        with _cache_lock:
+            _summary_cache[cache_key] = dict(result)
+    return result
+
+
+# ── Self-update application ───────────────────────────────────────────────────
 
 
 def _schedule_restart(delay: float = 2.0) -> None:
