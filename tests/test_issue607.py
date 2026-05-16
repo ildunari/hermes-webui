@@ -88,6 +88,20 @@ class TestGemma4ThinkingTokenStrip:
         result = _strip_thinking_markup(raw)
         assert result == raw
 
+    def test_leading_the_user_is_asking_wrapper_line_is_stripped(self):
+        """A leading title-wrapper line is metadata; the visible answer should remain."""
+        raw = "The user is asking about Python imports.\nUse importlib for dynamic imports."
+        result = _strip_thinking_markup(raw)
+        assert result == "Use importlib for dynamic imports."
+
+    def test_mid_response_the_user_is_asking_line_is_preserved(self):
+        """Only the leading wrapper line is stripped; normal mid-response prose survives."""
+        raw = "First, define the context.\nThe user is asking us to be patient.\nThen answer."
+        result = _strip_thinking_markup(raw)
+        assert "First, define the context." in result
+        assert "The user is asking us to be patient." in result
+        assert "Then answer." in result
+
     def test_minimax_channel_without_second_pipe_still_stripped_at_start(self):
         """The client-facing MiniMax <|channel>thought shape is stripped when leading."""
         raw = "<|channel>thought\nSome reasoning<channel|>Answer"

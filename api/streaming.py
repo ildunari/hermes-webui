@@ -24,6 +24,7 @@ from api.config import (
     STREAMS, STREAMS_LOCK, CANCEL_FLAGS, AGENT_INSTANCES, STREAM_PARTIAL_TEXT,
     STREAM_REASONING_TEXT, STREAM_LIVE_TOOL_CALLS,
     STREAM_GOAL_RELATED, PENDING_GOAL_CONTINUATION,
+    STREAM_LAST_EVENT_ID,
     LOCK, SESSIONS, SESSION_DIR,
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
     register_active_run, update_active_run, unregister_active_run,
@@ -31,16 +32,22 @@ from api.config import (
     resolve_model_provider,
     resolve_custom_provider_connection,
     model_with_provider_context,
+    load_settings,
 )
 from api.helpers import redact_session_data, _redact_text
 from api.compression_anchor import visible_messages_for_anchor
 from api.metering import meter
+from api.run_journal import RunJournalWriter
 from api.turn_journal import append_turn_journal_event_for_stream
 
 # Global lock for os.environ writes. Per-session locks (_agent_lock) prevent
 # concurrent runs of the SAME session, but two DIFFERENT sessions can still
 # interleave their os.environ writes. This global lock serializes the env
-# save/restore around the entire agent run.
+# save/restore — held only briefly across the env-mutation critical section,
+# NOT for the entire agent run. The agent runs outside the lock; the finally
+# block re-acquires to atomically restore env vars. See narrow-lock pattern
+# in _run_agent_streaming (line ~2719) and profile_env_for_background_worker
+# (api/profiles.py:715).
 _ENV_LOCK = threading.Lock()
 
 
@@ -130,6 +137,71 @@ def _clarify_timeout_seconds(default: int = 120) -> int:
 _CANCEL_MARKER_PATTERNS = ('task cancelled', 'task canceled', 'response interrupted')
 
 
+_WEBUI_VISIBLE_PROGRESS_PROMPT = """
+WebUI progress contract:
+- For multi-step work that uses tools, provide brief user-visible progress updates as normal assistant content before continuing with tool calls.
+- Each update should say what you are about to check, what you just confirmed, or why the next tool call is needed.
+- Keep updates concise, factual, and in the user's language. One or two short sentences are enough.
+- Do not reveal hidden reasoning, chain-of-thought, private scratchpads, secrets, raw logs, or long tool output.
+- For direct answers or very short tasks, skip progress updates and answer normally.
+""".strip()
+
+
+def _webui_ephemeral_system_prompt(personality_prompt: Optional[str]) -> str:
+    """Build WebUI-only runtime instructions that are not persisted to history."""
+    parts = []
+    if personality_prompt:
+        parts.append(str(personality_prompt).strip())
+    parts.append(_WEBUI_VISIBLE_PROGRESS_PROMPT)
+    return "\n\n".join(part for part in parts if part)
+
+
+def _has_new_assistant_reply(all_messages: list, prev_count: int) -> bool:
+    """Return True if *new* messages (beyond ``prev_count``) contain an
+    assistant message with non-empty content.
+
+    ``all_messages`` is ``result.get('messages')`` which includes the full
+    conversation history.  ``prev_count`` is ``len(_previous_context_messages)``
+    — the number of messages present before the current turn started.  Only
+    messages at index >= prev_count are inspected so that historical assistant
+    replies don't mask a silent failure on the current turn.
+
+    If ``len(all_messages) < prev_count`` (an edge-case shrink), there is no
+    reliable new-message slice to inspect. Treat that as "no new assistant
+    reply" so stale historical assistant replies cannot mask a silent failure.
+    When ``len == prev_count``, there are no new messages and we return False.
+    """
+    if len(all_messages) > prev_count:
+        # Normal case: new messages appended beyond the pre-turn history.
+        candidates = all_messages[prev_count:]
+    elif len(all_messages) < prev_count:
+        return False
+    else:
+        # Same length. In production this means no new messages were appended.
+        # However, some test fixtures replace the entire message list rather
+        # than appending, so check whether the tail changed.
+        return False
+    return any(
+        m.get('role') == 'assistant' and str(m.get('content') or '').strip()
+        for m in candidates
+    )
+
+
+def _preferred_agent_display_name() -> str:
+    """Return the configured assistant display name for user-facing copy."""
+    try:
+        name = str((load_settings() or {}).get('bot_name') or '').strip()
+    except Exception:
+        logger.debug("Failed to load bot_name for cancellation copy", exc_info=True)
+        name = ''
+    return name or 'Hermes'
+
+
+def _cancelled_turn_hint(agent_name: str | None = None) -> str:
+    name = str(agent_name or _preferred_agent_display_name()).strip() or 'Hermes'
+    return f'The run was cancelled by the user before {name} finished. No provider failure occurred.'
+
+
 def _classify_provider_error(err_str: str, exc=None, *, silent_failure: bool = False) -> dict:
     """Classify provider/agent failure text for WebUI apperror UX.
 
@@ -166,7 +238,7 @@ def _classify_provider_error(err_str: str, exc=None, *, silent_failure: bool = F
         return {
             'label': 'Task cancelled',
             'type': 'cancelled',
-            'hint': 'The run was cancelled by the user before Skyly finished. No provider failure occurred.',
+            'hint': _cancelled_turn_hint(),
         }
     if _is_interrupted:
         return {
@@ -283,7 +355,7 @@ def _cancelled_turn_content(message: str = 'Task cancelled.') -> str:
         _message += '.'
     return (
         f"**Task cancelled:** {_message}\n\n"
-        "*The run was cancelled by the user before Skyly finished. No provider failure occurred.*"
+        f"*{_cancelled_turn_hint()}*"
     )
 
 
@@ -551,9 +623,96 @@ def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, se
         'TERMINAL_CWD': str(workspace),
         'HERMES_EXEC_ASK': '1',
         'HERMES_SESSION_KEY': session_id,
+        'HERMES_SESSION_ID': session_id,
+        'HERMES_SESSION_PLATFORM': 'webui',
         'HERMES_HOME': profile_home,
     })
     return env
+
+
+def _format_process_notification(evt: dict) -> str:
+    """Format a completed background process notification for agent input."""
+    if not isinstance(evt, dict):
+        return ''
+    if evt.get('type') != 'completion':
+        return ''
+    _sid = evt.get('session_id', '')
+    _cmd = evt.get('command', '')
+    _exit = evt.get('exit_code', '')
+    _out = evt.get('output') or ''
+    if len(_out) > 4000:
+        _out = _out[:4000] + '\n... (truncated)'
+    return (
+        f"[IMPORTANT: Background process {_sid} completed (exit code {_exit}).\n"
+        f"Command: {_cmd}\n"
+        f"Output:\n{_out}]"
+    )
+
+
+def _mark_process_completion_consumed(process_registry, process_id: str) -> None:
+    """Best-effort bridge to the agent registry's private completion marker."""
+    try:
+        with process_registry._lock:
+            process_registry._completion_consumed.add(process_id)
+    except Exception:
+        logger.debug("Failed to mark process completion consumed", exc_info=True)
+
+
+def _drain_webui_process_notifications(session_id: str) -> list[str]:
+    """Return completion notifications that belong to this WebUI session.
+
+    The agent registry completion queue is process-wide and events do not carry
+    the WebUI session key directly. Look up the live process session before
+    delivery so completions from other tabs remain queued for their owners.
+    """
+    if not session_id:
+        return []
+    try:
+        from tools.process_registry import process_registry
+    except Exception:
+        return []
+
+    notifications: list[str] = []
+    skipped_events: list[dict] = []
+    completion_queue = getattr(process_registry, 'completion_queue', None)
+    if completion_queue is None:
+        return []
+
+    while True:
+        try:
+            evt = completion_queue.get_nowait()
+        except queue.Empty:
+            break
+        except Exception:
+            logger.debug("Failed to drain process completion queue", exc_info=True)
+            break
+
+        evt_sid = str(evt.get('session_id') or '') if isinstance(evt, dict) else ''
+        if not evt_sid:
+            skipped_events.append(evt)
+            continue
+        try:
+            if process_registry.is_completion_consumed(evt_sid):
+                continue
+            proc = process_registry.get(evt_sid)
+        except Exception:
+            proc = None
+        if getattr(proc, 'session_key', None) != session_id:
+            skipped_events.append(evt)
+            continue
+
+        notification = _format_process_notification(evt)
+        if notification:
+            notifications.append(notification)
+            _mark_process_completion_consumed(process_registry, evt_sid)
+
+    for evt in skipped_events:
+        try:
+            completion_queue.put(evt)
+        except Exception:
+            logger.debug("Failed to requeue process completion event", exc_info=True)
+            break
+    return notifications
 
 
 def _attachment_name(att) -> str:
@@ -651,6 +810,20 @@ def _build_native_multimodal_message(workspace_ctx: str, msg_text: str, attachme
 
     parts = [{'type': 'text', 'text': workspace_ctx + msg_text}]
     workspace_root = Path(workspace).expanduser().resolve()
+    # Stage-361 maintainer fix (Opus SHOULD-FIX): chat uploads from #2319 now
+    # land in ~/.hermes/webui/attachments/<sid>/ (outside workspace_root by
+    # design). The pre-existing `path.relative_to(workspace_root)` guard would
+    # silently reject every image upload for vision-capable models. Allow the
+    # configured attachment root in addition to workspace_root so native
+    # multimodal embeds still build the base64 image_url part. The
+    # _attachment_root() helper applies expanduser+resolve and is also reused
+    # by _upload_destination — single source of truth for the inbox root.
+    try:
+        from api.upload import _attachment_root
+        attachment_root = _attachment_root()
+        _allowed_roots = (workspace_root, attachment_root)
+    except Exception:
+        _allowed_roots = (workspace_root,)
     image_count = 0
 
     for att in attachments or []:
@@ -661,9 +834,11 @@ def _build_native_multimodal_message(workspace_ctx: str, msg_text: str, attachme
             continue
         try:
             path = Path(raw_path).expanduser().resolve()
-            # Uploads should live inside the selected workspace. Do not read
-            # arbitrary paths from client-provided attachment metadata.
-            path.relative_to(workspace_root)
+            # Uploads should live inside the selected workspace OR the
+            # session attachment inbox (#2319). Do not read arbitrary paths
+            # from client-provided attachment metadata.
+            if not any(path.is_relative_to(r) for r in _allowed_roots):
+                continue
             if not path.is_file():
                 continue
             size = path.stat().st_size
@@ -695,7 +870,7 @@ def _strip_thinking_markup(text: str) -> str:
     s = re.sub(r'^\s*<think>.*?</think>\s*', ' ', s, flags=re.IGNORECASE | re.DOTALL)
     s = re.sub(r'^\s*<\|channel\|?>thought\n?.*?<channel\|>\s*', ' ', s, flags=re.IGNORECASE | re.DOTALL)
     s = re.sub(r'^\s*<\|turn\|>thinking\n.*?<turn\|>\s*', ' ', s, flags=re.IGNORECASE | re.DOTALL)  # Gemma 4
-    s = re.sub(r'^\s*(the|ther)\s+user\s+is\s+asking.*$', ' ', s, flags=re.IGNORECASE | re.MULTILINE)
+    s = re.sub(r'^\s*(the|ther)\s+user\s+is\s+asking[^\n]*(?:\n|$)', ' ', s, flags=re.IGNORECASE)
     # Strip plain-text thinking preambles from models that don't use <think> tags (e.g. Qwen3).
     # These appear as the very first sentence of the assistant response and are not useful as titles.
     s = re.sub(
@@ -1436,24 +1611,27 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
         if not still_auto:
             _put_title_status(put_event, session_id, 'skipped', 'manual_title', current)
             return
-        aux_title_configured = _aux_title_configured()
-        if agent and not aux_title_configured:
-            next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
-            if not next_title and llm_status in ('llm_error', 'llm_invalid'):
-                next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent, use_agent_model=True)
-        else:
-            next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text)
-            if not next_title and agent and llm_status in ('llm_error_aux', 'llm_invalid_aux'):
+        from api import profiles as profiles_api
+
+        with profiles_api.profile_env_for_background_worker(s, "background title", logger_override=logger):
+            aux_title_configured = _aux_title_configured()
+            if agent and not aux_title_configured:
                 next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
-        source = llm_status
-        if not next_title:
-            fallback_title = _fallback_title_from_exchange(user_text, assistant_text)
-            if fallback_title and not _is_generic_fallback_title(fallback_title):
-                logger.debug("Using local fallback for session title generation")
-                next_title = fallback_title
-                source = 'fallback'
-            elif fallback_title:
-                logger.debug("Skipping generic local fallback for session title generation: %r", fallback_title)
+                if not next_title and llm_status in ('llm_error', 'llm_invalid'):
+                    next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent, use_agent_model=True)
+            else:
+                next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text)
+                if not next_title and agent and llm_status in ('llm_error_aux', 'llm_invalid_aux'):
+                    next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
+            source = llm_status
+            if not next_title:
+                fallback_title = _fallback_title_from_exchange(user_text, assistant_text)
+                if fallback_title and not _is_generic_fallback_title(fallback_title):
+                    logger.debug("Using local fallback for session title generation")
+                    next_title = fallback_title
+                    source = 'fallback'
+                elif fallback_title:
+                    logger.debug("Skipping generic local fallback for session title generation: %r", fallback_title)
         fallback_reason = (
             f'local_summary:{llm_status}'
             if source == 'fallback' and llm_status
@@ -1516,15 +1694,18 @@ def _run_background_title_refresh(session_id: str, user_text: str, assistant_tex
             return
         if not effective or effective in ('Untitled', 'New Chat'):
             return
-        aux_title_configured = _aux_title_configured()
-        if agent and not aux_title_configured:
-            next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
-            if not next_title and llm_status in ('llm_error', 'llm_invalid'):
-                next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent, use_agent_model=True)
-        else:
-            next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text)
-            if not next_title and agent and llm_status in ('llm_error_aux', 'llm_invalid_aux'):
+        from api import profiles as profiles_api
+
+        with profiles_api.profile_env_for_background_worker(s, "background title", logger_override=logger):
+            aux_title_configured = _aux_title_configured()
+            if agent and not aux_title_configured:
                 next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
+                if not next_title and llm_status in ('llm_error', 'llm_invalid'):
+                    next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent, use_agent_model=True)
+            else:
+                next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text)
+                if not next_title and agent and llm_status in ('llm_error_aux', 'llm_invalid_aux'):
+                    next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
         if not next_title:
             _put_title_status(put_event, session_id, 'refresh_skipped', llm_status or 'empty', effective, raw_preview)
             return
@@ -1556,6 +1737,96 @@ def _run_background_title_refresh(session_id: str, user_text: str, assistant_tex
         logger.debug("Background title refresh failed for session %s", session_id, exc_info=True)
 
 
+def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
+    """Persist old_sid as a read-only pre-compression snapshot.
+
+    Context compression rotates the active WebUI session id from old_sid to the
+    agent's new continuation id. The old JSON must remain on disk for lineage
+    traversal, but it should not continue to appear as an active sidebar row.
+    """
+    old_path = SESSION_DIR / f'{old_sid}.json'
+    if not old_path.exists():
+        return
+    try:
+        existing_text = old_path.read_text(encoding='utf-8')
+        try:
+            existing = json.loads(existing_text)
+            existing_msgs = len(existing.get('messages') or [])
+            existing_snapshot = bool(existing.get('pre_compression_snapshot'))
+        except (json.JSONDecodeError, ValueError):
+            # Treat corrupt/malformed old JSON as missing history and rewrite it
+            # from the in-memory pre-compression messages below. That is safer
+            # than leaving an unreadable recovery snapshot behind.
+            existing_msgs = -1
+            existing_snapshot = False
+        if len(s.messages) > existing_msgs:
+            # In-memory messages are newer than the file; save the full old
+            # snapshot from the current session object while preserving its
+            # pre-existing parent_session_id lineage.
+            saved_sid = s.session_id
+            saved_snapshot = bool(getattr(s, 'pre_compression_snapshot', False))
+            s.session_id = old_sid
+            s.pre_compression_snapshot = True
+            # Stage-359 / PR #2295: clear runtime stream-state fields on the
+            # archived snapshot so the sidebar does not reopen the parent as
+            # a permanently-running session while the child already holds the
+            # completed answer. The continuation session's live state is
+            # restored from saved_* locals in the finally block.
+            saved_active_stream_id = getattr(s, 'active_stream_id', None)
+            saved_pending_user_message = getattr(s, 'pending_user_message', None)
+            saved_pending_attachments = list(getattr(s, 'pending_attachments', []) or [])
+            saved_pending_started_at = getattr(s, 'pending_started_at', None)
+            s.active_stream_id = None
+            s.pending_user_message = None
+            s.pending_attachments = []
+            s.pending_started_at = None
+            try:
+                # skip_index=False so the snapshot appears in _index.json with
+                # the pre_compression_snapshot marker. The sidebar projection
+                # (#2285) reads that marker to hide the snapshot from active
+                # rows while keeping the JSON discoverable for lineage traversal.
+                s.save(touch_updated_at=False, skip_index=False)
+                logger.info(
+                    "Preserved pre-compression session %s (%d messages) to disk",
+                    old_sid, len(s.messages),
+                )
+            finally:
+                s.session_id = saved_sid
+                s.pre_compression_snapshot = saved_snapshot
+                s.active_stream_id = saved_active_stream_id
+                s.pending_user_message = saved_pending_user_message
+                s.pending_attachments = saved_pending_attachments
+                s.pending_started_at = saved_pending_started_at
+            return
+        # Existing file is already at least as complete as memory; stamp only
+        # the snapshot marker so index/sidebar projection can hide it without
+        # rewriting a shorter messages array over a fuller transcript.
+        from api.models import Session
+        snapshot = Session.load(old_sid)
+        if snapshot:
+            snapshot.pre_compression_snapshot = True
+            # Stage-359 Opus SHOULD-FIX: clear runtime fields on the loaded
+            # snapshot too. If the disk snapshot was last persisted while the
+            # parent was live, it could carry a stale active_stream_id /
+            # pending_* over to disk. The sidebar projection filters snapshot
+            # rows so this is latent today, but the contract should match the
+            # primary branch above so future readers can trust snapshot files
+            # to never contain live runtime state.
+            snapshot.active_stream_id = None
+            snapshot.pending_user_message = None
+            snapshot.pending_attachments = []
+            snapshot.pending_started_at = None
+            snapshot.save(touch_updated_at=False, skip_index=False)
+            logger.info(
+                "Marked pre-compression session %s as sidebar-hidden snapshot",
+                old_sid,
+            )
+    except OSError:
+        logger.debug("Could not read old session file before preservation")
+    except Exception:
+        logger.debug("Failed to preserve pre-compression session file", exc_info=True)
+
+
 def _maybe_schedule_title_refresh(session, put_event, agent):
     """Check if the session is due for an adaptive title refresh and schedule it."""
     refresh_interval = _get_title_refresh_interval()
@@ -1579,7 +1850,32 @@ def _maybe_schedule_title_refresh(session, put_event, agent):
     ).start()
 
 
-def _sanitize_messages_for_api(messages):
+def _strip_native_image_parts_from_content(content):
+    """Return provider-safe content with native image parts removed.
+
+    Text-only provider endpoints (for example DeepSeek/OpenAI-compatible text
+    models) reject historical OpenAI-style ``image_url`` parts before the agent
+    can recover.  When WebUI is configured for text-mode image handling, preserve
+    textual content from mixed content arrays and drop only the native image
+    blocks from replayed history.
+    """
+    if not isinstance(content, list):
+        return content
+    clean_parts = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get('type') == 'image_url' or 'image_url' in part:
+            continue
+        clean_parts.append(copy.deepcopy(part))
+    if not clean_parts:
+        return ''
+    if len(clean_parts) == 1 and clean_parts[0].get('type') == 'text':
+        return str(clean_parts[0].get('text') or '')
+    return clean_parts
+
+
+def _sanitize_messages_for_api(messages, *, cfg: dict = None):
     """Return a deep copy of messages with only API-safe fields.
 
     The webui stores extra metadata on messages (attachments, timestamp, _ts)
@@ -1591,7 +1887,14 @@ def _sanitize_messages_for_api(messages):
     (Mercury-2/Inception, newer OpenAI models) reject histories containing dangling
     tool results with a 400 error: "Message has tool role, but there was no previous
     assistant message with a tool call."
+
+    If ``agent.image_input_mode`` resolves to ``text``, native historical
+    ``image_url`` content parts are stripped too.  Current-turn uploads already
+    respect text mode in ``_build_native_multimodal_message``; this closes the
+    remaining replay gap where an older native image in the saved transcript kept
+    causing 400s on every later text-only turn (#2297).
     """
+    strip_native_images = cfg is not None and _resolve_image_input_mode(cfg) == "text"
     # First pass: collect all tool_call_ids declared by assistant messages.
     # Handles both OpenAI ('id') and Anthropic ('call_id') field names.
     valid_tool_call_ids: set = set()
@@ -1620,6 +1923,8 @@ def _sanitize_messages_for_api(messages):
                 # Orphaned tool result — skip to avoid 400 from strict providers.
                 continue
         sanitized = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS}
+        if strip_native_images and 'content' in sanitized:
+            sanitized['content'] = _strip_native_image_parts_from_content(sanitized.get('content'))
         if sanitized.get('role'):
             clean.append(sanitized)
     return clean
@@ -2178,6 +2483,145 @@ def _attempt_credential_self_heal(
         return None
 
 
+def _agent_cache_api_key_sig(resolved_api_key, credential_pool) -> str:
+    """Return the cache-signature component for runtime credentials.
+
+    Credential-pool providers can legitimately hand WebUI a different runtime
+    token on each request (round-robin pools, OAuth refresh, auth self-heal).
+    The AIAgent object is also where cross-turn memory-provider state lives, so
+    using the volatile token itself in the cache signature silently defeats the
+    per-session agent cache and drops warmed Hindsight prefetch results.
+    """
+    if credential_pool is not None:
+        return 'credential-pool'
+    import hashlib as _hashlib
+    return _hashlib.sha256((resolved_api_key or '').encode()).hexdigest()[:16]
+
+
+def _refresh_cached_agent_runtime(agent, agent_kwargs: dict) -> bool:
+    """Refresh volatile runtime credentials on a reused cached AIAgent.
+
+    The cache key intentionally ignores credential-pool token churn, but the
+    cached agent's LLM client still needs the latest selected/refreshed runtime
+    key. Keep long-lived provider/session state (memory prefetch, turn counters,
+    tool state) while swapping only the runtime credential/client.
+    """
+    if agent is None or not isinstance(agent_kwargs, dict):
+        return False
+
+    new_pool = agent_kwargs.get('credential_pool')
+    if new_pool is not None:
+        try:
+            agent._credential_pool = new_pool
+        except Exception:
+            pass
+
+    new_key = agent_kwargs.get('api_key') or ''
+    if not new_key:
+        return True
+
+    new_base = agent_kwargs.get('base_url') or getattr(agent, 'base_url', '') or ''
+    if getattr(agent, '_fallback_activated', False):
+        # Avoid mixing a refreshed primary credential into a live fallback
+        # runtime. Rebuilding is safer than mutating a fallback-active agent
+        # whose restore/cooldown state has not run yet for this turn.
+        return False
+
+    if new_key == (getattr(agent, 'api_key', '') or ''):
+        _refresh_cached_agent_primary_runtime_snapshot(agent)
+        return True
+
+    try:
+        if getattr(agent, 'api_mode', None) == 'anthropic_messages':
+            # Native Anthropic-style clients have their own construction path;
+            # switch_model() already handles token/client refresh there.
+            if hasattr(agent, 'switch_model'):
+                agent.switch_model(
+                    agent_kwargs.get('model') or getattr(agent, 'model', None),
+                    agent_kwargs.get('provider') or getattr(agent, 'provider', None),
+                    api_key=new_key,
+                    base_url=new_base,
+                    api_mode=agent_kwargs.get('api_mode') or getattr(agent, 'api_mode', ''),
+                )
+                return True
+            return False
+
+        if not hasattr(agent, '_client_kwargs') or not hasattr(agent, '_replace_primary_openai_client'):
+            # Test/fake-agent fallback: keep metadata accurate even if no real
+            # OpenAI client exists to rebuild.
+            agent.api_key = new_key
+            if new_base:
+                agent.base_url = new_base
+            _refresh_cached_agent_primary_runtime_snapshot(agent)
+            return True
+
+        client_kwargs = dict(getattr(agent, '_client_kwargs', {}) or {})
+        client_kwargs['api_key'] = new_key
+        if new_base:
+            client_kwargs['base_url'] = new_base
+        agent._client_kwargs = client_kwargs
+        agent.api_key = new_key
+        if new_base:
+            agent.base_url = new_base
+        if hasattr(agent, '_apply_client_headers_for_base_url'):
+            agent._apply_client_headers_for_base_url(agent.base_url)
+        rebuilt = bool(agent._replace_primary_openai_client(reason='webui_credential_refresh'))
+        if rebuilt:
+            _refresh_cached_agent_primary_runtime_snapshot(agent)
+        return rebuilt
+    except Exception:
+        logger.debug('[webui] Failed to refresh cached agent runtime credentials', exc_info=True)
+        return False
+
+
+def _refresh_cached_agent_primary_runtime_snapshot(agent) -> None:
+    """Keep AIAgent's primary-runtime snapshot aligned with refreshed creds.
+
+    Long-lived AIAgent instances use `_primary_runtime` to restore the preferred
+    provider after fallback/transport recovery. If WebUI refreshes a cached
+    agent's runtime token but leaves that snapshot stale, a later restore can
+    resurrect the old credential and undo the refresh.
+    """
+    rt = getattr(agent, '_primary_runtime', None)
+    if not isinstance(rt, dict):
+        return
+
+    base_url = getattr(agent, 'base_url', rt.get('base_url'))
+    api_key = getattr(agent, 'api_key', rt.get('api_key', ''))
+    client_kwargs = dict(getattr(agent, '_client_kwargs', None) or rt.get('client_kwargs', {}) or {})
+
+    rt['base_url'] = base_url
+    rt['api_key'] = api_key
+    rt['client_kwargs'] = client_kwargs
+
+    # The default context compressor usually tracks the primary runtime too;
+    # keep both the live compressor fields and the fallback-restoration
+    # snapshot aligned when those attributes exist.
+    cc = getattr(agent, 'context_compressor', None)
+    if cc is not None:
+        if hasattr(cc, 'base_url'):
+            cc.base_url = base_url
+        if hasattr(cc, 'api_key'):
+            cc.api_key = api_key
+        if 'compressor_base_url' in rt:
+            rt['compressor_base_url'] = getattr(cc, 'base_url', base_url)
+        if 'compressor_api_key' in rt:
+            rt['compressor_api_key'] = getattr(cc, 'api_key', api_key)
+    else:
+        if 'compressor_base_url' in rt:
+            rt['compressor_base_url'] = base_url
+        if 'compressor_api_key' in rt:
+            rt['compressor_api_key'] = api_key
+
+    if getattr(agent, 'api_mode', None) == 'anthropic_messages':
+        if hasattr(agent, '_anthropic_api_key'):
+            rt['anthropic_api_key'] = getattr(agent, '_anthropic_api_key')
+        if hasattr(agent, '_anthropic_base_url'):
+            rt['anthropic_base_url'] = getattr(agent, '_anthropic_base_url')
+        if hasattr(agent, '_is_anthropic_oauth'):
+            rt['is_anthropic_oauth'] = getattr(agent, '_is_anthropic_oauth')
+
+
 def _run_agent_streaming(
     session_id,
     msg_text,
@@ -2208,6 +2652,11 @@ def _run_agent_streaming(
         provider=model_provider,
         ephemeral=bool(ephemeral),
     )
+    try:
+        run_journal = RunJournalWriter(session_id, stream_id)
+    except Exception:
+        run_journal = None
+        logger.debug("Failed to initialize run journal for stream %s", stream_id, exc_info=True)
     if not ephemeral:
         try:
             append_turn_journal_event_for_stream(
@@ -2222,6 +2671,8 @@ def _run_agent_streaming(
     old_cwd = None
     old_exec_ask = None
     old_session_key = None
+    old_session_id = None
+    old_session_platform = None
     old_hermes_home = None
     old_profile_env = {}
 
@@ -2362,6 +2813,22 @@ def _run_agent_streaming(
         # If cancelled, drop all further events except the cancel event itself
         if cancel_event.is_set() and event not in ('cancel', 'error'):
             return
+        if run_journal is not None:
+            try:
+                journaled = run_journal.append_sse_event(event, data)
+                # Stage-364: propagate journal event_id via a side-channel dict
+                # (STREAM_LAST_EVENT_ID) instead of changing the queue tuple
+                # shape — keeping the 2-tuple shape preserves backward
+                # compatibility for tests and any non-SSE queue consumer. The
+                # SSE handler reads this dict at emit time to populate `id:`
+                # on every live frame, which lets the frontend's cursor
+                # advance during live streaming and prevents replay from
+                # double-rendering tokens after a mid-stream error→reconnect.
+                event_id = (journaled or {}).get('event_id') if isinstance(journaled, dict) else None
+                if event_id:
+                    STREAM_LAST_EVENT_ID[stream_id] = event_id
+            except Exception:
+                logger.debug("Failed to append run journal event %s for stream %s", event, stream_id, exc_info=True)
         try:
             q.put_nowait((event, data))
         except Exception:
@@ -2472,11 +2939,15 @@ def _run_agent_streaming(
             old_cwd = os.environ.get('TERMINAL_CWD')
             old_exec_ask = os.environ.get('HERMES_EXEC_ASK')
             old_session_key = os.environ.get('HERMES_SESSION_KEY')
+            old_session_id = os.environ.get('HERMES_SESSION_ID')
+            old_session_platform = os.environ.get('HERMES_SESSION_PLATFORM')
             old_hermes_home = os.environ.get('HERMES_HOME')
             os.environ.update(_profile_runtime_env)
             os.environ['TERMINAL_CWD'] = str(s.workspace)
             os.environ['HERMES_EXEC_ASK'] = '1'
             os.environ['HERMES_SESSION_KEY'] = session_id
+            os.environ['HERMES_SESSION_ID'] = session_id
+            os.environ['HERMES_SESSION_PLATFORM'] = 'webui'
             if _profile_home:
                 os.environ['HERMES_HOME'] = _profile_home
                 # Patch module-level caches to match the active profile.
@@ -3036,11 +3507,16 @@ def _run_agent_streaming(
                 import hashlib as _hashlib
                 import json as _json
                 from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
+                _credential_pool = _rt.get('credential_pool')
                 _sig_blob = _json.dumps([
                     resolved_model or '',
-                    _hashlib.sha256((resolved_api_key or '').encode()).hexdigest()[:16],
+                    _agent_cache_api_key_sig(resolved_api_key, _credential_pool),
                     resolved_base_url or '',
                     resolved_provider or '',
+                    _rt.get('api_mode') or '',
+                    _rt.get('command') or '',
+                    _rt.get('args') or [],
+                    bool(_credential_pool),
                     _max_iterations_cfg or '',
                     _max_tokens_cfg or '',
                     _fallback_resolved or {},
@@ -3063,6 +3539,23 @@ def _run_agent_streaming(
                         agent = _cached[0]
                         SESSION_AGENT_CACHE.move_to_end(session_id)  # LRU: mark as recently used
                         logger.debug('[webui] Reusing cached agent for session %s', session_id)
+
+                if agent is not None:
+                    # Refresh volatile runtime credentials selected from provider
+                    # pools without discarding cross-turn agent/provider state.
+                    if not _refresh_cached_agent_runtime(agent, _agent_kwargs):
+                        logger.warning(
+                            '[webui] Cached agent runtime could not be safely refreshed; rebuilding agent for session %s',
+                            session_id,
+                        )
+                        try:
+                            if getattr(agent, '_session_db', None) is not None:
+                                agent._session_db.close()
+                        except Exception:
+                            pass
+                        with SESSION_AGENT_CACHE_LOCK:
+                            SESSION_AGENT_CACHE.pop(session_id, None)
+                        agent = None
 
                 if agent is not None:
                     # Refresh per-turn callbacks — these close over request-scoped
@@ -3113,7 +3606,6 @@ def _run_agent_streaming(
                             # released until GC finalizes the agent, which on a
                             # long-running server may be never. Close it
                             # explicitly so the WAL handles release immediately.
-                            # (Opus pre-release follow-up to #1421.)
                             try:
                                 _evicted_agent = evicted_entry[0] if isinstance(evicted_entry, tuple) else None
                                 if _evicted_agent is not None and getattr(_evicted_agent, '_session_db', None) is not None:
@@ -3170,9 +3662,11 @@ def _run_agent_streaming(
                         _personality_prompt = '\n'.join(p for p in _parts if p)
                     else:
                         _personality_prompt = str(_pval)
-            # Pass personality via ephemeral_system_prompt (agent's own mechanism)
-            if _personality_prompt:
-                agent.ephemeral_system_prompt = _personality_prompt
+            # Pass WebUI-only runtime guidance via ephemeral_system_prompt
+            # (agent's own mechanism). This preserves any selected personality
+            # while making long tool runs emit real user-visible interim text
+            # through interim_assistant_callback instead of frontend guesses.
+            agent.ephemeral_system_prompt = _webui_ephemeral_system_prompt(_personality_prompt)
             _pending_started_at = getattr(s, 'pending_started_at', None)
             # Normal chat-start sets pending_started_at before spawning this thread;
             # fallback to now only for recovered/legacy flows where that marker is absent
@@ -3228,11 +3722,15 @@ def _run_agent_streaming(
             )
             _ckpt_thread.start()
 
-            user_message = _build_native_multimodal_message(workspace_ctx, msg_text, attachments, workspace, cfg=_cfg)
+            _process_notifications = _drain_webui_process_notifications(session_id)
+            _agent_msg_text = msg_text
+            if _process_notifications:
+                _agent_msg_text = "\n\n".join([*_process_notifications, msg_text]).strip()
+            user_message = _build_native_multimodal_message(workspace_ctx, _agent_msg_text, attachments, workspace, cfg=_cfg)
             result = agent.run_conversation(
                 user_message=user_message,
                 system_message=workspace_system_msg,
-                conversation_history=_sanitize_messages_for_api(_previous_context_messages),
+                conversation_history=_sanitize_messages_for_api(_previous_context_messages, cfg=_cfg),
                 task_id=session_id,
                 persist_user_message=msg_text,
             )
@@ -3360,10 +3858,13 @@ def _run_agent_streaming(
                 # an empty final_response without raising — the stream would end with
                 # a done event containing zero assistant messages, leaving the user with
                 # no feedback. Emit an apperror so the client shows an inline error.
-                _assistant_added = any(
-                    m.get('role') == 'assistant' and str(m.get('content') or '').strip()
-                    for m in (result.get('messages') or [])
-                )
+                #
+                # Only check NEW messages added by this turn — result.get('messages')
+                # includes the full conversation history, so checking all of them would
+                # match assistant content from prior turns and mask the real failure.
+                _all_result_messages = result.get('messages') or []
+                _prev_len = len(_previous_context_messages)
+                _assistant_added = _has_new_assistant_reply(_all_result_messages, _prev_len)
                 # _token_sent tracks whether on_token() was called (any streamed text)
                 if not _assistant_added and not _token_sent:
                     if cancel_event.is_set():
@@ -3440,14 +3941,12 @@ def _run_agent_streaming(
                                 _heal_result = agent.run_conversation(
                                     user_message=user_message,
                                     system_message=workspace_system_msg,
-                                    conversation_history=_sanitize_messages_for_api(_previous_context_messages),
+                                    conversation_history=_sanitize_messages_for_api(_previous_context_messages, cfg=_cfg),
                                     task_id=session_id,
                                     persist_user_message=msg_text,
                                 )
-                                _heal_ok = any(
-                                    m.get('role') == 'assistant' and str(m.get('content') or '').strip()
-                                    for m in (_heal_result.get('messages') or [])
-                                ) or _token_sent
+                                _heal_all_msgs = _heal_result.get('messages') or []
+                                _heal_ok = _has_new_assistant_reply(_heal_all_msgs, _prev_len) or _token_sent
                             except Exception as _retry_exc:
                                 logger.warning(
                                     '[webui] self-heal: retry also failed: %s', _retry_exc,
@@ -3567,9 +4066,6 @@ def _run_agent_streaming(
                 if _agent_sid and _agent_sid != session_id:
                     old_sid = session_id
                     new_sid = _agent_sid
-                    # Rename the session file
-                    old_path = SESSION_DIR / f'{old_sid}.json'
-                    new_path = SESSION_DIR / f'{new_sid}.json'
                     s.session_id = new_sid
                     # Carry profile identity across the compression boundary.
                     # Without this, s.profile stays None on the continuation
@@ -3587,6 +4083,30 @@ def _run_agent_streaming(
                             "Stamped profile=%r on continuation session %s after compression",
                             _resolved_profile_name, new_sid,
                         )
+                    # Preserve the original session file so the full pre-compression
+                    # history survives even when summarisation fails.  The previous
+                    # implementation renamed old_sid.json → new_sid.json, which
+                    # destroyed the only persistent copy of the uncompressed history
+                    # before the new (possibly summary-only) session had been saved.
+                    # If the LLM summariser also failed, the user was left with zero
+                    # recoverable messages.  (#2223)
+                    # ---
+                    # Archive the old session: write its current state to disk so
+                    # the full conversation history survives even when context
+                    # compression removes messages from the model's context.  Skip
+                    # the write when the file already contains up-to-date data
+                    # (i.e. it was just saved by a checkpoint).
+                    _preserve_pre_compression_snapshot(s, old_sid)
+                    # Always link the continuation session to its immediate predecessor
+                    # (the preserved snapshot).  This OVERRIDES any prior
+                    # parent_session_id because the new continuation IS the next link
+                    # in the chain: traversal walks new → old → old.parent → ... root.
+                    # Stage-353 Opus SHOULD-FIX: previous `if not s.parent_session_id`
+                    # guard skipped this stamp on fork-of-fork compressions, so a
+                    # subsequent traversal from the new continuation would jump
+                    # over the just-preserved snapshot back to the original fork
+                    # parent, losing access to the recoverable history in old_sid.json.
+                    s.parent_session_id = old_sid
                     with LOCK:
                         if old_sid in SESSIONS:
                             SESSIONS[new_sid] = SESSIONS.pop(old_sid)
@@ -3603,11 +4123,6 @@ def _run_agent_streaming(
                         _cached_entry = SESSION_AGENT_CACHE.pop(old_sid, None)
                         if _cached_entry:
                             SESSION_AGENT_CACHE[new_sid] = _cached_entry
-                    if old_path.exists() and not new_path.exists():
-                        try:
-                            old_path.rename(new_path)
-                        except OSError:
-                            logger.debug("Failed to rename session file during compression")
                     _compressed = True
                 # Also detect compression via the result dict or compressor state
                 if not _compressed:
@@ -4101,6 +4616,10 @@ def _run_agent_streaming(
                 else: os.environ['HERMES_EXEC_ASK'] = old_exec_ask
                 if old_session_key is None: os.environ.pop('HERMES_SESSION_KEY', None)
                 else: os.environ['HERMES_SESSION_KEY'] = old_session_key
+                if old_session_id is None: os.environ.pop('HERMES_SESSION_ID', None)
+                else: os.environ['HERMES_SESSION_ID'] = old_session_id
+                if old_session_platform is None: os.environ.pop('HERMES_SESSION_PLATFORM', None)
+                else: os.environ['HERMES_SESSION_PLATFORM'] = old_session_platform
                 if old_hermes_home is None: os.environ.pop('HERMES_HOME', None)
                 else: os.environ['HERMES_HOME'] = old_hermes_home
 
@@ -4201,7 +4720,7 @@ def _run_agent_streaming(
                         _heal_result = _heal_agent.run_conversation(
                             user_message=user_message,
                             system_message=workspace_system_msg,
-                            conversation_history=_sanitize_messages_for_api(_previous_context_messages),
+                            conversation_history=_sanitize_messages_for_api(_previous_context_messages, cfg=_cfg),
                             task_id=session_id,
                             persist_user_message=msg_text,
                         )
@@ -4332,6 +4851,7 @@ def _run_agent_streaming(
             STREAM_REASONING_TEXT.pop(stream_id, None)  # Clean up reasoning trace (#1361 §A)
             STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)  # Clean up tool calls (#1361 §B)
             STREAM_GOAL_RELATED.pop(stream_id, None)  # Clean up goal-related flag (#1932)
+            STREAM_LAST_EVENT_ID.pop(stream_id, None)  # Clean up event_id pointer (stage-364)
             unregister_active_run(stream_id)
             # NOTE: do NOT discard PENDING_GOAL_CONTINUATION here. The marker
             # is set by goal_continue (line ~3328) inside the SAME function

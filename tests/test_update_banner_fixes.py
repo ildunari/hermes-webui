@@ -18,6 +18,9 @@ import threading
 import time
 import sys
 import os
+import io
+import json
+import types
 
 REPO = pathlib.Path(__file__).parent.parent
 
@@ -418,7 +421,172 @@ class TestForceUpdateRoute:
         )
 
 
-# ── static/ui.js ──────────────────────────────────────────────────────────────
+class TestUpdateSummaryRouteModelSelection:
+    """Update summaries should use a known text auxiliary model before main model fallback."""
+
+    def test_summary_route_prefers_documented_compression_auxiliary_model(self):
+        src = read('api/routes.py')
+
+        assert 'get_text_auxiliary_client' in src
+        assert '"compression"' in src
+        assert '"update_summary"' not in src
+        assert 'main_runtime=main_runtime' in src
+        assert 'update summary auxiliary model failed; falling back to main model' in src
+        assert 'from run_agent import AIAgent' in src
+
+    def test_summary_route_auxiliary_model_uses_active_profile_env(self, monkeypatch, tmp_path):
+        import api.config as cfg
+        import api.profiles as profiles
+        import api.routes as routes
+        import api.updates as updates
+
+        class FakeHandler:
+            def __init__(self, payload):
+                raw = json.dumps(payload).encode('utf-8')
+                self.headers = {'Content-Length': str(len(raw))}
+                self.rfile = io.BytesIO(raw)
+                self.wfile = io.BytesIO()
+                self.status = None
+
+            def send_response(self, status):
+                self.status = status
+
+            def send_header(self, _key, _value):
+                pass
+
+            def end_headers(self):
+                pass
+
+            def response_payload(self):
+                return json.loads(self.wfile.getvalue().decode('utf-8'))
+
+        captured = {}
+        profile_home = tmp_path / 'profiles' / 'work'
+        fake_skill_module = types.ModuleType('tools.skills_tool')
+        setattr(fake_skill_module, 'HERMES_HOME', 'default-home')
+        setattr(fake_skill_module, 'SKILLS_DIR', 'default-home/skills')
+        monkeypatch.setitem(sys.modules, 'tools.skills_tool', fake_skill_module)
+
+        monkeypatch.setattr(profiles, 'get_hermes_home_for_profile', lambda profile: profile_home)
+        monkeypatch.setattr(
+            profiles,
+            'get_profile_runtime_env',
+            lambda home: {'HERMES_TEST_PROFILE_ENV': 'work-runtime'},
+        )
+        monkeypatch.setattr(cfg, 'get_effective_default_model', lambda: 'openai/test-main')
+
+        def fake_resolve_model_provider(model):
+            thread_env = getattr(cfg._thread_ctx, 'env', {})
+            captured['model_resolution_env'] = {
+                'HERMES_HOME': os.environ.get('HERMES_HOME'),
+                'HERMES_TEST_PROFILE_ENV': os.environ.get('HERMES_TEST_PROFILE_ENV'),
+                'THREAD_HERMES_HOME': thread_env.get('HERMES_HOME'),
+                'THREAD_HERMES_TEST_PROFILE_ENV': thread_env.get('HERMES_TEST_PROFILE_ENV'),
+            }
+            return model, 'openai', 'https://example.test/v1'
+
+        monkeypatch.setattr(cfg, 'resolve_model_provider', fake_resolve_model_provider)
+        monkeypatch.setattr(cfg, 'resolve_custom_provider_connection', lambda provider: (None, None))
+
+        fake_runtime_provider = types.ModuleType('hermes_cli.runtime_provider')
+        fake_runtime_provider.resolve_runtime_provider = lambda requested=None: {
+            'api_key': 'fake-key',
+            'provider': requested or 'openai',
+            'base_url': 'https://example.test/v1',
+        }
+        fake_hermes_cli = types.ModuleType('hermes_cli')
+        fake_hermes_cli.__path__ = []
+        fake_hermes_cli.runtime_provider = fake_runtime_provider
+        monkeypatch.setitem(sys.modules, 'hermes_cli', fake_hermes_cli)
+        monkeypatch.setitem(sys.modules, 'hermes_cli.runtime_provider', fake_runtime_provider)
+
+        class FakeAuxClient:
+            class chat:
+                class completions:
+                    @staticmethod
+                    def create(model, messages):
+                        captured['aux_create'] = {'model': model, 'messages': messages}
+                        return types.SimpleNamespace(
+                            choices=[
+                                types.SimpleNamespace(
+                                    message=types.SimpleNamespace(
+                                        content='Notice: Profile-routed update summaries work.'
+                                    )
+                                )
+                            ]
+                        )
+
+        def fake_get_text_auxiliary_client(task, main_runtime=None):
+            thread_env = getattr(cfg._thread_ctx, 'env', {})
+            captured['aux_env'] = {
+                'HERMES_HOME': os.environ.get('HERMES_HOME'),
+                'HERMES_TEST_PROFILE_ENV': os.environ.get('HERMES_TEST_PROFILE_ENV'),
+                'THREAD_HERMES_HOME': thread_env.get('HERMES_HOME'),
+                'THREAD_HERMES_TEST_PROFILE_ENV': thread_env.get('HERMES_TEST_PROFILE_ENV'),
+                'SKILL_MODULE_HOME': getattr(fake_skill_module, 'HERMES_HOME'),
+                'SKILL_MODULE_DIR': getattr(fake_skill_module, 'SKILLS_DIR'),
+            }
+            captured['aux_task'] = task
+            captured['main_runtime'] = dict(main_runtime or {})
+            return FakeAuxClient(), 'profile-compression-model'
+
+        fake_auxiliary_client = types.ModuleType('agent.auxiliary_client')
+        fake_auxiliary_client.get_text_auxiliary_client = fake_get_text_auxiliary_client
+        fake_agent = types.ModuleType('agent')
+        fake_agent.__path__ = []
+        fake_agent.auxiliary_client = fake_auxiliary_client
+        monkeypatch.setitem(sys.modules, 'agent', fake_agent)
+        monkeypatch.setitem(sys.modules, 'agent.auxiliary_client', fake_auxiliary_client)
+
+        with updates._cache_lock:
+            updates._summary_cache.clear()
+
+        monkeypatch.setenv('HERMES_HOME', 'default-home')
+        monkeypatch.setenv('HERMES_TEST_PROFILE_ENV', 'default-runtime')
+
+        body = {
+            'target': 'webui',
+            'updates': {
+                'webui': {
+                    'behind': 1,
+                    'current_sha': 'profile-env-before',
+                    'latest_sha': f'profile-env-after-{time.time_ns()}',
+                    'compare_url': 'https://example.test/compare',
+                },
+            },
+        }
+        handler = FakeHandler(body)
+
+        profiles.set_request_profile('work')
+        try:
+            routes.handle_post(handler, types.SimpleNamespace(path='/api/updates/summary'))
+        finally:
+            profiles.clear_request_profile()
+
+        assert handler.status == 200
+        payload = handler.response_payload()
+        assert payload['generated_by'] == 'llm'
+        assert captured['aux_task'] == 'compression'
+        assert captured['model_resolution_env'] == {
+            'HERMES_HOME': str(profile_home),
+            'HERMES_TEST_PROFILE_ENV': 'work-runtime',
+            'THREAD_HERMES_HOME': str(profile_home),
+            'THREAD_HERMES_TEST_PROFILE_ENV': 'work-runtime',
+        }
+        assert captured['aux_env'] == {
+            'HERMES_HOME': str(profile_home),
+            'HERMES_TEST_PROFILE_ENV': 'work-runtime',
+            'THREAD_HERMES_HOME': str(profile_home),
+            'THREAD_HERMES_TEST_PROFILE_ENV': 'work-runtime',
+            'SKILL_MODULE_HOME': profile_home,
+            'SKILL_MODULE_DIR': profile_home / 'skills',
+        }
+        assert captured['aux_create']['model'] == 'profile-compression-model'
+        assert getattr(fake_skill_module, 'HERMES_HOME') == 'default-home'
+        assert getattr(fake_skill_module, 'SKILLS_DIR') == 'default-home/skills'
+        assert os.environ.get('HERMES_HOME') == 'default-home'
+        assert os.environ.get('HERMES_TEST_PROFILE_ENV') == 'default-runtime'
+
 
 class TestUiJsUpdateBanner:
     """#813 + #814 — UI must show persistent error, force button, and correct toast."""
@@ -792,7 +960,7 @@ class TestWhatsNewSummaryToggle:
         assert 'human-readable' in updates
         assert 'avoid technical jargon' in updates
         assert 'regular diff comparison' in updates
-        assert 'Return only bullets' in updates
+        assert 'Return only prefixed bullets' in updates
         assert 'def _format_update_summary_sections' in updates
 
     def test_update_summary_formats_llm_text_into_stable_sections(self):
@@ -815,6 +983,181 @@ class TestWhatsNewSummaryToggle:
         assert 'What you\'ll notice' in result['summary']
         assert 'Worth knowing' in result['summary']
         assert '- The settings panel is easier to understand.' in result['summary']
+
+    def test_update_summary_deduplicates_notice_items_from_worth_knowing(self):
+        from api.updates import summarize_update_payload
+
+        payload = {
+            'webui': {'behind': 2, 'current_sha': 'abc', 'latest_sha': 'def', 'compare_url': 'https://example.test/webui'},
+        }
+        result = summarize_update_payload(
+            payload,
+            llm_callback=lambda _system, _prompt: 'The settings panel is easier to understand. Update prompts are clearer.',
+            use_cache=False,
+        )
+        notice_items = result['summary_sections'][0]['items']
+        worth_section = next((section for section in result['summary_sections'] if section['title'] == 'Worth knowing'), None)
+
+        assert notice_items == [
+            'The settings panel is easier to understand.',
+            'Update prompts are clearer.',
+        ]
+        assert worth_section is None
+        assert 'Worth knowing' not in result['summary']
+        assert 'This summary covers WebUI' not in result['summary']
+
+    def test_update_summary_deduplicates_repeated_agent_summary_bullets(self):
+        from api.updates import summarize_update_payload
+
+        duplicate_menu_item = (
+            'The `hermes tools` menus should open noticeably faster, especially when checking available tools or auth state.'
+        )
+        duplicate_quality_item = (
+            'These updates are small quality-of-life improvements focused on smoother messaging and less waiting in the CLI.'
+        )
+        result = summarize_update_payload(
+            {
+                'agent': {
+                    'behind': 2,
+                    'current_sha': 'abc',
+                    'latest_sha': 'def',
+                    'compare_url': 'https://example.test/agent',
+                },
+            },
+            llm_callback=lambda _system, _prompt: '\n'.join(
+                [
+                    'Slack thread commands now also work with `!cmd`, giving you an easier fallback when slash commands are awkward or unavailable.',
+                    duplicate_menu_item,
+                    duplicate_quality_item,
+                    duplicate_menu_item,
+                    duplicate_quality_item,
+                ]
+            ),
+            use_cache=False,
+        )
+        sections = {section['title']: section['items'] for section in result['summary_sections']}
+
+        assert duplicate_menu_item in sections["What you'll notice"]
+        assert duplicate_quality_item in sections["What you'll notice"]
+        assert 'Worth knowing' not in sections
+        assert result['summary'].count(duplicate_menu_item) == 1
+        assert result['summary'].count(duplicate_quality_item) == 1
+
+    def test_update_summary_keeps_all_categorized_notice_and_worth_bullets(self):
+        from api.updates import summarize_update_payload
+
+        result = summarize_update_payload(
+            {'webui': {'behind': 8, 'current_sha': 'abc', 'latest_sha': 'def', 'compare_url': 'https://example.test/webui'}},
+            llm_callback=lambda _system, _prompt: '\n'.join(
+                [
+                    'Notice: The settings panel loads faster.',
+                    'Notice: Update prompts are easier to read.',
+                    'Notice: Chat status is clearer during reconnects.',
+                    'Notice: Tool results stay grouped by source.',
+                    'Notice: Mobile controls remain visible.',
+                    'Worth knowing: Some labels were renamed to match the new flow.',
+                    'Worth knowing: The full diff is still available from the update banner.',
+                ]
+            ),
+            use_cache=False,
+        )
+        sections = {section['title']: section['items'] for section in result['summary_sections']}
+
+        assert sections["What you'll notice"] == [
+            'The settings panel loads faster.',
+            'Update prompts are easier to read.',
+            'Chat status is clearer during reconnects.',
+            'Tool results stay grouped by source.',
+            'Mobile controls remain visible.',
+        ]
+        assert sections['Worth knowing'] == [
+            'Some labels were renamed to match the new flow.',
+            'The full diff is still available from the update banner.',
+        ]
+
+    def test_update_summary_keeps_unknown_prefixed_bullets_as_notice(self):
+        from api.updates import summarize_update_payload
+
+        result = summarize_update_payload(
+            {'webui': {'behind': 3, 'current_sha': 'abc', 'latest_sha': 'def', 'compare_url': 'https://example.test/webui'}},
+            llm_callback=lambda _system, _prompt: '\n'.join(
+                [
+                    'Notice: The settings panel loads faster.',
+                    'Caveat: Restart once after applying the update.',
+                    'Action required: Reopen the update banner if the summary was already cached.',
+                    'Worth knowing: The full diff is still available from the update banner.',
+                ]
+            ),
+            use_cache=False,
+        )
+        sections = {section['title']: section['items'] for section in result['summary_sections']}
+
+        assert sections["What you'll notice"] == [
+            'The settings panel loads faster.',
+            'Caveat: Restart once after applying the update.',
+            'Action required: Reopen the update banner if the summary was already cached.',
+        ]
+        assert sections['Worth knowing'] == [
+            'The full diff is still available from the update banner.',
+        ]
+
+    def test_update_summary_panel_is_scrollable_for_long_summaries(self):
+        style = read('static/style.css')
+
+        assert '#updateSummaryPanel{max-height:min(34vh,260px);overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-width:thin;scrollbar-color:var(--accent) transparent;}' in style
+
+    def test_update_summary_many_updates_caps_commit_input_and_discloses_scope(self, monkeypatch):
+        import api.updates as upd
+
+        subjects = [f'Commit subject {idx}' for idx in range(1, 25)]
+        monkeypatch.setattr(
+            upd,
+            '_commit_subjects_for_update_with_limit',
+            lambda _info, *, limit=24: (subjects[:limit], True),
+        )
+        prompts = []
+
+        def fake_llm(_system, prompt):
+            prompts.append(prompt)
+            return '\n'.join([
+                'Notice: Several user-facing fixes are ready.',
+                'Notice: Settings and update messaging should be easier to understand.',
+                'Notice: The update flow should feel safer and clearer.',
+                'Notice: Mobile update controls should stay reachable.',
+                'Worth knowing: Some lower-level cleanup supports the visible update changes.',
+            ])
+
+        result = upd.summarize_update_payload(
+            {
+                'webui': {
+                    'behind': 57,
+                    'current_sha': 'abc',
+                    'latest_sha': 'def',
+                    'compare_url': 'https://example.test/webui',
+                }
+            },
+            target='webui',
+            llm_callback=fake_llm,
+            use_cache=False,
+        )
+
+        assert len(subjects) == 24
+        assert prompts
+        assert 'Showing latest 24 of 57 commit subjects; summarize trends, not every commit.' in prompts[0]
+        assert 'Commit subject 24' in prompts[0]
+        assert 'Commit subject 25' not in prompts[0]
+        sections = {section['title']: section['items'] for section in result['summary_sections']}
+        assert sections["What you'll notice"] == [
+            'Several user-facing fixes are ready.',
+            'Settings and update messaging should be easier to understand.',
+            'The update flow should feel safer and clearer.',
+            'Mobile update controls should stay reachable.',
+        ]
+        assert sections['Worth knowing'] == [
+            'Some lower-level cleanup supports the visible update changes.',
+            'WebUI has 57 updates; this summary uses the latest 24 commit subjects, with the full comparison still available in the diff link.',
+        ]
+        assert result['targets'][0]['commits_truncated'] is True
 
     def test_update_summary_cache_reuses_same_update_summary(self):
         import api.updates as upd
@@ -839,6 +1182,51 @@ class TestWhatsNewSummaryToggle:
         assert second['summary'] == first['summary']
         assert second['cached'] is True
         assert changed['summary'] != first['summary']
+
+    def test_update_summary_cache_is_bounded_lru(self):
+        import api.updates as upd
+
+        upd._summary_cache.clear()
+        calls = []
+
+        def payload(n):
+            return {
+                'webui': {
+                    'behind': n + 1,
+                    'current_sha': f'old-{n}',
+                    'latest_sha': f'new-{n}',
+                    'compare_url': f'https://example.test/webui/{n}',
+                },
+            }
+
+        def fake_llm(_system, prompt):
+            calls.append(prompt)
+            return f'- Generated summary #{len(calls)}'
+
+        try:
+            for i in range(upd._SUMMARY_CACHE_MAX):
+                upd.summarize_update_payload(payload(i), llm_callback=fake_llm)
+
+            assert len(upd._summary_cache) == upd._SUMMARY_CACHE_MAX
+            assert len(calls) == upd._SUMMARY_CACHE_MAX
+
+            first_again = upd.summarize_update_payload(payload(0), llm_callback=fake_llm)
+            assert first_again['cached'] is True
+            assert len(calls) == upd._SUMMARY_CACHE_MAX
+
+            upd.summarize_update_payload(payload(upd._SUMMARY_CACHE_MAX), llm_callback=fake_llm)
+            assert len(upd._summary_cache) == upd._SUMMARY_CACHE_MAX
+
+            still_cached = upd.summarize_update_payload(payload(0), llm_callback=fake_llm)
+            assert still_cached['cached'] is True
+            assert len(calls) == upd._SUMMARY_CACHE_MAX + 1
+
+            evicted = upd.summarize_update_payload(payload(1), llm_callback=fake_llm)
+            assert evicted['cached'] is False
+            assert len(calls) == upd._SUMMARY_CACHE_MAX + 2
+        finally:
+            upd._summary_cache.clear()
+
     def test_update_summary_can_be_generated_per_target_and_cached_separately(self):
         import api.updates as upd
 
@@ -932,4 +1320,3 @@ class TestCheckForUpdatesButton:
         assert count >= 5, (
             f"settings_check_now found in only {count} locale blocks (expected ≥5: en, ru, es, zh, zh-Hant)"
         )
-

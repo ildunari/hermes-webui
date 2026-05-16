@@ -244,6 +244,12 @@ async function switchPanel(name, opts = {}) {
     switchSettingsSection(_currentSettingsSection);
     loadSettingsPanel();
   }
+  if (opts.fromRailClick && typeof _isDesktopWidth === 'function' && !_isDesktopWidth()) {
+    const sidebar = document.querySelector('.sidebar');
+    const overlay = document.getElementById('mobileOverlay');
+    if (sidebar) sidebar.classList.add('mobile-open');
+    if (overlay) overlay.classList.add('visible');
+  }
   syncAppTitlebar();
   return true;
 }
@@ -455,6 +461,45 @@ async function loadCrons(animate) {
   }
 }
 
+function _cronPanelExpandKey(jobId, suffix){
+  return `hermes-webui-cron-${suffix}-expanded-${encodeURIComponent(String(jobId||''))}`;
+}
+
+function _cronRunExpandKey(jobId, filename){
+  return `${_cronPanelExpandKey(jobId, 'run')}-${encodeURIComponent(String(filename||''))}`;
+}
+
+function _cronExpansionGet(key){
+  try { return localStorage.getItem(key) === '1'; } catch(_) { return false; }
+}
+
+function _cronExpansionSet(key, expanded){
+  try { localStorage.setItem(key, expanded ? '1' : '0'); } catch(_) {}
+}
+
+function toggleCronPromptExpanded(jobId){
+  const key = _cronPanelExpandKey(jobId, 'prompt');
+  _cronExpansionSet(key, !_cronExpansionGet(key));
+  if (_currentCronDetail && String(_currentCronDetail.id) === String(jobId)) {
+    _renderCronDetail(_currentCronDetail);
+  }
+}
+
+function toggleCronRunExpanded(jobId, filename, runId){
+  const key = _cronRunExpandKey(jobId, filename);
+  const expanded = !_cronExpansionGet(key);
+  _cronExpansionSet(key, expanded);
+  const item = document.getElementById(runId);
+  const body = item ? item.querySelector('.detail-run-body') : null;
+  const btn = item ? item.querySelector('.detail-expand-toggle') : null;
+  if (body) body.classList.toggle('expanded', expanded);
+  if (btn) {
+    btn.textContent = expanded ? '▴' : '▾';
+    btn.title = expanded ? (t('cron_collapse_output') || 'Collapse output') : (t('cron_expand_output') || 'Expand output');
+    btn.setAttribute('aria-label', btn.title);
+  }
+}
+
 function _renderCronDetail(job){
   _currentCronDetail = job;
   const title = $('taskDetailTitle');
@@ -495,6 +540,8 @@ function _renderCronDetail(job){
         </div>
       </div>` : '';
   const toastNotifications = job.toast_notifications !== false;
+  const promptExpanded = _cronExpansionGet(_cronPanelExpandKey(job.id, 'prompt'));
+  const promptToggleLabel = promptExpanded ? (t('cron_collapse_prompt') || 'Collapse prompt') : (t('cron_expand_prompt') || 'Expand prompt');
   body.innerHTML = `
     <div class="main-view-content">
       ${attentionBanner}
@@ -513,8 +560,11 @@ function _renderCronDetail(job){
         ${lastError}
       </div>
       <div class="detail-card">
-        <div class="detail-card-title">Prompt</div>
-        <div class="detail-prompt">${esc(job.prompt || '')}</div>
+        <div class="detail-card-title detail-card-title-row">
+          <span>Prompt</span>
+          <button type="button" class="detail-expand-toggle" onclick="toggleCronPromptExpanded('${esc(job.id)}')" title="${esc(promptToggleLabel)}" aria-label="${esc(promptToggleLabel)}">${esc(promptExpanded ? '▴' : '▾')}</button>
+        </div>
+        <div class="detail-prompt ${promptExpanded ? 'expanded' : ''}">${esc(job.prompt || '')}</div>
       </div>
       <div class="detail-card ${_cronNewJobIds.has(String(job.id)) ? 'has-new-run' : ''}" id="cronDetailRuns">
         <div class="detail-card-title">${esc(t('cron_last_output'))}</div>
@@ -573,12 +623,18 @@ async function _loadCronDetailRuns(jobId){
       const sizeStr = run.size > 1024 ? (run.size/1024).toFixed(1)+' KB' : run.size+' B';
       const dateStr = new Date(run.modified * 1000).toLocaleString();
       const rid = `cron-det-run-${jobId}-${i}`;
+      const usageStrip = _formatCronRunUsageStrip(run.usage);
+      const runExpanded = _cronExpansionGet(_cronRunExpandKey(jobId, run.filename));
+      const runToggleLabel = runExpanded ? (t('cron_collapse_output') || 'Collapse output') : (t('cron_expand_output') || 'Expand output');
       return `<div class="detail-run-item" id="${rid}">
         <div class="detail-run-head" onclick="_loadRunContent('${esc(jobId)}','${esc(run.filename)}','${rid}')">
-          <span><span style="opacity:.7">${esc(ts)}</span> <span style="opacity:.4;font-size:11px">${esc(sizeStr)}</span></span>
-          <span style="opacity:.6">▸</span>
+          <span><span style="opacity:.7">${esc(ts)}</span> <span style="opacity:.4;font-size:11px">${esc(sizeStr)}</span>${usageStrip ? ` <span class="cron-run-usage-strip">${esc(usageStrip)}</span>` : ''}</span>
+          <span class="detail-run-actions">
+            <button type="button" class="detail-expand-toggle" onclick="event.stopPropagation();toggleCronRunExpanded('${esc(jobId)}','${esc(run.filename)}','${rid}')" title="${esc(runToggleLabel)}" aria-label="${esc(runToggleLabel)}">${esc(runExpanded ? '▴' : '▾')}</button>
+            <span style="opacity:.6">▸</span>
+          </span>
         </div>
-        <div class="detail-run-body" style="color:var(--muted);font-size:12px">${esc(t('loading'))}</div>
+        <div class="detail-run-body ${runExpanded ? 'expanded' : ''}" style="color:var(--muted);font-size:12px">${esc(t('loading'))}</div>
       </div>`;
     }).join('');
     const countLabel = data.total > 50 ? ` (${data.total} runs, showing latest 50)` : ` (${data.total} runs)`;
@@ -593,6 +649,7 @@ async function _loadRunContent(jobId, filename, runId){
   if (!item.classList.contains('open')) {
     item.classList.add('open');
   }
+  body.classList.toggle('expanded', _cronExpansionGet(_cronRunExpandKey(jobId, filename)));
   body.innerHTML = `<span style="opacity:.5">${esc(t('loading'))}</span>`;
   try {
     const data = await api(`/api/crons/run?job_id=${encodeURIComponent(jobId)}&filename=${encodeURIComponent(filename)}`);
@@ -605,6 +662,13 @@ async function _loadRunContent(jobId, filename, runId){
       body.innerHTML = renderMd(data.snippet || data.content);
     } else {
       body.textContent = data.snippet || data.content;
+    }
+    const usageStrip = _formatCronRunUsageStrip(data.usage);
+    if (usageStrip) {
+      const usage = document.createElement('div');
+      usage.className = 'cron-run-usage-strip cron-run-usage-footer';
+      usage.textContent = usageStrip;
+      body.appendChild(usage);
     }
     // Show "View full output" button if content was truncated
     if (data.content && data.snippet && data.content.length > data.snippet.length) {
@@ -953,6 +1017,27 @@ function _cronOutputSnippet(content) {
   const responseIdx = lines.findIndex(l => l.startsWith('## Response') || l.startsWith('# Response'));
   const body = (responseIdx >= 0 ? lines.slice(responseIdx + 1) : lines).join('\n').trim();
   return body.slice(0, 600) || '(empty)';
+}
+
+function _formatCronRunUsageStrip(usage) {
+  if (!usage || typeof usage !== 'object') return '';
+  const parts = [];
+  const fmt = n => {
+    const value = Number(n || 0);
+    if (!Number.isFinite(value) || value <= 0) return '';
+    if (value >= 1000000) return (value / 1000000).toFixed(value >= 10000000 ? 0 : 1).replace(/\.0$/, '') + 'M';
+    if (value >= 1000) return (value / 1000).toFixed(value >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'k';
+    return String(Math.round(value));
+  };
+  const input = fmt(usage.input_tokens);
+  const output = fmt(usage.output_tokens);
+  const total = fmt(usage.total_tokens);
+  if (input || output) parts.push(`${input || '0'} in · ${output || '0'} out`);
+  else if (total) parts.push(`${total} tokens`);
+  const cost = Number(usage.estimated_cost_usd);
+  if (Number.isFinite(cost) && cost > 0) parts.push(`$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}`);
+  if (usage.model) parts.push(String(usage.model));
+  return parts.join(' · ');
 }
 
 // ── Cron run watch ────────────────────────────────────────────────────────────
@@ -3244,6 +3329,21 @@ function _renderSkillDetail(name, content, linkedFiles) {
   _setSkillHeaderButtons('read');
 }
 
+function _renderSkillError(name, message) {
+  const title = $('skillDetailTitle');
+  const body = $('skillDetailBody');
+  const empty = $('skillDetailEmpty');
+  if (title) title.textContent = name;
+  if (body) {
+    body.innerHTML = `<div class="main-view-content"><div class="detail-form-error" style="display:block">${esc(message || t('skill_load_failed'))}</div></div>`;
+    body.style.display = '';
+  }
+  if (empty) empty.style.display = 'none';
+  _currentSkillDetail = null;
+  _skillMode = 'empty';
+  _setSkillHeaderButtons('empty');
+}
+
 function _setSkillHeaderButtons(mode) {
   const editBtn = $('btnEditSkillDetail');
   const delBtn = $('btnDeleteSkillDetail');
@@ -3264,6 +3364,12 @@ async function openSkill(name, el) {
   _editingSkillName = null;
   try {
     const data = await api(`/api/skills/content?name=${encodeURIComponent(name)}`);
+    if (data && (data.success === false || data.error)) {
+      const message = data.error || t('skill_load_failed');
+      _renderSkillError(name, message);
+      setStatus(t('skill_load_failed') + message);
+      return;
+    }
     _currentSkillDetail = { name, content: data.content || '', linked_files: data.linked_files || {} };
     _renderSkillDetail(name, data.content || '', data.linked_files || {});
   } catch(e) { setStatus(t('skill_load_failed') + e.message); }
@@ -3272,6 +3378,11 @@ async function openSkill(name, el) {
 async function openSkillFile(skillName, filePath) {
   try {
     const data = await api(`/api/skills/content?name=${encodeURIComponent(skillName)}&file=${encodeURIComponent(filePath)}`);
+    if (data && data.error) {
+      _renderSkillError(skillName, data.error);
+      setStatus(t('skill_file_load_failed') + data.error);
+      return;
+    }
     const body = $('skillDetailBody');
     if (!body) return;
     const ext = (filePath.split('.').pop() || '').toLowerCase();
@@ -4354,8 +4465,22 @@ async function loadProfilesPanel() {
     const data = await api('/api/profiles');
     _profilesCache = data;
     panel.innerHTML = '';
+    const explainer = document.createElement('div');
+    explainer.className = 'profile-card profile-help-card';
+    explainer.innerHTML = `
+      <div class="profile-card-header">
+        <div style="min-width:0;flex:1">
+          <div class="profile-card-name">Profiles vs workspaces</div>
+          <div class="profile-card-meta">Use profiles for how the agent works; use workspaces for what files it works on.</div>
+        </div>
+      </div>`;
+    explainer.onclick = () => _renderProfileConceptHelp(data.active || 'default');
+    panel.appendChild(explainer);
     if (!data.profiles || !data.profiles.length) {
-      panel.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:12px">${esc(t('profiles_no_profiles'))}</div>`;
+      const emptyMsg = document.createElement('div');
+      emptyMsg.style.cssText = 'padding:16px;color:var(--muted);font-size:12px';
+      emptyMsg.textContent = t('profiles_no_profiles');
+      panel.appendChild(emptyMsg);
       if (_profileMode !== 'create') _clearProfileDetail();
       return;
     }
@@ -4396,6 +4521,28 @@ async function loadProfilesPanel() {
   } catch (e) {
     panel.innerHTML = `<div style="color:var(--accent);font-size:12px;padding:12px">${esc(t('error_prefix'))}${esc(e.message)}</div>`;
   }
+}
+
+function _renderProfileConceptHelp(activeName){
+  const title = $('profileDetailTitle');
+  const body = $('profileDetailBody');
+  const empty = $('profileDetailEmpty');
+  if (!title || !body) return;
+  title.textContent = 'Profiles vs workspaces';
+  body.innerHTML = `
+    <div class="main-view-content">
+      <div class="detail-card">
+        <div class="detail-card-title">Use profiles for how; workspaces for what</div>
+        <div class="detail-row"><div class="detail-row-label">Profiles</div><div class="detail-row-value">Agent identity, memory, skills, model/provider config, and connected tools. Create profiles for roles like researcher, writer, marketer, or developer when those roles should carry different context or capabilities.</div></div>
+        <div class="detail-row"><div class="detail-row-label">Workspaces</div><div class="detail-row-value">Project or product folders on disk. Use one workspace per repo/product so chat, terminal, and file browsing point at the right files.</div></div>
+        <div class="detail-row"><div class="detail-row-label">Together</div><div class="detail-row-value">A profile can have a default workspace, but you can still switch workspaces for a session. Profiles answer “who is working?”; workspaces answer “where are they working?”</div></div>
+      </div>
+    </div>`;
+  body.style.display = '';
+  if (empty) empty.style.display = 'none';
+  _profileMode = 'read';
+  _currentProfileDetail = null;
+  _setProfileHeaderButtons('empty');
 }
 
 function _renderProfileDetail(p, activeName){
@@ -4721,6 +4868,11 @@ function _renderProfileForm(){
           </label>
         </div>
         <div class="detail-form-row">
+          <label for="profileFormModel">${esc(t('profile_model_label') || 'Model / provider')}</label>
+          <select id="profileFormModel"></select>
+          <div class="detail-form-hint">${esc(t('profile_model_hint') || 'Choose from configured providers and models for this new profile.')}</div>
+        </div>
+        <div class="detail-form-row">
           <label for="profileFormBaseUrl">${esc(t('profile_base_url_label') || 'Base URL')}</label>
           <input type="text" id="profileFormBaseUrl" placeholder="${esc(t('profile_base_url_placeholder') || 'Optional, e.g. http://localhost:11434')}" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
         </div>
@@ -4736,6 +4888,35 @@ function _renderProfileForm(){
   _setProfileHeaderButtons('create');
   const n = $('profileFormName');
   if (n) n.focus();
+  _populateProfileFormModelSelect();
+}
+
+async function _populateProfileFormModelSelect(){
+  const sel = $('profileFormModel');
+  if (!sel) return;
+  sel.innerHTML = `<option value="">${esc(t('profile_model_use_default') || 'Use active profile default')}</option>`;
+  try {
+    const data = await api('/api/models');
+    const groups = (Array.isArray(data && data.groups) && data.groups.length) ? data.groups : [];
+    for (const g of groups) {
+      const og = document.createElement('optgroup');
+      og.label = g.provider || g.provider_id || 'Configured';
+      if (g.provider_id) og.dataset.provider = g.provider_id;
+      for (const m of (Array.isArray(g.models) ? g.models : [])) {
+        if (!m || !m.id) continue;
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = m.label || m.id;
+        og.appendChild(opt);
+      }
+      if (og.children.length) sel.appendChild(og);
+    }
+    if (data && data.default_model && typeof _applyModelToDropdown === 'function') {
+      _applyModelToDropdown(data.default_model, sel, data.active_provider || window._activeProvider || null);
+    }
+  } catch (e) {
+    console.warn('Failed to load profile model picker:', e.message);
+  }
 }
 
 function cancelProfileForm(){
@@ -4752,6 +4933,7 @@ function cancelProfileForm(){
 async function saveProfileForm(){
   const nameEl = $('profileFormName');
   const cloneEl = $('profileFormClone');
+  const modelEl = $('profileFormModel');
   const baseEl = $('profileFormBaseUrl');
   const apiKeyEl = $('profileFormApiKey');
   const errEl = $('profileFormError');
@@ -4766,6 +4948,14 @@ async function saveProfileForm(){
   if (baseUrl && !/^https?:\/\//.test(baseUrl)) { errEl.textContent = t('profile_base_url_rule'); errEl.style.display = ''; return; }
   try {
     const payload = { name, clone_config: cloneConfig };
+    const selectedModel = modelEl ? (modelEl.value || '').trim() : '';
+    if (selectedModel) {
+      const modelState = (typeof _modelStateForSelect === 'function')
+        ? _modelStateForSelect(modelEl, selectedModel)
+        : { model: selectedModel, model_provider: null };
+      if (modelState.model) payload.default_model = modelState.model;
+      if (modelState.model_provider) payload.model_provider = modelState.model_provider;
+    }
     if (baseUrl) payload.base_url = baseUrl;
     if (apiKey) payload.api_key = apiKey;
     await api('/api/profile/create', { method: 'POST', body: JSON.stringify(payload) });
@@ -5067,6 +5257,8 @@ function _preferencesPayloadFromUi(){
   if(showUsageCb) payload.show_token_usage=showUsageCb.checked;
   const showTpsCb=$('settingsShowTps');
   if(showTpsCb) payload.show_tps=showTpsCb.checked;
+  const fadeTextCb=$('settingsFadeTextEffect');
+  if(fadeTextCb) payload.fade_text_effect=fadeTextCb.checked;
   const simplifiedToolCb=$('settingsSimplifiedToolCalling');
   if(simplifiedToolCb) payload.simplified_tool_calling=simplifiedToolCb.checked;
   const apiRedactCb=$('settingsApiRedact');
@@ -5135,6 +5327,7 @@ async function _autosavePreferencesSettings(payload){
       if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
       if(typeof renderMessages==='function') renderMessages();
     }
+    if(payload&&Object.prototype.hasOwnProperty.call(payload,'fade_text_effect')) window._fadeTextEffect=!!payload.fade_text_effect;
     if(payload&&payload.show_tps!==undefined){
       window._showTps=!!(saved&&saved.show_tps);
       if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
@@ -5302,6 +5495,8 @@ async function loadSettingsPanel(){
     if(showUsageCb){showUsageCb.checked=!!settings.show_token_usage;showUsageCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const showTpsCb=$('settingsShowTps');
     if(showTpsCb){showTpsCb.checked=!!settings.show_tps;showTpsCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const fadeTextCb=$('settingsFadeTextEffect');
+    if(fadeTextCb){fadeTextCb.checked=!!settings.fade_text_effect;window._fadeTextEffect=fadeTextCb.checked;fadeTextCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const simplifiedToolCb=$('settingsSimplifiedToolCalling');
     if(simplifiedToolCb){simplifiedToolCb.checked=settings.simplified_tool_calling!==false;simplifiedToolCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const apiRedactCb=$('settingsApiRedact');
@@ -5509,7 +5704,7 @@ async function loadProvidersPanel(){
   if(!list) return;
   try{
     const data=await api('/api/providers');
-    const quota=await _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||'Quota status unavailable',client_fetched_at:new Date().toISOString()}));
+    const quota=await _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()}));
     const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth);
     list.innerHTML='';
     _providerCardEls.clear();
@@ -5526,7 +5721,7 @@ async function loadProvidersPanel(){
       list.appendChild(_buildProviderCard(p));
     }
   }catch(e){
-    list.innerHTML='<div style="color:var(--error);padding:12px;font-size:13px">Failed to load providers: '+e.message+'</div>';
+    list.innerHTML='<div style="color:var(--error);padding:12px;font-size:13px">Failed to load providers: '+esc(e.message||String(e))+'</div>';
   }
 }
 
@@ -5534,7 +5729,7 @@ async function _refreshProviderQuota(card,button){
   if(!card) return;
   if(button){
     button.disabled=true;
-    button.textContent='Refreshing…';
+    button.textContent=t('provider_quota_refreshing');
     button.setAttribute('aria-busy','true');
   }
   let failed=false;
@@ -5544,13 +5739,13 @@ async function _refreshProviderQuota(card,button){
     failed=next&&next.ok===false;
   }catch(e){
     failed=true;
-    next={ok:false,status:'unavailable',quota:null,message:e.message||'Quota status unavailable',client_fetched_at:new Date().toISOString()};
+    next={ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()};
   }
   try{
     const fresh=_buildProviderQuotaCard(next);
     if(fresh){
       card.replaceWith(fresh);
-      if(typeof showToast==='function') showToast(failed?'Provider usage refresh failed':'Provider usage refreshed');
+      if(typeof showToast==='function') showToast(failed?t('provider_quota_refresh_failed'):t('provider_quota_refresh_succeeded'));
       return;
     }
   }catch(e){
@@ -5558,10 +5753,10 @@ async function _refreshProviderQuota(card,button){
   }
   if(card.isConnected&&button){
     button.disabled=false;
-    button.textContent='Refresh usage';
+    button.textContent=t('provider_quota_refresh_usage');
     button.removeAttribute('aria-busy');
   }
-  if(typeof showToast==='function') showToast('Provider usage refresh failed');
+  if(typeof showToast==='function') showToast(t('provider_quota_refresh_failed'));
 }
 
 function _formatProviderQuotaMoney(value){
@@ -5586,22 +5781,127 @@ function _formatProviderQuotaReset(value){
 }
 
 function _formatProviderQuotaWindowLabel(accountLimits,w){
-  const raw=((w&&w.label)||'Window').trim();
+  const raw=((w&&w.label)||t('provider_quota_window_fallback')).trim();
   const provider=((accountLimits&&accountLimits.provider)||'').toLowerCase();
   if(provider==='openai-codex'){
-    if(raw.toLowerCase()==='session') return '5-hour limit';
-    if(raw.toLowerCase()==='weekly') return 'Weekly limit';
+    if(raw.toLowerCase()==='session') return t('provider_quota_session_limit');
+    if(raw.toLowerCase()==='weekly') return t('provider_quota_weekly_limit');
   }
-  return raw||'Window';
+  return raw||t('provider_quota_window_fallback');
 }
 
 function _formatProviderQuotaLastChecked(status){
   const accountLimits=status&&status.account_limits;
   const value=(accountLimits&&accountLimits.fetched_at)||status&&status.client_fetched_at;
-  if(!value) return 'Last checked after refresh';
+  if(!value) return t('provider_quota_last_checked_after_refresh');
   const d=new Date(value);
-  if(Number.isNaN(d.getTime())) return 'Last checked after refresh';
-  try{return 'Last checked '+d.toLocaleString();}catch(e){return 'Last checked '+value;}
+  if(Number.isNaN(d.getTime())) return t('provider_quota_last_checked_after_refresh');
+  try{return t('provider_quota_last_checked',d.toLocaleString());}catch(e){return t('provider_quota_last_checked',value);}
+}
+
+function _providerQuotaStateClass(value){
+  return String(value||'unavailable').replace(/[^a-z0-9_-]/gi,'').toLowerCase()||'unavailable';
+}
+
+function _providerQuotaStatusLabel(value){
+  const state=_providerQuotaStateClass(value);
+  const key={
+    available:'provider_quota_status_available',
+    exhausted:'provider_quota_status_exhausted',
+    unavailable:'provider_quota_status_unavailable',
+    failed:'provider_quota_status_failed',
+    checked:'provider_quota_status_checked',
+    no_key:'provider_quota_status_no_key',
+    invalid_key:'provider_quota_status_invalid_key',
+    unsupported:'provider_quota_status_unsupported',
+  }[state];
+  return key?t(key):state.replace(/_/g,' ');
+}
+
+function _providerQuotaWindowMeta(used,reset){
+  const meta=[];
+  if(used!=='—') meta.push(t('provider_quota_used_meta',used));
+  if(reset) meta.push(t('provider_quota_resets_meta',reset));
+  return meta;
+}
+
+function _providerQuotaRetryAfterText(value){
+  const retry=_formatProviderQuotaReset(value);
+  return retry?t('provider_quota_retry_after',retry):'';
+}
+
+function _providerQuotaUnavailableReason(credential){
+  const structured=_providerQuotaRetryAfterText(credential&&credential.retry_after);
+  if(structured) return structured;
+  const raw=String((credential&&credential.unavailable_reason)||'').trim();
+  const match=raw.match(/\bretry after\s+([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+Z?)/i);
+  if(match){
+    const parsed=_providerQuotaRetryAfterText(match[1]);
+    if(parsed) return parsed;
+  }
+  return raw;
+}
+
+function _providerQuotaPoolShouldDefaultOpen(pool){
+  try{
+    const saved=localStorage.getItem('hermes-provider-quota-pool-open');
+    if(saved==='1') return true;
+    if(saved==='0') return false;
+  }catch(e){}
+  const count=Array.isArray(pool&&pool.credentials)?pool.credentials.length:0;
+  return count>0&&count<=3;
+}
+
+function _buildProviderQuotaPoolBreakdown(accountLimits){
+  const pool=accountLimits&&accountLimits.pool;
+  if(!pool||!Array.isArray(pool.credentials)||pool.credentials.length===0) return '';
+  const defaultOpen=_providerQuotaPoolShouldDefaultOpen(pool);
+  const total=Number.isFinite(Number(pool.total_credentials))?Number(pool.total_credentials):pool.credentials.length;
+  const available=Number.isFinite(Number(pool.available_credentials))?Number(pool.available_credentials):pool.credentials.filter(c=>c&&c.status==='available').length;
+  const exhausted=Number.isFinite(Number(pool.exhausted_credentials))?Number(pool.exhausted_credentials):0;
+  const failed=Number.isFinite(Number(pool.failed_credentials))?Number(pool.failed_credentials):0;
+  const queried=Number.isFinite(Number(pool.queried_credentials))?Number(pool.queried_credentials):0;
+  const summaryParts=[t('provider_quota_pool_summary_available',available,total)];
+  if(exhausted>0) summaryParts.push(t('provider_quota_pool_summary_exhausted',exhausted));
+  if(failed>0) summaryParts.push(t('provider_quota_pool_summary_failed',failed));
+  if(queried>0) summaryParts.push(t('provider_quota_pool_summary_checked',queried));
+  const planParts=Array.isArray(pool.plans)?pool.plans.filter(Boolean):[];
+  const rows=pool.credentials.map((credential,idx)=>{
+    const label=(credential&&credential.label)||t('provider_quota_credential_label',idx+1);
+    const status=_providerQuotaStateClass(credential&&credential.status);
+    const statusText=_providerQuotaStatusLabel(credential&&credential.status);
+    const plan=credential&&credential.plan?` · ${credential.plan}`:'';
+    const windows=Array.isArray(credential&&credential.windows)?credential.windows:[];
+    const details=Array.isArray(credential&&credential.details)?credential.details.filter(Boolean):[];
+    const unavailableReason=_providerQuotaUnavailableReason(credential);
+    const windowHtml=windows.length?windows.map(w=>{
+      const remaining=_formatProviderQuotaPercent(w&&w.remaining_percent);
+      const used=_formatProviderQuotaPercent(w&&w.used_percent);
+      const reset=_formatProviderQuotaReset(w&&w.reset_at);
+      const meta=_providerQuotaWindowMeta(used,reset);
+      const detail=(w&&w.detail)?String(w.detail).trim():'';
+      return `<div class="provider-quota-pool-window"><span>${esc(_formatProviderQuotaWindowLabel(accountLimits,w))}</span><strong>${esc(remaining)}</strong>${meta.length?`<small>${esc(meta.join(' · '))}</small>`:''}${detail?`<small class="provider-quota-window-detail">${esc(detail)}</small>`:''}</div>`;
+    }).join(''):`<div class="provider-quota-pool-note">${esc(unavailableReason||t('provider_quota_pool_no_windows'))}</div>`;
+    const detailHtml=details.length?`<div class="provider-quota-pool-details">${details.map(d=>`<span>${esc(d)}</span>`).join('')}</div>`:'';
+    return `
+      <div class="provider-quota-pool-row provider-quota-pool-row-${status}">
+        <div class="provider-quota-pool-row-head">
+          <span>${esc(label)}${esc(plan)}</span>
+          <strong>${esc(statusText)}</strong>
+        </div>
+        <div class="provider-quota-pool-windows">${windowHtml}</div>
+        ${detailHtml}
+      </div>
+    `;
+  }).join('');
+  const planText=planParts.length?`<div class="provider-quota-pool-plans">${esc(t('provider_quota_pool_plans',planParts.join(', ')))}</div>`:'';
+  return `
+    <details class="provider-quota-pool"${defaultOpen?' open':''}>
+      <summary><span class="provider-quota-pool-summary-label"><span class="provider-quota-pool-chevron" aria-hidden="true"></span><span>${esc(t('provider_quota_credential_pool'))}</span></span><strong>${esc(summaryParts.join(' · '))}</strong></summary>
+      ${planText}
+      <div class="provider-quota-pool-rows">${rows}</div>
+    </details>
+  `;
 }
 
 function _buildProviderQuotaCard(status){
@@ -5610,58 +5910,64 @@ function _buildProviderQuotaCard(status){
   const state=(status.status||'unavailable').replace(/[^a-z0-9_-]/gi,'').toLowerCase()||'unavailable';
   card.className='provider-quota-card provider-quota-card-'+state;
   const accountLimits=status.account_limits||null;
-  const providerBase=status.display_name||status.provider||'Active provider';
+  const providerBase=status.display_name||status.provider||t('provider_quota_active_provider');
   const provider=(accountLimits&&accountLimits.plan)?`${providerBase} · ${accountLimits.plan}`:providerBase;
   const quota=status.quota||null;
   let body='';
-  if(status.status==='available'&&accountLimits){
+  if(accountLimits&&(status.status==='available'||accountLimits.pool)){
     const windows=Array.isArray(accountLimits.windows)?accountLimits.windows:[];
-    const details=Array.isArray(accountLimits.details)?accountLimits.details:[];
+    const details=Array.isArray(accountLimits.details)&&!accountLimits.pool?accountLimits.details:[];
     const windowHtml=windows.map(w=>{
       const used=_formatProviderQuotaPercent(w&&w.used_percent);
       const reset=_formatProviderQuotaReset(w&&w.reset_at);
-      const meta=[];
-      if(used!=='—') meta.push(`${used} used`);
-      if(reset) meta.push(`resets ${reset}`);
-      if(w&&w.detail) meta.push(w.detail);
+      const meta=_providerQuotaWindowMeta(used,reset);
+      const detail=(w&&w.detail)?String(w.detail).trim():'';
       return `
         <div class="provider-quota-metric provider-quota-window">
           <span>${esc(_formatProviderQuotaWindowLabel(accountLimits,w))}</span>
           <strong>${esc(_formatProviderQuotaPercent(w&&w.remaining_percent))}</strong>
           ${meta.length?`<small>${esc(meta.join(' · '))}</small>`:''}
+          ${detail?`<small class="provider-quota-window-detail">${esc(detail)}</small>`:''}
         </div>
       `;
     }).join('');
     const detailHtml=details.length
       ? `<div class="provider-quota-details">${details.map(d=>`<span>${esc(d)}</span>`).join('')}</div>`
       : '';
-    body=windowHtml+detailHtml;
-    if(!body) body=`<div class="provider-quota-message">${esc(status.message||'Account limits loaded.')}</div>`;
+    const poolHtml=_buildProviderQuotaPoolBreakdown(accountLimits);
+    body=windowHtml+detailHtml+poolHtml;
+    if(!body) body=`<div class="provider-quota-message">${esc(status.message||t('provider_quota_account_limits_loaded'))}</div>`;
   }else if(status.status==='available'&&quota){
     body=`
-      <div class="provider-quota-metric"><span>Remaining</span><strong>${esc(_formatProviderQuotaMoney(quota.limit_remaining))}</strong></div>
-      <div class="provider-quota-metric"><span>Used</span><strong>${esc(_formatProviderQuotaMoney(quota.usage))}</strong></div>
-      <div class="provider-quota-metric"><span>Limit</span><strong>${esc(_formatProviderQuotaMoney(quota.limit))}</strong></div>
+      <div class="provider-quota-metric"><span>${esc(t('provider_quota_metric_remaining'))}</span><strong>${esc(_formatProviderQuotaMoney(quota.limit_remaining))}</strong></div>
+      <div class="provider-quota-metric"><span>${esc(t('provider_quota_metric_used'))}</span><strong>${esc(_formatProviderQuotaMoney(quota.usage))}</strong></div>
+      <div class="provider-quota-metric"><span>${esc(t('provider_quota_metric_limit'))}</span><strong>${esc(_formatProviderQuotaMoney(quota.limit))}</strong></div>
     `;
   }else{
-    body=`<div class="provider-quota-message">${esc(status.message||'Quota status unavailable')}</div>`;
+    body=`<div class="provider-quota-message">${esc(status.message||t('provider_quota_unavailable'))}</div>`;
   }
   card.innerHTML=`
     <div class="provider-quota-header">
       <div>
-        <div class="provider-quota-title">Active provider quota</div>
+        <div class="provider-quota-title">${esc(t('provider_quota_title'))}</div>
         <div class="provider-quota-subtitle">${esc(provider)}</div>
         <div class="provider-quota-checked">${esc(_formatProviderQuotaLastChecked(status))}</div>
       </div>
       <div class="provider-quota-actions">
-        <span class="provider-quota-badge">${esc(state.replace(/_/g,' '))}</span>
-        <button class="provider-quota-refresh" type="button" data-provider-quota-refresh title="Refresh provider usage limits now">Refresh usage</button>
+        <span class="provider-quota-badge">${esc(_providerQuotaStatusLabel(state))}</span>
+        <button class="provider-quota-refresh" type="button" data-provider-quota-refresh title="${esc(t('provider_quota_refresh_title'))}">${esc(t('provider_quota_refresh_usage'))}</button>
       </div>
     </div>
     <div class="provider-quota-body">${body}</div>
   `;
   const refreshBtn=card.querySelector('[data-provider-quota-refresh]');
   if(refreshBtn) refreshBtn.addEventListener('click',()=>_refreshProviderQuota(card,refreshBtn));
+  const poolDetails=card.querySelector('.provider-quota-pool');
+  if(poolDetails){
+    poolDetails.addEventListener('toggle',()=>{
+      try{localStorage.setItem('hermes-provider-quota-pool-open',poolDetails.open?'1':'0');}catch(e){}
+    });
+  }
   return card;
 }
 
@@ -5939,10 +6245,11 @@ function _setSettingsAuthButtonsVisible(active){
 }
 
 function _applySavedSettingsUi(saved, body, opts){
-  const {sendKey,showTokenUsage,showTps,showCliSessions,theme,skin,language,sidebarDensity,fontSize}=opts;
+  const {sendKey,showTokenUsage,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize}=opts;
   window._sendKey=sendKey||'enter';
   window._showTokenUsage=showTokenUsage;
   window._showTps=showTps;
+  window._fadeTextEffect=!!fadeTextEffect;
   window._showCliSessions=showCliSessions;
   window._soundEnabled=body.sound_enabled;
   window._notificationsEnabled=body.notifications_enabled;
@@ -6036,6 +6343,7 @@ async function saveSettings(andClose){
   const sendKey=($('settingsSendKey')||{}).value;
   const showTokenUsage=!!($('settingsShowTokenUsage')||{}).checked;
   const showTps=!!($('settingsShowTps')||{}).checked;
+  const fadeTextEffect=!!($('settingsFadeTextEffect')||{}).checked;
   const showCliSessions=!!($('settingsShowCliSessions')||{}).checked;
   const pw=($('settingsPassword')||{}).value;
   const theme=($('settingsTheme')||{}).value||'dark';
@@ -6055,6 +6363,7 @@ async function saveSettings(andClose){
   body.language=language;
   body.show_token_usage=showTokenUsage;
   body.show_tps=showTps;
+  body.fade_text_effect=fadeTextEffect;
   body.simplified_tool_calling=!!($('settingsSimplifiedToolCalling')||{}).checked;
   body.api_redact_enabled=!!($('settingsApiRedact')||{}).checked;
   body.show_cli_sessions=showCliSessions;
@@ -6081,7 +6390,7 @@ async function saveSettings(andClose){
           if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
         }
       }
-      _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showTps,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
+      _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
       showToast(t(saved.auth_just_enabled?'settings_saved_pw':'settings_saved_pw_updated'));
       _settingsDirty=false;
       _resetSettingsPanelState();
@@ -6100,7 +6409,7 @@ async function saveSettings(andClose){
         if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
       }
     }
-    _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showTps,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
+    _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
     showToast(t('settings_saved'));
     _settingsDirty=false;
     _resetSettingsPanelState();

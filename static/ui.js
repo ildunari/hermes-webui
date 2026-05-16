@@ -1,7 +1,7 @@
 const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',showHiddenWorkspaceFiles:false};
 const INFLIGHT={};  // keyed by session_id while request in-flight
 const SESSION_QUEUES={};  // keyed by session_id for queued follow-up turns
-const MAX_UPLOAD_BYTES=20*1024*1024;
+const MAX_UPLOAD_BYTES=(window.__HERMES_CONFIG__&&window.__HERMES_CONFIG__.maxUploadBytes)||20*1024*1024;
 const MAX_UPLOAD_MB=Math.round(MAX_UPLOAD_BYTES/1024/1024);
 // Tracks which session's queue to drain in setBusy(false).
 // Set to activeSid just before setBusy(false) in done/error handlers so the
@@ -347,6 +347,43 @@ async function jumpToSessionStart(){
   }catch(e){
     console.warn('jumpToSessionStart failed:',e);
     _programmaticScroll=false;
+  }
+}
+
+function _userMessageDomId(rawIdx){
+  return `msg-user-${rawIdx}`;
+}
+
+function _questionJumpButtonHtml(questionRawIdx){
+  if(typeof questionRawIdx!=='number'||questionRawIdx<0) return '';
+  const label=t('jump_to_question')||'Question';
+  const title=t('jump_to_question_label')||'Jump to the question for this response';
+  return `<button class="msg-question-jump-btn" type="button" title="${esc(title)}" aria-label="${esc(title)}" onclick="jumpToTurnQuestion(${questionRawIdx})"><span aria-hidden="true">↑</span><span>${esc(label)}</span></button>`;
+}
+
+function _highlightQuestionRow(row){
+  if(!row) return;
+  row.classList.remove('msg-question-highlight');
+  void row.offsetWidth;
+  row.classList.add('msg-question-highlight');
+  window.setTimeout(()=>row.classList.remove('msg-question-highlight'),1800);
+}
+
+async function jumpToTurnQuestion(questionRawIdx){
+  const container=$('messages');
+  if(!container||typeof questionRawIdx!=='number'||questionRawIdx<0) return;
+  const scrollToTarget=()=>{
+    const row=document.getElementById(_userMessageDomId(questionRawIdx));
+    if(!row) return false;
+    row.scrollIntoView({block:'center',behavior:'smooth'});
+    _highlightQuestionRow(row);
+    return true;
+  };
+  if(scrollToTarget()) return;
+  if(_messageHiddenBeforeCount()>0){
+    _messageRenderWindowSize=Math.max(_currentMessageRenderWindowSize(),_messageRenderableMessageCount());
+    renderMessages({ preserveScroll:true });
+    requestAnimationFrame(scrollToTarget);
   }
 }
 
@@ -963,12 +1000,13 @@ async function _fetchLiveModels(provider, sel){
  *
  * Provider detection is intentionally loose — we compare the model's slash
  * prefix (e.g. "openai/" from "openai/gpt-4o") against the active provider
- * name. Custom/local endpoints report active_provider='custom' or the
- * base_url hostname and we skip the check to avoid false positives.
+ * name. Custom/local endpoints report active_provider='custom', a named
+ * custom provider such as 'custom:zenmux', or the base_url hostname; skip the
+ * check for those values to avoid false positives.
  */
 function _checkProviderMismatch(modelId){
   const ap=(window._activeProvider||'').toLowerCase();
-  if(!ap||ap==='custom'||ap==='openrouter') return null; // can't reliably check
+  if(!ap||ap==='custom'||ap.startsWith('custom:')||ap==='openrouter') return null; // can't reliably check
   // @provider: prefixed IDs came from that provider's live model list — no mismatch possible
   if(modelId.startsWith('@')) return null;
   const slash=modelId.indexOf('/');
@@ -1206,7 +1244,7 @@ function renderModelDropdown(){
           }
         }
         const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(badgeLabel)}</span>`:'';
-        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(modelName)}</span>${badgeHtml}</div><span class="model-opt-id">${m.id}</span>`;
+        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(modelName)}</span>${badgeHtml}</div><span class="model-opt-id">${esc(m.id)}</span>`;
         row.onclick=()=>selectModelFromDropdown(m.value);
         dd.appendChild(row);
       }
@@ -1234,7 +1272,7 @@ function renderModelDropdown(){
       const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(m.badge.label||'Configured')}</span>`:'';
       // Inline provider chip on every row that has a group (#1425)
       const providerChip=m.group?`<span class="model-opt-provider">${esc(m.group)}</span>`:'';
-      row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${m.name}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${m.id}</span>`;
+      row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
       row.onclick=()=>selectModelFromDropdown(m.value);
       dd.appendChild(row);
     }
@@ -2270,6 +2308,16 @@ function _sanitizeThinkingDisplayText(text){
   return stripped.trim();
 }
 
+function _stripVisibleAssistantEchoFromThinking(thinkingText, visibleText){
+  let out=String(thinkingText||'');
+  const visible=String(visibleText||'');
+  if(!out||!visible) return out.trim();
+  visible.split(/\n{2,}/).map(s=>s.trim()).filter(s=>s.length>=20).forEach(snippet=>{
+    out=out.split(snippet).join('');
+  });
+  return out.trim();
+}
+
 function renderMd(raw){
   let s=(raw||'').replace(/\r\n/g,'\n').replace(/\r/g,'\n');
   // ── Entity decode: must run FIRST so &gt; lines become > for the blockquote
@@ -2566,7 +2614,10 @@ function renderMd(raw){
     const parseHeader=r=>r.trim().replace(/^\|/,'').replace(/\|$/,'').split('|').map(c=>`<th>${inlineMd(c.trim())}</th>`).join('');
     const header=`<tr>${parseHeader(rows[0])}</tr>`;
     const body=rows.slice(2).map(r=>`<tr>${parseRow(r)}</tr>`).join('');
-    return `<table><thead>${header}</thead><tbody>${body}</tbody></table>`;
+    // Surround with blank lines so the final paragraph splitter treats the
+    // generated table as its own block even when the regex consumes one of the
+    // markdown block's trailing newlines.
+    return `\n\n<table><thead>${header}</thead><tbody>${body}</tbody></table>\n\n`;
   });
   // #487: Outer image pass — handles ![alt](url) in plain paragraphs (outside tables/lists).
   // Runs AFTER the table pass (images in table cells are handled by inlineMd() above).
@@ -2709,7 +2760,7 @@ function renderMd(raw){
     return '\x00E'+(_pre_stash.length-1)+'\x00';
   });
   const parts=s.split(/\n{2,}/);
-  s=parts.map(p=>{p=p.trim();if(!p)return '';if(/^<(h[1-6]|ul|ol|pre|hr|blockquote)|^\x00[EQ]/.test(p))return p;return `<p>${p.replace(/\n/g,'<br>')}</p>`;}).join('\n');
+  s=parts.map(p=>{p=p.trim();if(!p)return '';if(/^<(h[1-6]|ul|ol|table|pre|hr|blockquote)|^\x00[EQ]/.test(p))return p;return `<p>${p.replace(/\n/g,'<br>')}</p>`;}).join('\n');
   s=s.replace(/\x00E(\d+)\x00/g,(_,i)=>_pre_stash[+i]);
   // ── Restore MEDIA stash → inline images or download links ─────────────────
   s=s.replace(/\x00D(\d+)\x00/g,(_,i)=>{
@@ -3669,6 +3720,67 @@ function clearInflightState(sid){
   }catch(_){ }
 }
 
+function snapshotLiveTurnHtmlForSession(sid){
+  // Keep the DOM snapshot memory-only. Persisted INFLIGHT state intentionally
+  // stores structured stream state, not outerHTML, so a hard reload still uses
+  // the safer flat replay path instead of reviving stale nodes/listeners.
+  if(!sid||!INFLIGHT[sid]) return;
+  const turn=$('liveAssistantTurn');
+  if(!turn) return;
+  if(turn.dataset&&turn.dataset.sessionId&&turn.dataset.sessionId!==sid) return;
+  INFLIGHT[sid].liveTurnHtml=turn.outerHTML;
+}
+
+function _liveAssistantSegmentTextLength(seg){
+  if(!seg) return 0;
+  const body=seg.querySelector('.msg-body')||seg;
+  return String(body.textContent||'').trim().length;
+}
+
+function _mergeRestoredLiveAssistantSegment(restored, existing){
+  if(!restored||!existing) return;
+  const existingLive=existing.querySelector('[data-live-assistant="1"]');
+  if(!existingLive) return;
+  const restoredLive=restored.querySelector('[data-live-assistant="1"]');
+  const existingLen=_liveAssistantSegmentTextLength(existingLive);
+  const restoredLen=_liveAssistantSegmentTextLength(restoredLive);
+  if(existingLen<=restoredLen) return;
+  const replacement=existingLive.cloneNode(true);
+  if(restoredLive){
+    restoredLive.replaceWith(replacement);
+    return;
+  }
+  const blocks=_assistantTurnBlocks(restored);
+  if(!blocks) return;
+  const anchor=Array.from(blocks.children).filter(el=>
+    el.matches('.tool-call-group,.tool-card-row,.agent-activity-thinking,.thinking-card-row,[data-live-assistant="1"]')
+  ).pop();
+  if(anchor) anchor.insertAdjacentElement('afterend', replacement);
+  else blocks.appendChild(replacement);
+}
+
+function restoreLiveTurnHtmlForSession(sid){
+  const inflight=INFLIGHT[sid];
+  if(!sid||!inflight||!inflight.liveTurnHtml) return false;
+  const inner=$('msgInner');
+  if(!inner) return false;
+  const template=document.createElement('template');
+  template.innerHTML=String(inflight.liveTurnHtml||'').trim();
+  const restored=template.content.firstElementChild;
+  if(!restored) return false;
+  restored.id='liveAssistantTurn';
+  if(S.session) restored.dataset.sessionId=S.session.session_id;
+  const existing=$('liveAssistantTurn');
+  _mergeRestoredLiveAssistantSegment(restored, existing);
+  if(existing) existing.replaceWith(restored);
+  else inner.appendChild(restored);
+  const liveGroup=restored.querySelector('.tool-call-group[data-live-tool-call-group="1"]');
+  if(liveGroup&&typeof _startActivityElapsedTimer==='function') _startActivityElapsedTimer(liveGroup);
+  if(typeof placeLiveToolCardsHost==='function') placeLiveToolCardsHost();
+  requestAnimationFrame(()=>postProcessRenderedMessages(restored));
+  return true;
+}
+
 function markInflight(sid, streamId) {
   localStorage.setItem(INFLIGHT_KEY, JSON.stringify({sid, streamId, ts: Date.now()}));
 }
@@ -3864,7 +3976,7 @@ async function refreshSession() {
     const data = await api(`/api/session?session_id=${encodeURIComponent(S.session.session_id)}`);
     S.session = data.session;
     S.messages = data.session.messages || [];
-    const pendingMsg=getPendingSessionMessage(data.session);
+    const pendingMsg=getPendingSessionMessage(data.session,S.messages);
     if(pendingMsg) S.messages.push(pendingMsg);
     S.activeStreamId=data.session.active_stream_id||null;
 
@@ -4264,11 +4376,12 @@ async function _waitForServerThenReload(opts){
   if(msgEl) msgEl.textContent='⚠️ Server is taking longer than expected — click Reload when ready';
 }
 
-function getPendingSessionMessage(session){
+function getPendingSessionMessage(session, messagesOverride=null){
   const text=String(session?.pending_user_message||'').trim();
   if(!text) return null;
   const attachments=Array.isArray(session?.pending_attachments)?session.pending_attachments.filter(Boolean):[];
-  const messages=Array.isArray(session?.messages)?session.messages:[];
+  const sourceMessages=Array.isArray(messagesOverride)?messagesOverride:session?.messages;
+  const messages=Array.isArray(sourceMessages)?sourceMessages:[];
   const lastUser=[...messages].reverse().find(m=>m&&m.role==='user');
   if(lastUser){
     const lastText=String(msgContent(lastUser)||'').trim();
@@ -4488,23 +4601,26 @@ function _createAssistantTurn(tsTitle='', tpsText=''){
   const row=document.createElement('div');
   row.className='msg-row assistant-turn';
   row.dataset.role='assistant';
+  if(S.session) row.dataset.sessionId=S.session.session_id;
   row.innerHTML=`${_assistantRoleHtml(tsTitle, tpsText)}<div class="assistant-turn-blocks"></div>`;
   return row;
 }
 function _assistantTurnBlocks(turn){
   return turn?turn.querySelector('.assistant-turn-blocks'):null;
 }
-function _thinkingCardHtml(text){
+function _thinkingCardHtml(text, open){
   const clean=_sanitizeThinkingDisplayText(text);
-  return `<div class="thinking-card"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
+  return open
+    ? `<div class="thinking-card open"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`
+    : `<div class="thinking-card"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
 }
 function isSimplifiedToolCalling(){
   return window._simplifiedToolCalling!==false;
 }
-function _thinkingActivityNode(text){
+function _thinkingActivityNode(text, open){
   const row=document.createElement('div');
   row.className='agent-activity-thinking';
-  row.innerHTML=_thinkingCardHtml(text);
+  row.innerHTML=_thinkingCardHtml(text, open);
   return row;
 }
 // ── Activity-group user expand intent (#1298) ──────────────────────────────
@@ -4569,7 +4685,7 @@ function ensureActivityGroup(inner, opts){
   if(!inner) return null;
   const live=!!opts.live;
   const activityKey=opts.activityKey||(live?_activityKeyForLiveTurn():null);
-  const selector=live?'.tool-call-group[data-live-tool-call-group="1"]':'.tool-call-group[data-agent-activity-group="1"]';
+  const selector=live?'.tool-call-group[data-live-tool-call-group="1"][data-live-activity-current="1"]':'.tool-call-group[data-agent-activity-group="1"]';
   let group=inner.querySelector(selector);
   if(!group){
     group=document.createElement('div');
@@ -4586,7 +4702,10 @@ function ensureActivityGroup(inner, opts){
     group.setAttribute('data-tool-call-group','1');
     group.setAttribute('data-agent-activity-group','1');
     if(activityKey) group.setAttribute('data-activity-disclosure-key',activityKey);
-    if(live) group.setAttribute('data-live-tool-call-group','1');
+    if(live){
+      group.setAttribute('data-live-tool-call-group','1');
+      group.setAttribute('data-live-activity-current','1');
+    }
     group.innerHTML=`<button type="button" class="tool-call-group-summary" aria-expanded="${collapsed?'false':'true'}" onclick="_toggleActivityGroup(this)"><span class="tool-call-group-chevron">${li('chevron-right',12)}</span><span class="tool-call-group-label">Activity</span><span class="tool-call-group-duration"></span></button><div class="tool-call-group-body"></div>`;
     const anchor=opts.anchor||null;
     if(anchor&&anchor.parentElement===inner) anchor.insertAdjacentElement('afterend', group);
@@ -4688,17 +4807,24 @@ function _compressionCardsHtml(state){
 }
 function _autoCompressionCardsHtml(state){
   const fallback='Context auto-compressed to continue the conversation';
-  const detail=String(state.message||fallback).trim()||fallback;
-  const preview=String(state.summary?.headline||detail).trim()||detail;
+  const running=state&&state.phase==='running';
+  const detail=running
+    ? (String(state.message||'Auto-compressing context...').trim()||'Auto-compressing context...')
+    : (String(state.message||fallback).trim()||fallback);
+  const preview=running
+    ? detail
+    : (String(state.summary?.headline||detail).trim()||detail);
   return `
     <div class="tool-card-row compression-card-row" data-compression-card="1">
       ${_compressionStatusCardHtml({
         statusLabel: t('auto_compress_label'),
         previewText: preview,
         detail,
-        icon: li('check',13),
-        open: false,
-        variantClass: 'tool-card-compress-complete tool-card-compress-auto',
+        icon: running ? '<span class="tool-card-running-dot"></span>' : li('check',13),
+        open: running,
+        variantClass: running
+          ? 'tool-card-compress-running tool-card-compress-auto'
+          : 'tool-card-compress-complete tool-card-compress-auto',
       })}
     </div>`;
 }
@@ -4707,6 +4833,26 @@ function _compressionCardsNode(state){
   wrap.className='compression-turn';
   wrap.innerHTML=`<div class="compression-turn-blocks">${_compressionCardsHtml(state)}</div>`;
   return wrap;
+}
+function appendLiveCompressionCard(state){
+  if(!S.session||!S.activeStreamId||!state) return false;
+  let turn=$('liveAssistantTurn');
+  if(!turn){
+    turn=_createAssistantTurn();
+    turn.id='liveAssistantTurn';
+    if(S.session) turn.dataset.sessionId=S.session.session_id;
+    $('msgInner').appendChild(turn);
+  }
+  const inner=_assistantTurnBlocks(turn);
+  if(!inner) return false;
+  const node=_compressionCardsNode(state);
+  if(!node) return false;
+  node.setAttribute('data-live-compression-card','1');
+  const existing=inner.querySelector('[data-live-compression-card="1"]');
+  if(existing) existing.replaceWith(node);
+  else inner.appendChild(node);
+  if(typeof scrollIfPinned==='function') scrollIfPinned();
+  return true;
 }
 function _isHandoffSummaryToolPayload(value){
   if(!value||typeof value!=='object'||Array.isArray(value)) return false;
@@ -4755,10 +4901,24 @@ function _isContextCompactionMessage(m){
   const text=msgContent(m)||String(m.content||'');
   return /^\s*\[context compaction/i.test(text) || /^\s*context compaction/i.test(text);
 }
+function _isPreservedCompressionTaskListMarkerText(text){
+  return /^\s*\[your active task list was preserved across context compression\]/i.test(String(text||''));
+}
+function _isPreservedCompressionTaskListMarkerOnlyText(text){
+  return _isPreservedCompressionTaskListMarkerText(text)
+    && !String(text||'')
+      .replace(/^\s*\[your active task list was preserved across context compression\]\s*/i,'')
+      .trim();
+}
 function _isPreservedCompressionTaskListMessage(m){
   if(!m||m.role!=='user') return false;
   const text=msgContent(m)||String(m.content||'');
   return /^\s*\[your active task list was preserved across context compression\]/i.test(text);
+}
+function _isMarkerOnlyAssistantCompressionMessage(m){
+  if(!m||m.role!=='assistant') return false;
+  const text=msgContent(m)||String(m.content||'');
+  return _isPreservedCompressionTaskListMarkerOnlyText(text);
 }
 function _preservedCompressionTaskListPreview(text){
   const body=String(text||'')
@@ -5288,6 +5448,13 @@ function renderMessages(options){
   }
   let _prevSepKey=null;
   let currentAssistantTurn=null;
+  const questionRawIdxByAssistantRawIdx=new Map();
+  let lastQuestionRawIdx=-1;
+  for(const entry of visWithIdx){
+    const role=entry&&entry.m&&entry.m.role;
+    if(role==='user') lastQuestionRawIdx=entry.rawIdx;
+    else if(role==='assistant') questionRawIdxByAssistantRawIdx.set(entry.rawIdx,lastQuestionRawIdx);
+  }
   const assistantSegments=new Map();
   const assistantThinking=new Map();
   const userRows=new Map();
@@ -5338,8 +5505,16 @@ function renderMessages(options){
       }
     }
     const isUser=m.role==='user';
+    if(!isUser&&_isMarkerOnlyAssistantCompressionMessage(m)){
+      content='**Error:** No response received after context compression. Please retry.';
+    }
     const displayContent=isUser?_stripWorkspaceDisplayPrefix(content):content;
+    if(thinkingText&&!isUser){
+      thinkingText=_stripVisibleAssistantEchoFromThinking(thinkingText, displayContent);
+    }
     const isLastAssistant=!isUser&&vi===renderVisWithIdx.length-1;
+    const nextRendered=renderVisWithIdx[vi+1];
+    const isTurnFinalAssistant=!isUser&&(!nextRendered||!nextRendered.m||nextRendered.m.role!=='assistant');
     let filesHtml='';
     if(m.attachments&&m.attachments.length){
       // Static regression tests intentionally look for msg-media-img/msg-file-badge near this branch.
@@ -5372,7 +5547,10 @@ function renderMessages(options){
     const tsTitle=tsVal?(_fmtSv?_fmtSv(new Date(tsVal*1000),{}):new Date(tsVal*1000).toLocaleString()):'';
     const tsTime=_formatMessageFooterTimestamp(tsVal);
     const timeHtml = tsTime ? `<span class="msg-time" title="${esc(tsTitle)}">${tsTime}</span>` : '';
-    const footHtml = `<div class="msg-foot">${timeHtml}<span class="msg-actions">${editBtn}${ttsBtn}${forkBtn}${copyBtn}${retryBtn}</span></div>`;
+    const questionJumpBtn = (!isUser&&!m._live&&isTurnFinalAssistant)
+      ? _questionJumpButtonHtml(questionRawIdxByAssistantRawIdx.get(rawIdx))
+      : '';
+    const footHtml = `<div class="msg-foot">${timeHtml}<span class="msg-actions">${editBtn}${ttsBtn}${forkBtn}${copyBtn}${retryBtn}</span>${questionJumpBtn}</div>`;
 
     if(_isContextCompactionMessage(m)){
       if(compressionState || referenceNode){
@@ -5392,6 +5570,7 @@ function renderMessages(options){
       currentAssistantTurn=null;
       const row=document.createElement('div');
       row.className='msg-row';
+      row.id=_userMessageDomId(rawIdx);
       row.dataset.msgIdx=rawIdx;
       row.dataset.role='user';
       row.dataset.rawText=String(displayContent).trim();
@@ -5480,7 +5659,7 @@ function renderMessages(options){
       const turn=anchorSeg.closest('.assistant-turn');
       const blocks=_assistantTurnBlocks(turn);
       if(blocks){
-        blocks.appendChild(node);
+        blocks.insertBefore(node, anchorSeg);
         return;
       }
       const turnParent=turn && turn.parentElement;
@@ -5623,14 +5802,18 @@ function renderMessages(options){
         }
         if(!anchorRow) continue;
         const anchorParent=anchorRow.parentElement;
-        const insertAfterNode = anchorInsertAfter.get(anchorRow) || anchorRow;
+        let insertAfterNode = anchorInsertAfter.get(anchorRow) || anchorRow;
+        const thinkingText=assistantThinking.get(aIdx);
+        if(thinkingText){
+          const thinkingNode=_thinkingActivityNode(thinkingText, false);
+          anchorParent.insertBefore(thinkingNode, anchorRow);
+        }
+        if(!cards.length) continue;
         const group=ensureActivityGroup(anchorParent,{collapsed:true,anchor:insertAfterNode,activityKey:`assistant:${aIdx}`});
         const sourceMsg=S.messages[aIdx]||{};
         if(sourceMsg._turnDuration!==undefined) group.setAttribute('data-turn-duration', String(sourceMsg._turnDuration));
         const body=group&&group.querySelector('.tool-call-group-body');
         if(!body) continue;
-        const thinkingText=assistantThinking.get(aIdx);
-        if(thinkingText) body.appendChild(_thinkingActivityNode(thinkingText));
         for(const tc of cards){
           body.appendChild(buildToolCard(tc));
         }
@@ -5862,16 +6045,36 @@ function _syncToolCallGroupSummary(group){
   if(durationEl){
     if(group.getAttribute('data-live-tool-call-group')==='1'){
       const activeText=_activityElapsedLabel(group);
+      const progressText=_activityLiveProgressLabel(group);
       if(activeText) group.setAttribute('data-active-turn-elapsed',activeText);
       else group.removeAttribute('data-active-turn-elapsed');
-      durationEl.textContent=activeText?`Working ${activeText}`:'';
-      durationEl.style.display=activeText?'':'none';
+      durationEl.textContent=[progressText, activeText].filter(Boolean).join(' · ');
+      durationEl.style.display=durationEl.textContent?'':'none';
     }else{
       const durationText=_formatTurnDuration(group.dataset.turnDuration);
       durationEl.textContent=durationText?`Done in ${durationText}`:'';
       durationEl.style.display=durationText?'':'none';
     }
   }
+}
+
+function _activityProgressLabelForToolName(name){
+  const key=String(name||'').toLowerCase().replace(/[^a-z0-9]+/g,'_');
+  if(!key) return 'Working';
+  if(key.includes('search')||key.includes('grep')) return 'Searching workspace';
+  if(key.includes('read')||key.includes('view')||key.includes('open')) return 'Reading files';
+  if(key.includes('write')||key.includes('patch')||key.includes('edit')) return 'Updating files';
+  if(key.includes('terminal')||key.includes('shell')||key.includes('command')||key.includes('process')) return 'Running command';
+  if(key.includes('web')||key.includes('fetch')||key.includes('curl')) return 'Checking web data';
+  if(key.includes('todo')||key.includes('plan')) return 'Planning next steps';
+  return 'Working';
+}
+
+function _activityLiveProgressLabel(group){
+  if(!group||group.getAttribute('data-live-tool-call-group')!=='1') return '';
+  const running=group.querySelector('.tool-card.tool-card-running .tool-card-name');
+  const latest=running || Array.from(group.querySelectorAll('.tool-card-name')).pop();
+  return _activityProgressLabelForToolName(latest?latest.textContent:'');
 }
 
 // ── Live tool card helpers (called during SSE streaming) ──
@@ -6755,31 +6958,25 @@ function appendThinking(text=''){
     }
     return;
   }
-  if(!String(text||'').trim()){
-    scrollIfPinned();
-    return;
-  }
-  const allChildren=Array.from(blocks.children);
-  const anchor=allChildren.filter(el=>
-    el.id!=='toolRunningRow' &&
-    el.matches('[data-live-assistant="1"],.tool-call-group,.tool-card-row,.agent-activity-thinking')
-  ).pop();
-  const group=ensureActivityGroup(blocks,{live:true,collapsed:true,anchor,activityKey:_activityKeyForLiveTurn()});
-  const body=group&&group.querySelector('.tool-call-group-body');
-  if(!body) return;
-  let row=body.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
+  const thinkingText=String(text||'').trim()||'Thinking…';
+  let row=blocks.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
   if(!row){
-    row=document.createElement('div');
-    row.className='agent-activity-thinking';
+    row=_thinkingActivityNode(thinkingText, false);
     row.setAttribute('data-thinking-active','1');
-    body.insertBefore(row, body.firstChild);
+    const allChildren=Array.from(blocks.children);
+    const anchor=allChildren.filter(el=>
+      el.id!=='toolRunningRow' &&
+      el.matches('[data-live-assistant="1"],.tool-call-group,.tool-card-row,.agent-activity-thinking')
+    ).pop();
+    if(anchor) anchor.insertAdjacentElement('afterend', row);
+    else blocks.appendChild(row);
+  }else{
+    _renderThinkingInto(row,thinkingText);
   }
-  _renderThinkingInto(row,text);
-  _syncToolCallGroupSummary(group);
   scrollIfPinned();
   if(_scrollPinned){
-    const thinkingBody=row&&row.querySelector('.thinking-card-body');
-    if(thinkingBody) thinkingBody.scrollTop=thinkingBody.scrollHeight;
+    const body=row&&row.querySelector('.thinking-card-body');
+    if(body) body.scrollTop=body.scrollHeight;
   }
 }
 function updateThinking(text=''){appendThinking(text);}
