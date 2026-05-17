@@ -11,6 +11,7 @@ Discovery order for all paths:
 
 import collections
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -2205,11 +2206,45 @@ def _models_cache_file_fingerprint(path: Path) -> dict:
     return fingerprint
 
 
+def _models_cache_catalog_fingerprint() -> dict:
+    """Return non-secret model-catalog identity metadata for cache invalidation.
+
+    The /api/models payload is not only a function of user config/auth files.
+    It also depends on the provider/model catalog baked into this module and on
+    small local catalogs such as Codex's models_cache.json. Keep this cheap and
+    deterministic so a server restart after catalog changes does not keep
+    serving an otherwise-valid persisted models_cache.json until the 24h TTL
+    expires (#2443).
+    """
+    catalog_payload = {
+        "provider_models": _PROVIDER_MODELS,
+        "provider_display": _PROVIDER_DISPLAY,
+    }
+    try:
+        encoded = json.dumps(
+            catalog_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        ).encode("utf-8")
+        provider_catalog_sha = hashlib.sha256(encoded).hexdigest()
+    except Exception:
+        provider_catalog_sha = "unavailable"
+
+    codex_home = Path(os.getenv("CODEX_HOME", "").strip() or (HOME / ".codex")).expanduser()
+    return {
+        "provider_catalog_sha256": provider_catalog_sha,
+        "codex_models_cache": _models_cache_file_fingerprint(codex_home / "models_cache.json"),
+    }
+
+
 def _models_cache_source_fingerprint() -> dict:
-    """Return the current config/auth-store fingerprint for /api/models cache."""
+    """Return the current config/auth/catalog fingerprint for /api/models cache."""
     return {
         "config_yaml": _models_cache_file_fingerprint(_get_config_path()),
         "auth_json": _models_cache_file_fingerprint(_get_auth_store_path()),
+        "catalog": _models_cache_catalog_fingerprint(),
     }
 
 
@@ -2957,6 +2992,13 @@ def get_available_models() -> dict:
         # A user may configure a provider key via config.yaml providers.<name>.api_key
         # without setting the corresponding env var. (#604)
         #
+        # Gating: only seed picker groups for keys whose canonical id is known
+        # to ``_PROVIDER_MODELS`` / ``_PROVIDER_DISPLAY``, or whose value is a
+        # dict-shaped provider config (custom/local). Scalar siblings under
+        # ``providers:`` (e.g. ``providers.only_configured: true``) are config
+        # flags, not providers, and must not render as phantom picker groups
+        # like ``Only-Configured`` (#2399).
+        #
         # Canonicalise the id slug here so a user with ``providers.opencode_go``
         # (underscore variant) doesn't see TWO provider groups in the picker —
         # one for the canonical ``opencode-go`` from active_provider detection
@@ -2969,13 +3011,24 @@ def get_available_models() -> dict:
         # provider_cfg values (#2245).
         _canonical_to_raw_provider_key: dict[str, str] = {}
         if isinstance(_cfg_providers, dict):
-            for _pid_key in _cfg_providers:
+            for _pid_key, _provider_cfg in _cfg_providers.items():
                 _canonical = _canonicalise_provider_id(_pid_key)
                 if not _canonical:
                     continue
+
+                # See the gating comment on the block above. ``_PROVIDER_MODELS``
+                # / ``_PROVIDER_DISPLAY`` membership accepts known providers and
+                # aliases; ``isinstance(_provider_cfg, dict)`` accepts custom
+                # entries that supply their own models/api_key/base_url. (#2399)
+                _is_known_provider = (
+                    _canonical in _PROVIDER_MODELS or _canonical in _PROVIDER_DISPLAY
+                )
+                _is_provider_config = isinstance(_provider_cfg, dict)
+                if not (_is_known_provider or _is_provider_config):
+                    continue
+
                 _canonical_to_raw_provider_key.setdefault(_canonical, _pid_key)
-                if _canonical in _PROVIDER_MODELS or _canonical in _cfg_providers or _pid_key in _cfg_providers:
-                    detected_providers.add(_canonical)
+                detected_providers.add(_canonical)
 
         def _configured_provider_for_base_url(base_url: object) -> str:
             target = _normalize_base_url_for_match(base_url)
@@ -4019,6 +4072,7 @@ _SETTINGS_DEFAULTS = {
     "onboarding_completed": False,
     "send_key": "enter",  # 'enter' or 'ctrl+enter'
     "show_token_usage": False,  # show input/output token badge below assistant messages
+    "show_quota_chip": False,  # show ambient provider quota chip in composer footer (default off; wide desktop only when enabled, see style.css @media)
     "show_tps": False,  # show tokens-per-second chip in assistant message headers
     "fade_text_effect": False,  # animate newly streamed words with a lightweight fade-in effect
     "show_cli_sessions": False,  # merge CLI sessions from state.db into the sidebar
@@ -4026,7 +4080,7 @@ _SETTINGS_DEFAULTS = {
     "check_for_updates": True,  # check if webui/agent repos are behind upstream
     "whats_new_summary_enabled": False,  # show an LLM-written What's New summary before diff links
     "theme": "dark",  # light | dark | system
-    "skin": "default",  # accent color skin: default | ares | mono | slate | poseidon | sisyphus | charizard
+    "skin": "default",  # accent color skin: default | ares | mono | slate | poseidon | sisyphus | charizard | sienna | catppuccin | nous
     "font_size": "default",  # small | default | large | xlarge
     "session_jump_buttons": False,  # show Start/End transcript jump pills
     "session_endless_scroll": False,  # auto-load older transcript pages while scrolling upward
@@ -4035,9 +4089,10 @@ _SETTINGS_DEFAULTS = {
         "HERMES_WEBUI_BOT_NAME", "Hermes"
     ),  # display name for the assistant
     "sound_enabled": False,  # play notification sound when assistant finishes
+    "rtl": False,  # right-to-left chat layout (chat messages + composer only)
     "notifications_enabled": False,  # browser notification when tab is in background
     "show_thinking": True,  # show/hide thinking/reasoning blocks in chat view
-    "simplified_tool_calling": True,  # group tools/thinking into one quiet activity disclosure
+    "simplified_tool_calling": True,  # render tools/thinking as compact inline timeline activity
     "api_redact_enabled": True,  # redact sensitive data (API keys, secrets) from API responses
     "sidebar_density": "compact",  # compact | detailed
     "auto_title_refresh_every": "0",  # adaptive title refresh: 0=off, 5/10/20=every N exchanges
@@ -4055,6 +4110,7 @@ _SETTINGS_SKIN_VALUES = {
     "sisyphus",
     "charizard",
     "sienna",
+    "catppuccin",
     "nous",
 }
 _SETTINGS_LEGACY_THEME_MAP = {
@@ -4151,6 +4207,7 @@ _SETTINGS_ENUM_VALUES = {
 _SETTINGS_BOOL_KEYS = {
     "onboarding_completed",
     "show_token_usage",
+    "show_quota_chip",
     "show_tps",
     "fade_text_effect",
     "show_cli_sessions",
@@ -4158,6 +4215,7 @@ _SETTINGS_BOOL_KEYS = {
     "check_for_updates",
     "whats_new_summary_enabled",
     "sound_enabled",
+    "rtl",
     "notifications_enabled",
     "show_thinking",
     "simplified_tool_calling",

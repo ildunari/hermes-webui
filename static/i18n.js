@@ -185,7 +185,7 @@ const LOCALES = {
     cmd_terminal: 'Open the workspace terminal',
     cmd_new: 'Start a new chat session',
     cmd_usage: 'Toggle token usage display on/off',
-    cmd_theme: 'Switch appearance (theme: system/dark/light, skin: default/ares/mono/slate/poseidon/sisyphus/charizard)',
+    cmd_theme: 'Switch appearance (theme: system/dark/light, skin: default/ares/mono/slate/poseidon/sisyphus/charizard/sienna/catppuccin/nous)',
     cmd_personality: 'Switch agent personality',
     cmd_skills: 'List available Hermes skills',
     available_commands: 'Available commands:',
@@ -509,6 +509,16 @@ const LOCALES = {
     settings_tab_appearance: 'Appearance',
     settings_tab_preferences: 'Preferences',
     settings_tab_plugins: 'Plugins',
+    settings_plugins_title: 'Plugins',
+    settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',
+    settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',
+    plugins_unnamed: 'Unnamed plugin',
+    plugins_no_description: 'No description provided.',
+    plugins_no_hooks: 'No registered lifecycle hooks',
+    plugins_registered_hooks: 'Registered hooks',
+    plugins_enabled: 'Enabled',
+    plugins_disabled: 'Disabled',
+    plugins_load_failed: 'Failed to load plugins: ',
     settings_tab_system: 'System',
     settings_title: 'Settings',
     settings_save_btn: 'Save Settings',
@@ -527,6 +537,8 @@ const LOCALES = {
     settings_autosave_failed: 'Save failed',
     settings_autosave_retry: 'Retry',
     settings_label_language: 'Language',
+    settings_label_quota_chip: 'Show provider quota chip in composer',
+    settings_desc_quota_chip: 'Displays an ambient remaining-quota indicator (e.g. OpenRouter credit balance) in the composer footer. Default off. Only visible on wide displays (≥1400px) when enabled, to keep the composer uncluttered on laptop and standard desktop widths.',
     settings_label_token_usage: 'Show token usage',
     settings_label_sidebar_density: 'Sidebar density',
     cmd_reasoning: 'Toggle thinking visibility (show/hide), set effort level, or check current status',
@@ -736,6 +748,8 @@ const LOCALES = {
     import_session_json_tooltip: 'Import session from JSON',
     clear_conversation_btn_tooltip: 'Clear all messages in this conversation',
     // Settings detail
+    settings_label_rtl: 'Right-to-left chat layout',
+    settings_desc_rtl: 'Flips alignment of chat messages and the composer input for languages like Arabic or Hebrew. Affects only the chat area — sidebar and other panels stay left-to-right.',
     settings_label_sound: 'Notification sound',
     settings_desc_sound: 'Play a sound when the assistant finishes a response.',
     // TTS (#499)
@@ -1379,7 +1393,7 @@ const LOCALES = {
     cmd_terminal: 'Apri il terminale del workspace',
     cmd_new: 'Avvia una nuova sessione di chat',
     cmd_usage: 'Attiva/disattiva visualizzazione uso token',
-    cmd_theme: 'Cambia aspetto (tema: system/dark/light, skin: default/ares/mono/slate/poseidon/sisyphus/charizard)',
+    cmd_theme: 'Cambia aspetto (tema: system/dark/light, skin: default/ares/mono/slate/poseidon/sisyphus/charizard/sienna/catppuccin/nous)',
     cmd_personality: "Cambia personalità dell'agente",
     cmd_skills: 'Elenca le skill Hermes disponibili',
     available_commands: 'Comandi disponibili:',
@@ -1703,6 +1717,16 @@ const LOCALES = {
     settings_tab_appearance: 'Aspetto',
     settings_tab_preferences: 'Preferenze',
     settings_tab_plugins: 'Plugin',
+    settings_plugins_title: 'Plugins',  // TODO: translate
+    settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
+    settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
+    plugins_unnamed: 'Unnamed plugin',  // TODO: translate
+    plugins_no_description: 'No description provided.',  // TODO: translate
+    plugins_no_hooks: 'No registered lifecycle hooks',  // TODO: translate
+    plugins_registered_hooks: 'Registered hooks',  // TODO: translate
+    plugins_enabled: 'Enabled',  // TODO: translate
+    plugins_disabled: 'Disabled',  // TODO: translate
+    plugins_load_failed: 'Failed to load plugins: ',  // TODO: translate
     settings_tab_system: 'Sistema',
     settings_title: 'Impostazioni',
     settings_save_btn: 'Salva Impostazioni',
@@ -1721,6 +1745,8 @@ const LOCALES = {
     settings_autosave_failed: 'Salvataggio fallito',
     settings_autosave_retry: 'Riprova',
     settings_label_language: 'Lingua',
+    settings_label_quota_chip: 'Mostra il chip della quota del provider nel compositore',
+    settings_desc_quota_chip: "Mostra un indicatore di quota residua (es. saldo crediti OpenRouter) nel piè di pagina del compositore. Predefinito disattivato. Visibile solo su schermi larghi (≥1400px) quando attivato, per mantenere il compositore non affollato su laptop e desktop standard.",
     settings_label_token_usage: 'Mostra uso token',
     settings_label_sidebar_density: 'Densità sidebar',
     cmd_reasoning: 'Mostra/nascondi ragionamento, imposta livello sforzo o controlla stato attuale',
@@ -1922,6 +1948,8 @@ const LOCALES = {
     import_session_json_tooltip: 'Importa sessione da JSON',
     clear_conversation_btn_tooltip: 'Cancella tutti i messaggi in questa conversazione',
     // Settings detail
+    settings_label_rtl: 'Layout chat da destra a sinistra',
+    settings_desc_rtl: "Inverte l'allineamento dei messaggi e dell'input del compositore per lingue come arabo o ebraico. Influisce solo sull'area chat — la barra laterale e gli altri pannelli rimangono da sinistra a destra.",
     settings_label_sound: 'Suono notifica',
     settings_desc_sound: 'Riproduci un suono quando l\'assistente termina una risposta.',
     // TTS (#499)
@@ -2565,7 +2593,7 @@ const LOCALES = {
     cmd_terminal: 'ワークスペースのターミナルを開く',
     cmd_new: '新しいチャットセッションを開始',
     cmd_usage: 'トークン使用量表示の ON/OFF を切り替え',
-    cmd_theme: '外観を切り替え (theme: system/dark/light, skin: default/ares/mono/slate/poseidon/sisyphus/charizard)',
+    cmd_theme: '外観を切り替え (theme: system/dark/light, skin: default/ares/mono/slate/poseidon/sisyphus/charizard/sienna/catppuccin/nous)',
     cmd_personality: 'エージェントのパーソナリティを切り替え',
     cmd_skills: '利用可能な Hermes スキルを一覧表示',
     available_commands: '利用可能なコマンド:',
@@ -2889,6 +2917,16 @@ const LOCALES = {
     settings_tab_appearance: '外観',
     settings_tab_preferences: '環境設定',
     settings_tab_plugins: 'プラグイン',
+    settings_plugins_title: 'Plugins',  // TODO: translate
+    settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
+    settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
+    plugins_unnamed: 'Unnamed plugin',  // TODO: translate
+    plugins_no_description: 'No description provided.',  // TODO: translate
+    plugins_no_hooks: 'No registered lifecycle hooks',  // TODO: translate
+    plugins_registered_hooks: 'Registered hooks',  // TODO: translate
+    plugins_enabled: 'Enabled',  // TODO: translate
+    plugins_disabled: 'Disabled',  // TODO: translate
+    plugins_load_failed: 'Failed to load plugins: ',  // TODO: translate
     settings_tab_system: 'システム',
     settings_title: '設定',
     settings_save_btn: '設定を保存',
@@ -2907,6 +2945,8 @@ const LOCALES = {
     settings_autosave_failed: '保存失敗',
     settings_autosave_retry: '再試行',
     settings_label_language: '言語',
+    settings_label_quota_chip: 'コンポーザーにプロバイダーのクォータチップを表示',
+    settings_desc_quota_chip: 'コンポーザーのフッターに残りクォータインジケーター（例: OpenRouter のクレジット残高）を表示します。デフォルトはオフ。有効にした場合、ラップトップや標準デスクトップの幅でコンポーザーが混雑しないよう、ワイドディスプレイ（≥1400px）でのみ表示されます。',
     settings_label_token_usage: 'トークン使用量を表示',
     settings_label_sidebar_density: 'サイドバー密度',
     cmd_reasoning: '思考表示の切り替え (表示/非表示)、努力レベル設定、現在状態の確認',
@@ -3113,6 +3153,8 @@ const LOCALES = {
     import_session_json_tooltip: 'JSONからセッションをインポート',
     clear_conversation_btn_tooltip: 'この会話のすべてのメッセージをクリア',
     // Settings detail
+    settings_label_rtl: 'チャットの右から左へのレイアウト',
+    settings_desc_rtl: 'アラビア語やヘブライ語のような言語向けに、チャットメッセージとコンポーザー入力の配置を反転します。チャット領域のみに影響し、サイドバーや他のパネルは左から右のままです。',
     settings_label_sound: '通知音',
     settings_desc_sound: 'アシスタントが応答を完了したときに音を鳴らします。',
     // TTS (#499)
@@ -3720,7 +3762,7 @@ const LOCALES = {
     cmd_terminal: 'Открыть терминал рабочей области',
     cmd_new: 'Начать новую сессию чата',
     cmd_usage: 'Показать или скрыть использование токенов',
-    cmd_theme: 'Переключить тему (dark/light/slate/solarized/monokai/nord/oled)',
+    cmd_theme: 'Переключить внешний вид (тема: system/dark/light, скин: default/ares/mono/slate/poseidon/sisyphus/charizard/sienna/catppuccin/nous)',
     cmd_personality: 'Переключить личность агента',
     cmd_skills: 'Показать доступные навыки Hermes',
     available_commands: 'Доступные команды:',
@@ -3917,6 +3959,8 @@ const LOCALES = {
     settings_label_send_key: 'Клавиша отправки',
     settings_label_theme: 'Тема',
     settings_label_language: 'Язык',
+    settings_label_quota_chip: 'Показывать чип квоты провайдера в композиторе',
+    settings_desc_quota_chip: 'Отображает фоновый индикатор остатка квоты (например, баланс кредитов OpenRouter) в подвале композитора. По умолчанию отключено. Виден только на широких экранах (≥1400px) при включении, чтобы не загромождать композитор на ноутбуках и стандартных мониторах.',
     settings_label_token_usage: 'Показывать использование токенов',
     settings_label_sidebar_density: 'Плотность боковой панели',
     cmd_reasoning: 'Toggle thinking visibility (show/hide), set effort level, or check current status',
@@ -4088,6 +4132,8 @@ const LOCALES = {
     export_session_json_tooltip: 'Экспортировать сессию как JSON',
     import_session_json_tooltip: 'Импортировать сессию из JSON',
     clear_conversation_btn_tooltip: 'Очистить все сообщения в этой беседе',
+    settings_label_rtl: 'Раскладка чата справа налево',
+    settings_desc_rtl: 'Переворачивает выравнивание сообщений чата и поля ввода для языков вроде арабского или иврита. Влияет только на область чата — боковая панель и другие панели остаются слева направо.',
     settings_label_sound: 'Звук уведомления',
     settings_desc_sound: 'Проигрывать звук, когда помощник завершает ответ.',
     settings_label_notifications: 'Уведомления браузера',
@@ -4584,6 +4630,16 @@ const LOCALES = {
     settings_tab_conversation: 'Conversation',
     settings_tab_preferences: 'Preferences',
     settings_tab_plugins: 'Плагины',
+    settings_plugins_title: 'Plugins',  // TODO: translate
+    settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
+    settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
+    plugins_unnamed: 'Unnamed plugin',  // TODO: translate
+    plugins_no_description: 'No description provided.',  // TODO: translate
+    plugins_no_hooks: 'No registered lifecycle hooks',  // TODO: translate
+    plugins_registered_hooks: 'Registered hooks',  // TODO: translate
+    plugins_enabled: 'Enabled',  // TODO: translate
+    plugins_disabled: 'Disabled',  // TODO: translate
+    plugins_load_failed: 'Failed to load plugins: ',  // TODO: translate
     settings_tab_system: 'System',
     status_updated: 'Updated',
     status_ephemeral: 'Ephemeral snapshot — not saved to transcript history.',
@@ -4873,7 +4929,7 @@ const LOCALES = {
     cmd_terminal: 'Abrir terminal del espacio de trabajo',
     cmd_new: 'Iniciar una nueva sesión de chat',
     cmd_usage: 'Activar o desactivar el uso de tokens',
-    cmd_theme: 'Cambiar apariencia (tema: system/dark/light, skin: default/ares/mono/slate/poseidon/sisyphus/charizard)',
+    cmd_theme: 'Cambiar apariencia (tema: system/dark/light, skin: default/ares/mono/slate/poseidon/sisyphus/charizard/sienna/catppuccin/nous)',
     cmd_personality: 'Cambiar la personalidad del agente',
     cmd_skills: 'Listar las skills de Hermes disponibles',
     available_commands: 'Comandos disponibles:',
@@ -5032,6 +5088,8 @@ const LOCALES = {
     settings_autosave_failed: 'Error al guardar',
     settings_autosave_retry: 'Reintentar',
     settings_label_language: 'Idioma',
+    settings_label_quota_chip: 'Mostrar el chip de cuota del proveedor en el compositor',
+    settings_desc_quota_chip: 'Muestra un indicador ambiental de cuota restante (por ejemplo, saldo de crédito de OpenRouter) en el pie del compositor. Predeterminado: desactivado. Solo visible en pantallas anchas (≥1400px) cuando se activa, para mantener el compositor despejado en portátiles y monitores estándar.',
     settings_label_token_usage: 'Mostrar uso de tokens',
     settings_label_sidebar_density: 'Densidad de la barra lateral',
     cmd_reasoning: 'Toggle thinking visibility (show/hide), set effort level, or check current status',
@@ -5214,6 +5272,8 @@ const LOCALES = {
     import_session_json_tooltip: 'Importar sesión desde JSON',
     clear_conversation_btn_tooltip: 'Borrar todos los mensajes de esta conversación',
     // Settings detail
+    settings_label_rtl: 'Diseño de chat de derecha a izquierda',
+    settings_desc_rtl: 'Invierte la alineación de los mensajes y la entrada del compositor para idiomas como árabe o hebreo. Afecta solo al área del chat — la barra lateral y otros paneles siguen de izquierda a derecha.',
     settings_label_sound: 'Sonido de notificación',
     settings_desc_sound: 'Reproduce un sonido cuando el asistente termina una respuesta.',
     settings_label_notifications: 'Notificaciones del navegador',
@@ -5697,6 +5757,16 @@ const LOCALES = {
     settings_tab_conversation: 'Conversation',
     settings_tab_preferences: 'Preferences',
     settings_tab_plugins: 'Plugins',
+    settings_plugins_title: 'Plugins',  // TODO: translate
+    settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
+    settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
+    plugins_unnamed: 'Unnamed plugin',  // TODO: translate
+    plugins_no_description: 'No description provided.',  // TODO: translate
+    plugins_no_hooks: 'No registered lifecycle hooks',  // TODO: translate
+    plugins_registered_hooks: 'Registered hooks',  // TODO: translate
+    plugins_enabled: 'Enabled',  // TODO: translate
+    plugins_disabled: 'Disabled',  // TODO: translate
+    plugins_load_failed: 'Failed to load plugins: ',  // TODO: translate
     settings_tab_system: 'System',
     status_updated: 'Updated',
     status_ephemeral: 'Ephemeral snapshot — not saved to transcript history.',
@@ -5972,7 +6042,7 @@ const LOCALES = {
     cmd_terminal: 'Workspace-Terminal öffnen',
     cmd_new: 'Neue Chat-Sitzung starten',
     cmd_usage: 'Token-Verbrauchsanzeige umschalten',
-    cmd_theme: 'Darstellung wechseln (Theme: system/dark/light, Skin: default/ares/mono/slate/poseidon/sisyphus/charizard)',
+    cmd_theme: 'Darstellung wechseln (Theme: system/dark/light, Skin: default/ares/mono/slate/poseidon/sisyphus/charizard/sienna/catppuccin/nous)',
     cmd_personality: 'Agenten-Persönlichkeit wechseln',
     cmd_skills: 'Verfügbare Hermes-Skills auflisten',
     available_commands: 'Verfügbare Befehle:',
@@ -6140,6 +6210,8 @@ const LOCALES = {
     settings_autosave_failed: 'Speichern fehlgeschlagen',
     settings_autosave_retry: 'Wiederholen',
     settings_label_language: 'Sprache',
+    settings_label_quota_chip: 'Anbieter-Kontingent-Chip im Editor anzeigen',
+    settings_desc_quota_chip: 'Zeigt einen Hintergrund-Indikator des verbleibenden Kontingents (z. B. OpenRouter-Guthaben) in der Editor-Fußzeile an. Standardmäßig deaktiviert. Bei Aktivierung nur auf breiten Bildschirmen (≥1400px) sichtbar, damit der Editor auf Laptops und Standard-Desktops übersichtlich bleibt.',
     settings_label_token_usage: 'Token-Verbrauch anzeigen',
     settings_label_sidebar_density: 'Seitenleistendichte',
     cmd_reasoning: 'Toggle thinking visibility (show/hide), set effort level, or check current status',
@@ -6312,6 +6384,8 @@ const LOCALES = {
     import_session_json_tooltip: 'Sitzung aus JSON importieren',
     clear_conversation_btn_tooltip: 'Alle Nachrichten in dieser Konversation löschen',
     // Settings detail
+    settings_label_rtl: 'Chat-Layout von rechts nach links',
+    settings_desc_rtl: 'Kehrt die Ausrichtung von Chat-Nachrichten und Eingabefeld für Sprachen wie Arabisch oder Hebräisch um. Betrifft nur den Chat-Bereich — Seitenleiste und andere Panels bleiben von links nach rechts.',
     settings_label_sound: 'Benachrichtigungston',
     settings_desc_sound: 'Spielt einen Ton ab, wenn der Assistent eine Antwort beendet.',
     settings_label_notifications: 'Browser-Benachrichtigungen',
@@ -6546,6 +6620,16 @@ const LOCALES = {
     settings_tab_conversation: 'Conversation',
     settings_tab_preferences: 'Preferences',
     settings_tab_plugins: 'Plugins',
+    settings_plugins_title: 'Plugins',  // TODO: translate
+    settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
+    settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
+    plugins_unnamed: 'Unnamed plugin',  // TODO: translate
+    plugins_no_description: 'No description provided.',  // TODO: translate
+    plugins_no_hooks: 'No registered lifecycle hooks',  // TODO: translate
+    plugins_registered_hooks: 'Registered hooks',  // TODO: translate
+    plugins_enabled: 'Enabled',  // TODO: translate
+    plugins_disabled: 'Disabled',  // TODO: translate
+    plugins_load_failed: 'Failed to load plugins: ',  // TODO: translate
     settings_tab_system: 'System',
     status_updated: 'Updated',
     status_ephemeral: 'Ephemeral snapshot — not saved to transcript history.',
@@ -7122,7 +7206,7 @@ const LOCALES = {
     cmd_terminal: '打开工作区 Terminal',
     cmd_new: '新建聊天会话',
     cmd_usage: '切换 token 用量显示',
-    cmd_theme: '切换外观（主题：system/dark/light，皮肤：default/ares/mono/slate/poseidon/sisyphus/charizard）',
+    cmd_theme: '切换外观（主题：system/dark/light，皮肤：default/ares/mono/slate/poseidon/sisyphus/charizard/sienna/catppuccin/nous）',
     cmd_personality: '切换 Agent 人设',
     cmd_skills: '列出可用的 Hermes 技能',
     available_commands: '可用命令：',
@@ -7183,13 +7267,22 @@ const LOCALES = {
     busy_steer_fallback: 'Steer 不可用 — 已中断',
     busy_interrupt_confirm: '已中断 — 正在发送新消息',
     settings_label_busy_input_mode: '忙碌输入模式',
-    settings_desc_busy_input_mode: '控制在代理运行时发送消息的行为。队列等待；中断取消并重新开始；Steer中途注入纠正，不中断。',
-    settings_label_fade_text_effect: '文本淡入效果',
-    settings_desc_fade_text_effect: '在助手回复时让新流式输出的词语淡入显示。类似 OpenWebUI；为获得最佳性能默认关闭。',
-    settings_busy_input_mode_queue: '加入队列',
-    settings_busy_input_mode_interrupt: '中断当前回合',
-    settings_busy_input_mode_steer: 'Steer（中断 + 发送）',
-
+    settings_desc_busy_input_mode: '控制当代理正在运行时你发送消息会发生什么。队列会等待；中断会取消并重新开始；引导会在不中断的情况下注入中间修正（当流不可用时回退到队列）。',
+    settings_label_fade_text_effect: '淡入文字效果',
+    settings_desc_fade_text_effect: '在助手回复时淡入新流式单词。类似于 OpenWebUI；默认关闭以获得最佳性能。',
+    settings_busy_input_mode_queue: '队列后续消息',
+    settings_busy_input_mode_interrupt: '中断当前轮次',
+    settings_busy_input_mode_steer: '引导（中间修正）',
+    settings_plugins_title: '插件',
+    settings_plugins_meta: '查看已安装的 Hermes 插件及其注册的生命周期挂钩。此面板为只读。',
+    settings_plugins_empty: '当前没有可见的 Hermes 插件。通过 Hermes CLI/配置文件安装或启用插件后即可在此查看。',
+    plugins_unnamed: '未命名插件',
+    plugins_no_description: '未提供描述信息。',
+    plugins_no_hooks: '未注册生命周期挂钩',
+    plugins_registered_hooks: '已注册的挂钩',
+    plugins_enabled: '已启用',
+    plugins_disabled: '已禁用',
+    plugins_load_failed: '加载插件失败：',
     workspace_empty_no_path: '未选择工作区。请在 设置 → 工作区 中设置工作区以浏览文件。',
     workspace_empty_dir: '此工作区为空。',
     workspace_show_hidden_files: '显示隐藏文件',
@@ -7289,6 +7382,8 @@ const LOCALES = {
     settings_autosave_failed: '保存失败',
     settings_autosave_retry: '重试',
     settings_label_language: '语言',
+    settings_label_quota_chip: '在编辑器中显示供应商配额标签',
+    settings_desc_quota_chip: '在编辑器底部显示剩余配额指示器（如 OpenRouter 信用余额）。默认关闭。启用时仅在宽屏（≥1400px）显示，以保持笔记本和标准桌面屏幕上编辑器的整洁。',
     settings_label_token_usage: '显示 token 用量',
     settings_label_sidebar_density: '侧边栏密度',
     cmd_reasoning: '切换思维可见性（显示/隐藏）、设置工作强度或查看当前状态',
@@ -7534,6 +7629,8 @@ const LOCALES = {
     password_env_var_locked: '当前已设置 HERMES_WEBUI_PASSWORD 环境变量并具有优先级。请取消该变量并重启服务器，才能在此管理密码。',
     password_env_var_locked_placeholder: '已锁定：已设置 HERMES_WEBUI_PASSWORD 环境变量',
     disable_auth: '停用认证',
+    settings_label_rtl: '从右到左聊天布局',
+    settings_desc_rtl: '为阿拉伯语或希伯来语等语言翻转聊天消息和编辑器输入的对齐方式。仅影响聊天区域 — 侧边栏和其他面板保持从左到右。',
     settings_label_sound: '通知声音',
     settings_label_notifications: '浏览器通知',
     settings_desc_sound: '助手完成回复时播放提示音。',
@@ -8210,7 +8307,7 @@ const LOCALES = {
     cmd_terminal: '\u6253\u958b\u5de5\u4f5c\u5340 Terminal',
     cmd_new: '\u65b0\u5efa\u804a\u5929\u6703\u8a71',
     cmd_usage: '\u5207\u63db token \u7528\u91cf\u986f\u793a',
-    cmd_theme: '\u5207\u63db\u5916\u89c0\uff08\u4e3b\u984c\uff1asystem/dark/light\uff0c\u76ae\u819a\uff1adefault/ares/mono/slate/poseidon/sisyphus/charizard\uff09',
+    cmd_theme: '\u5207\u63db\u5916\u89c0\uff08\u4e3b\u984c\uff1asystem/dark/light\uff0c\u76ae\u819a\uff1adefault/ares/mono/slate/poseidon/sisyphus/charizard/sienna/catppuccin/nous\uff09',
     cmd_personality: '\u5207\u63db Agent \u4eba\u8a2d',
     cmd_skills: '\u5217\u51fa\u53ef\u7528\u7684 Hermes \u6280\u80fd',
     available_commands: '\u53ef\u7528\u547d\u4ee4\uff1a',
@@ -8404,6 +8501,16 @@ const LOCALES = {
     settings_tab_appearance: '外觀',
     settings_tab_preferences: '偏好設定',
     settings_tab_plugins: '外掛',
+    settings_plugins_title: '外掛',
+    settings_plugins_meta: '檢視已安裝的 Hermes 外掛及其註冊的生命週期鉤子。此面板為唯讀。',
+    settings_plugins_empty: '目前沒有可見的 Hermes 外掛。透過 Hermes CLI/設定檔安裝或啟用外掛後即可在此檢視。',
+    plugins_unnamed: '未命名外掛',
+    plugins_no_description: '未提供描述。',
+    plugins_no_hooks: '未註冊生命週期鉤子',
+    plugins_registered_hooks: '已註冊的鉤子',
+    plugins_enabled: '已啟用',
+    plugins_disabled: '已停用',
+    plugins_load_failed: '載入外掛失敗：',
     settings_tab_system: '系統',
     settings_title: '\u8a2d\u5b9a',
     settings_save_btn: '\u5132\u5b58\u8a2d\u5b9a',
@@ -8422,6 +8529,8 @@ const LOCALES = {
     settings_autosave_failed: '\u5132\u5b58\u5931\u6557',
     settings_autosave_retry: '\u91cd\u8a66',
     settings_label_language: '\u8a9e\u8a00',
+    settings_label_quota_chip: '在編輯器中顯示供應商配額標籤',
+    settings_desc_quota_chip: '在編輯器底部顯示剩餘配額指示器（如 OpenRouter 點數餘額）。預設關閉。啟用時僅在寬螢幕（≥1400px）顯示，以保持筆記型電腦和標準桌面螢幕上編輯器的整潔。',
     settings_label_token_usage: '\u986f\u793a token \u7528\u91cf',
     settings_label_sidebar_density: '側邊欄密度',
     cmd_reasoning: '切換思考區塊可見性（顯示/隱藏）或設定努力等級',
@@ -8591,6 +8700,8 @@ const LOCALES = {
     password_env_var_locked: '\u76ee\u524d\u5df2\u8a2d\u5b9a HERMES_WEBUI_PASSWORD \u74b0\u5883\u8b8a\u6578\u4e14\u512a\u5148\u751f\u6548\u3002\u8acb\u53d6\u6d88\u8a2d\u5b9a\u4e26\u91cd\u65b0\u555f\u52d5\u4f3a\u670d\u5668\uff0c\u624d\u80fd\u5728\u6b64\u7ba1\u7406\u5bc6\u78bc\u3002',
     password_env_var_locked_placeholder: '\u5df2\u9396\u5b9a\uff1a\u5df2\u8a2d\u5b9a HERMES_WEBUI_PASSWORD \u74b0\u5883\u8b8a\u6578',
     disable_auth: '\u505c\u7528\u9a57\u8b49',
+    settings_label_rtl: '從右到左聊天版面',
+    settings_desc_rtl: '為阿拉伯語或希伯來語等語言翻轉聊天訊息和編輯器輸入的對齊方式。僅影響聊天區域 — 側邊欄和其他面板保持從左到右。',
     settings_label_sound: '\u901a\u77e5\u8072\u97f3',
     settings_label_notifications: '\u700f\u89bd\u901a\u77e5',
     settings_desc_sound: '助手完成回答時播放聲音。',
@@ -9388,7 +9499,7 @@ const LOCALES = {
     cmd_workspace: 'Trocar workspace por nome',
     cmd_new: 'Iniciar nova sessão de chat',
     cmd_usage: 'Alternar exibição de uso de tokens',
-    cmd_theme: 'Trocar aparência (tema: system/dark/light, skin: default/ares/mono/slate/poseidon/sisyphus/charizard)',
+    cmd_theme: 'Trocar aparência (tema: system/dark/light, skin: default/ares/mono/slate/poseidon/sisyphus/charizard/sienna/catppuccin/nous)',
     cmd_personality: 'Trocar personalidade do agente',
     cmd_skills: 'Listar skills disponíveis do Hermes',
     available_commands: 'Comandos disponíveis:',
@@ -9678,6 +9789,16 @@ const LOCALES = {
     settings_tab_appearance: 'Aparência',
     settings_tab_preferences: 'Preferências',
     settings_tab_plugins: 'Plugins',
+    settings_plugins_title: 'Plugins',  // TODO: translate
+    settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
+    settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
+    plugins_unnamed: 'Unnamed plugin',  // TODO: translate
+    plugins_no_description: 'No description provided.',  // TODO: translate
+    plugins_no_hooks: 'No registered lifecycle hooks',  // TODO: translate
+    plugins_registered_hooks: 'Registered hooks',  // TODO: translate
+    plugins_enabled: 'Enabled',  // TODO: translate
+    plugins_disabled: 'Disabled',  // TODO: translate
+    plugins_load_failed: 'Failed to load plugins: ',  // TODO: translate
     settings_tab_system: 'Sistema',
     settings_title: 'Configurações',
     settings_save_btn: 'Salvar Configurações',
@@ -9696,6 +9817,8 @@ const LOCALES = {
     settings_autosave_failed: 'Falha ao salvar',
     settings_autosave_retry: 'Tentar novamente',
     settings_label_language: 'Idioma',
+    settings_label_quota_chip: 'Mostrar o chip de cota do provedor no compositor',
+    settings_desc_quota_chip: 'Exibe um indicador ambiente de cota restante (por exemplo, saldo de crédito do OpenRouter) no rodapé do compositor. Desativado por padrão. Visível apenas em telas largas (≥1400px) quando ativado, para manter o compositor livre em laptops e monitores padrão.',
     settings_label_token_usage: 'Mostrar uso de tokens',
     settings_label_sidebar_density: 'Densidade da sidebar',
     cmd_reasoning: 'Alternar visibilidade do pensamento (mostrar/ocultar)',
@@ -9871,6 +9994,8 @@ const LOCALES = {
     import_session_json_tooltip: 'Importar sessão de JSON',
     clear_conversation_btn_tooltip: 'Limpar todas as mensagens nesta conversa',
     // Settings detail
+    settings_label_rtl: 'Layout de chat da direita para a esquerda',
+    settings_desc_rtl: 'Inverte o alinhamento das mensagens do chat e da entrada do compositor para idiomas como árabe ou hebraico. Afeta apenas a área do chat — a barra lateral e outros painéis permanecem da esquerda para a direita.',
     settings_label_sound: 'Som de notificação',
     settings_desc_sound: 'Tocar som quando assistente finalizar resposta.',
     settings_label_notifications: 'Notificações do navegador',
@@ -10462,7 +10587,7 @@ const LOCALES = {
     cmd_terminal: '워크스페이스 터미널 열기',
     cmd_new: '새 채팅 세션 시작',
     cmd_usage: '토큰 사용량 표시 켜기/끄기',
-    cmd_theme: 'Switch appearance (theme: system/dark/light, skin: default/ares/mono/slate/poseidon/sisyphus/charizard)',
+    cmd_theme: 'Switch appearance (theme: system/dark/light, skin: default/ares/mono/slate/poseidon/sisyphus/charizard/sienna/catppuccin/nous)',
     cmd_personality: 'Switch agent personality',
     cmd_skills: 'List available Hermes skills',
     available_commands: '사용 가능한 명령:',
@@ -10767,6 +10892,16 @@ const LOCALES = {
     settings_tab_appearance: '외형',
     settings_tab_preferences: '환경설정',
     settings_tab_plugins: '플러그인',
+    settings_plugins_title: 'Plugins',  // TODO: translate
+    settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
+    settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
+    plugins_unnamed: 'Unnamed plugin',  // TODO: translate
+    plugins_no_description: 'No description provided.',  // TODO: translate
+    plugins_no_hooks: 'No registered lifecycle hooks',  // TODO: translate
+    plugins_registered_hooks: 'Registered hooks',  // TODO: translate
+    plugins_enabled: 'Enabled',  // TODO: translate
+    plugins_disabled: 'Disabled',  // TODO: translate
+    plugins_load_failed: 'Failed to load plugins: ',  // TODO: translate
     settings_tab_system: '시스템',
     settings_title: '설정',
     settings_save_btn: '설정 저장',
@@ -10785,6 +10920,8 @@ const LOCALES = {
     settings_autosave_failed: '저장 실패',
     settings_autosave_retry: '다시 시도',
     settings_label_language: '언어',
+    settings_label_quota_chip: '작성기에 공급자 할당량 칩 표시',
+    settings_desc_quota_chip: '작성기 푸터에 남은 할당량 표시기(예: OpenRouter 크레딧 잔액)를 표시합니다. 기본값은 끔. 활성화 시 노트북과 표준 데스크톱에서 작성기가 복잡해지지 않도록 와이드 디스플레이(≥1400px)에서만 표시됩니다.',
     settings_label_token_usage: '토큰 사용량 표시',
     settings_label_sidebar_density: '사이드바 밀도',
     cmd_reasoning: 'Toggle thinking visibility (show/hide), set effort level, or check current status',
@@ -10959,6 +11096,8 @@ const LOCALES = {
     import_session_json_tooltip: 'JSON에서 세션 가져오기',
     clear_conversation_btn_tooltip: '이 대화의 모든 메시지 지우기',
     // Settings detail
+    settings_label_rtl: '오른쪽에서 왼쪽 채팅 레이아웃',
+    settings_desc_rtl: '아랍어나 히브리어 같은 언어를 위해 채팅 메시지와 작성 입력의 정렬을 뒤집습니다. 채팅 영역에만 영향을 주며, 사이드바와 다른 패널은 왼쪽에서 오른쪽으로 유지됩니다.',
     settings_label_sound: '알림음',
     settings_desc_sound: 'Assistant 응답이 끝나면 소리를 재생합니다.',
     settings_label_notifications: '브라우저 알림',
@@ -11640,7 +11779,7 @@ const LOCALES = {
     cmd_terminal: 'Ouvrez le terminal de l\'espace de travail',
     cmd_new: 'Démarrer une nouvelle session de discussion',
     cmd_usage: 'Activer/désactiver l\'affichage de l\'utilisation du jeton',
-    cmd_theme: 'Changer d\'apparence (thème : système/dark/light, skin : default/ares/mono/slate/poseidon/sisyphus/charizard)',
+    cmd_theme: 'Changer d\'apparence (thème : system/dark/light, skin : default/ares/mono/slate/poseidon/sisyphus/charizard/sienna/catppuccin/nous)',
     cmd_personality: 'Personnalité de l\'agent de commutation',
     cmd_skills: 'Lister les compétences Hermès disponibles',
     available_commands: 'Commandes disponibles :',
@@ -11666,7 +11805,7 @@ const LOCALES = {
     focus_label: 'Se concentrer',
     token_usage_on: 'Utilisation du jeton sur',
     token_usage_off: 'Utilisation des jetons désactivée',
-    theme_usage: 'Utilisation : /thème',
+    theme_usage: 'Utilisation : /theme ',
     theme_set: 'Thème:',
     no_active_session: 'Aucune session active',
     cmd_queue: 'Mettre un message en file d\'attente pour le prochain tour',
@@ -11873,6 +12012,16 @@ const LOCALES = {
     settings_tab_appearance: 'Apparence',
     settings_tab_preferences: 'Préférences',
     settings_tab_plugins: 'Plugins',
+    settings_plugins_title: 'Plugins',  // TODO: translate
+    settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
+    settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
+    plugins_unnamed: 'Unnamed plugin',  // TODO: translate
+    plugins_no_description: 'No description provided.',  // TODO: translate
+    plugins_no_hooks: 'No registered lifecycle hooks',  // TODO: translate
+    plugins_registered_hooks: 'Registered hooks',  // TODO: translate
+    plugins_enabled: 'Enabled',  // TODO: translate
+    plugins_disabled: 'Disabled',  // TODO: translate
+    plugins_load_failed: 'Failed to load plugins: ',  // TODO: translate
     settings_tab_system: 'Système',
     settings_title: 'Paramètres',
     settings_save_btn: 'Enregistrer les paramètres',
@@ -11891,6 +12040,8 @@ const LOCALES = {
     settings_autosave_failed: 'Échec de l\'enregistrement',
     settings_autosave_retry: 'Réessayer',
     settings_label_language: 'Langue',
+    settings_label_quota_chip: 'Afficher la pastille de quota du fournisseur dans le compositeur',
+    settings_desc_quota_chip: "Affiche un indicateur ambiant de quota restant (par ex. solde de crédit OpenRouter) dans le pied du compositeur. Désactivé par défaut. Visible uniquement sur les écrans larges (≥1400px) lorsqu'activé, pour garder le compositeur dégagé sur les ordinateurs portables et les bureaux standard.",
     settings_label_token_usage: 'Afficher l\'utilisation du jeton',
     settings_label_sidebar_density: 'Densité de la barre latérale',
     cmd_reasoning: 'Basculez la visibilité de la réflexion (afficher/masquer), définir le niveau d\'effort ou vérifier l\'état actuel',
@@ -12061,6 +12212,8 @@ const LOCALES = {
     export_session_json_tooltip: 'Exporter la session complète en JSON',
     import_session_json_tooltip: 'Importer une session depuis JSON',
     clear_conversation_btn_tooltip: 'Effacer tous les messages de cette conversation',
+    settings_label_rtl: 'Mise en page du chat de droite à gauche',
+    settings_desc_rtl: "Inverse l'alignement des messages du chat et de la saisie du compositeur pour des langues comme l'arabe ou l'hébreu. N'affecte que la zone de chat — la barre latérale et les autres panneaux restent de gauche à droite.",
     settings_label_sound: 'Son de notification',
     settings_desc_sound: 'Jouez un son lorsque l\'assistant termine une réponse.',
     tts_listen: 'Écouter',

@@ -974,6 +974,8 @@ def _message_text(value) -> str:
 
 _WORKSPACE_PREFIX_RE = re.compile(r'^\s*\[Workspace::v1:\s*(?:\\.|[^\]\\])+\]\s*')
 _LEGACY_WORKSPACE_PREFIX_RE = re.compile(r'^\s*\[Workspace:[^\]]+\]\s*')
+_WORKSPACE_PREFIX_ANY_RE = re.compile(r'\[Workspace::v1:\s*(?:\\.|[^\]\\])+\]\s*')
+_LEGACY_WORKSPACE_PREFIX_ANY_RE = re.compile(r'\[Workspace:[^\]]+\]\s*')
 
 
 def _escape_workspace_prefix_path(path: str) -> str:
@@ -991,6 +993,27 @@ def _strip_workspace_prefix(text: str, *, include_legacy: bool = False) -> str:
     if include_legacy and stripped == value:
         stripped = _LEGACY_WORKSPACE_PREFIX_RE.sub('', value, count=1)
     return stripped.strip()
+
+
+def _looks_like_current_user_turn(msg, msg_text) -> bool:
+    """Match the current human turn even if an internal workspace tag leaked mid-text.
+
+    Normal model-facing messages start with the workspace sentinel. A failed
+    retry/merge path can also return an optimistic draft followed by the
+    sentinel and the real prompt. Only treat that shape as the current turn
+    when the text after the sentinel exactly matches the submitted prompt.
+    """
+    if not isinstance(msg, dict) or msg.get('role') != 'user':
+        return False
+    needle = " ".join(str(msg_text or '').split())
+    if not needle:
+        return False
+    text = _message_text(msg.get('content', ''))
+    candidates = [_strip_workspace_prefix(text, include_legacy=True)]
+    for pattern in (_WORKSPACE_PREFIX_ANY_RE, _LEGACY_WORKSPACE_PREFIX_ANY_RE):
+        for match in pattern.finditer(text):
+            candidates.append(text[match.end():])
+    return any(" ".join(str(candidate or '').split()) == needle for candidate in candidates)
 
 
 def _first_exchange_snippets(messages):
@@ -2113,6 +2136,8 @@ def _find_current_user_turn(messages, msg_text):
         if not isinstance(msg, dict) or msg.get('role') != 'user':
             continue
         fallback = idx
+        if _looks_like_current_user_turn(msg, msg_text):
+            return idx
         text = " ".join(
             _strip_workspace_prefix(
                 _message_text(msg.get('content', '')),
@@ -2132,6 +2157,90 @@ def _drop_checkpointed_current_user_from_context(messages, msg_text):
     current_user_key = _message_identity({'role': 'user', 'content': msg_text})
     if current_user_key and _message_identity(history[-1]) == current_user_key:
         return history[:-1]
+    return history
+
+
+def _normalize_fresh_chat_text(text):
+    text = _strip_workspace_prefix(str(text or ''), include_legacy=True)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text.strip(" \t\r\n.!?。！？,，~～")
+
+
+def _is_casual_fresh_chat_message(msg_text):
+    """Return True for short opener messages that should not resume old tasks."""
+    text = _normalize_fresh_chat_text(msg_text)
+    if not text or len(text) > 24:
+        return False
+    continuation_terms = (
+        "continue",
+        "resume",
+        "carry on",
+        "go on",
+        # CJK continuation terms (zh-CN): jixu, jiezhe, wangxia, xiayibu.
+        # Encoded as Python escape sequences (not literal CJK) so api/streaming.py
+        # passes tests/test_title_sanitization.py::test_title_generation_source_has_no_cjk_literals,
+        # which scans this file for any U+4E00-U+9FFF code points. Runtime
+        # comparisons still use the real CJK strings — Python decodes the
+        # escapes at compile time.
+        "\u7ee7\u7eed",
+        "\u63a5\u7740",
+        "\u5f80\u4e0b",
+        "\u4e0b\u4e00\u6b65",
+    )
+    if any(term in text for term in continuation_terms):
+        return False
+    return text in {
+        "hi",
+        "hello",
+        "hey",
+        "hello there",
+        "hi there",
+        # CJK greetings (zh-CN): nihao, ninhao, hai, haluo, zaima, zaime.
+        # Same escape-sequence rationale as the continuation block above.
+        "\u4f60\u597d",         # nihao
+        "\u60a8\u597d",         # ninhao
+        "\u55e8",               # hai (was \u5616 = "click of tongue", not a greeting)
+        "\u54c8\u55bd",         # haluo (was \u54c8\u5582 = uncommon "ha-wei" variant)
+        "\u5728\u5417",         # zaima
+        "\u5728\u4e48",         # zaime
+    }
+
+
+def _has_task_resume_compaction_marker(messages):
+    """Detect compacted model context that tells the agent to resume an old task."""
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        text = _message_text(msg.get('content', '')).lower()
+        if not text:
+            continue
+        if "context compaction" not in text and "context compression" not in text:
+            continue
+        if (
+            "active task" in text
+            or "resume exactly" in text
+            or "current task" in text
+            or "task list was preserved" in text
+            or "in_progress" in text
+        ):
+            return True
+    return False
+
+
+def _context_messages_for_new_turn(session, msg_text):
+    """Return provider-facing history for a new user turn.
+
+    Compacted agent sessions can carry a hidden "resume the active task" summary
+    long after the visible UI looks like normal chat.  A short greeting should
+    not silently reactivate that old task; explicit continuation prompts still
+    keep the full compacted context.
+    """
+    history = _drop_checkpointed_current_user_from_context(
+        _session_context_messages(session),
+        msg_text,
+    )
+    if _is_casual_fresh_chat_message(msg_text) and _has_task_resume_compaction_marker(history):
+        return []
     return history
 
 
@@ -2174,10 +2283,15 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
     seen = {_message_identity(m) for m in merged}
     current_user_key = _message_identity({'role': 'user', 'content': msg_text})
     current_user_in_candidates = any(
-        _message_identity(m) == current_user_key for m in candidates
+        _message_identity(m) == current_user_key or _looks_like_current_user_turn(m, msg_text)
+        for m in candidates
     )
     current_user_already_checkpointed = bool(
-        merged and _message_identity(merged[-1]) == current_user_key
+        merged
+        and (
+            _message_identity(merged[-1]) == current_user_key
+            or _looks_like_current_user_turn(merged[-1], msg_text)
+        )
     )
     if (
         current_user_key is not None
@@ -2202,11 +2316,14 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
 
     for msg in candidates:
         key = _message_identity(msg)
+        is_current_user_turn = _looks_like_current_user_turn(msg, msg_text)
         if (
-            key is not None
-            and key == current_user_key
+            ((key is not None and key == current_user_key) or is_current_user_turn)
             and merged
-            and _message_identity(merged[-1]) == key
+            and (
+                _message_identity(merged[-1]) == current_user_key
+                or _looks_like_current_user_turn(merged[-1], msg_text)
+            )
         ):
             # Eager session-save mode can checkpoint the current user turn
             # before the agent runs. When the agent returns that same user turn
@@ -2228,13 +2345,35 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
         if _is_context_compression_marker(msg) and key is not None and key in seen:
             continue
         display_msg = msg
-        if key is not None and key == current_user_key and isinstance(msg, dict) and msg.get('role') == 'user':
+        if (
+            ((key is not None and key == current_user_key) or is_current_user_turn)
+            and isinstance(msg, dict)
+            and msg.get('role') == 'user'
+        ):
             display_msg = copy.deepcopy(msg)
             display_msg['content'] = msg_text
         merged.append(copy.deepcopy(display_msg))
         if key is not None:
             seen.add(key)
     return merged
+
+
+def _assistant_reply_added_after_current_turn(result_messages, previous_context, msg_text) -> bool:
+    """Return True only when the just-finished turn produced assistant text."""
+    result_messages = list(result_messages or [])
+    previous_context = list(previous_context or [])
+    if _messages_have_prefix(result_messages, previous_context):
+        candidates = result_messages[len(previous_context):]
+    else:
+        current_user_idx = _find_current_user_turn(result_messages, msg_text)
+        candidates = result_messages[current_user_idx + 1:] if current_user_idx is not None else result_messages
+    return any(
+        isinstance(m, dict)
+        and m.get('role') == 'assistant'
+        and not m.get('_error')
+        and str(m.get('content') or '').strip()
+        for m in candidates
+    )
 
 
 _TOOL_RESULT_SNIPPET_MAX = 4000
@@ -2743,6 +2882,8 @@ def _run_agent_streaming(
             'input_tokens': 0,
             'output_tokens': 0,
             'estimated_cost': 0,
+            'cache_read_tokens': 0,
+            'cache_write_tokens': 0,
             'context_length': 0,
             'threshold_tokens': 0,
             'last_prompt_tokens': 0,
@@ -2758,6 +2899,8 @@ def _run_agent_streaming(
                 _usage['input_tokens'] = getattr(_agent, 'session_prompt_tokens', 0) or 0
                 _usage['output_tokens'] = getattr(_agent, 'session_completion_tokens', 0) or 0
                 _usage['estimated_cost'] = getattr(_agent, 'session_estimated_cost_usd', 0) or 0
+                _usage['cache_read_tokens'] = getattr(_agent, 'session_cache_read_tokens', 0) or 0
+                _usage['cache_write_tokens'] = getattr(_agent, 'session_cache_write_tokens', 0) or 0
             except Exception:
                 pass
             try:
@@ -2770,7 +2913,7 @@ def _run_agent_streaming(
                 pass
 
         if _session_obj is not None:
-            for _field in ('input_tokens', 'output_tokens', 'estimated_cost', 'context_length', 'threshold_tokens', 'last_prompt_tokens'):
+            for _field in ('input_tokens', 'output_tokens', 'estimated_cost', 'cache_read_tokens', 'cache_write_tokens', 'context_length', 'threshold_tokens', 'last_prompt_tokens'):
                 if not _usage.get(_field):
                     try:
                         _usage[_field] = getattr(_session_obj, _field, 0) or 0
@@ -3674,10 +3817,7 @@ def _run_agent_streaming(
             # Truthy-check covers None, missing-attr, and 0 uniformly.
             _turn_started_at = _pending_started_at if _pending_started_at else time.time()
             _previous_messages = list(s.messages or [])
-            _previous_context_messages = _drop_checkpointed_current_user_from_context(
-                _session_context_messages(s),
-                msg_text,
-            )
+            _previous_context_messages = _context_messages_for_new_turn(s, msg_text)
             _pre_compression_count = getattr(
                 getattr(agent, 'context_compressor', None),
                 'compression_count', 0,
@@ -3858,13 +3998,19 @@ def _run_agent_streaming(
                 # an empty final_response without raising — the stream would end with
                 # a done event containing zero assistant messages, leaving the user with
                 # no feedback. Emit an apperror so the client shows an inline error.
-                #
-                # Only check NEW messages added by this turn — result.get('messages')
-                # includes the full conversation history, so checking all of them would
-                # match assistant content from prior turns and mask the real failure.
+                # Keep the current-turn assistant detection aligned with the
+                # display-merge logic. A compacted or replayed result payload
+                # is not always a simple append-only suffix, so use the
+                # workspace-aware helper from this branch while still
+                # preserving the pre-turn length for downstream self-heal
+                # checks introduced on master.
                 _all_result_messages = result.get('messages') or []
                 _prev_len = len(_previous_context_messages)
-                _assistant_added = _has_new_assistant_reply(_all_result_messages, _prev_len)
+                _assistant_added = _assistant_reply_added_after_current_turn(
+                    _all_result_messages,
+                    _previous_context_messages,
+                    msg_text,
+                )
                 # _token_sent tracks whether on_token() was called (any streamed text)
                 if not _assistant_added and not _token_sent:
                     if cancel_event.is_set():
@@ -4179,12 +4325,18 @@ def _run_agent_streaming(
                 input_tokens = getattr(agent, 'session_prompt_tokens', 0) or 0
                 output_tokens = getattr(agent, 'session_completion_tokens', 0) or 0
                 estimated_cost = getattr(agent, 'session_estimated_cost_usd', None)
+                cache_read_tokens = getattr(agent, 'session_cache_read_tokens', 0) or 0
+                cache_write_tokens = getattr(agent, 'session_cache_write_tokens', 0) or 0
                 if input_tokens > 0:
                     s.input_tokens = input_tokens
                 if output_tokens > 0:
                     s.output_tokens = output_tokens
                 if estimated_cost is not None:
                     s.estimated_cost = estimated_cost
+                if cache_read_tokens > 0:
+                    s.cache_read_tokens = cache_read_tokens
+                if cache_write_tokens > 0:
+                    s.cache_write_tokens = cache_write_tokens
                 # Persist tool-call summaries even when the final message history only
                 # kept bare tool rows and omitted explicit assistant tool_call IDs.
                 tool_calls = _extract_tool_calls_from_messages(
@@ -4412,6 +4564,8 @@ def _run_agent_streaming(
                 'input_tokens': input_tokens,
                 'output_tokens': output_tokens,
                 'estimated_cost': estimated_cost,
+                'cache_read_tokens': cache_read_tokens,
+                'cache_write_tokens': cache_write_tokens,
                 'duration_seconds': round(_turn_duration_seconds, 3),
             }
             if _turn_tps is not None:

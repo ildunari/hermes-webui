@@ -273,7 +273,7 @@ async function send(){
   const userMsg={role:'user',content:displayText,attachments:uploaded.length?uploadedNames:undefined,_ts:Date.now()/1000};
   S.toolCalls=[];  // clear tool calls from previous turn
   clearLiveToolCards();  // clear any leftover live cards from last turn
-  S.messages.push(userMsg);renderMessages();appendThinking();setBusy(true);
+  S.messages.push(userMsg);renderMessages();appendThinking('',{pending:true});setBusy(true);
   // First optimistic pass: make the local user turn visible before /api/chat/start
   // can save pending state on the server.
   if(typeof upsertActiveSessionForLocalTurn==='function'){
@@ -697,6 +697,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   const _STREAM_FADE_MAX_MS=350;
   const _STREAM_FADE_STAGGER_MS=16;
   const _STREAM_FADE_DONE_MAX_MS=320;
+  const _STREAM_FADE_DONE_DRAIN_MAX_MS=900;
   const _streamFadeEnabledForStream=window._fadeTextEffect===true;
 
   // rAF-throttled rendering: buffer tokens, render at most once per frame
@@ -1086,6 +1087,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       : _stripXmlToolCalls(assistantText.slice(segmentStart));
   }
   function _drainStreamFadeBeforeDone(onDone){
+    const drainStartedAt=performance.now();
+    let forcedDone=false;
     const step=()=>{
       if(!assistantBody){onDone();return;}
       const target=_streamFadeCurrentDisplayText();
@@ -1099,6 +1102,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         // the final renderMessages() DOM replacement removes the live spans.
         const remainingAnimationMs=Math.max(_STREAM_FADE_MS, _streamFadeLatestAnimationEndAt-performance.now());
         setTimeout(onDone, Math.min(remainingAnimationMs, _STREAM_FADE_DONE_MAX_MS));
+        return;
+      }
+      // Final SSE `done` means the canonical completed session is available.
+      // The optional word-fade playout must not keep that completed answer
+      // hidden behind the live Thinking state for large/bursty responses.
+      if(!forcedDone&&performance.now()-drainStartedAt>=_STREAM_FADE_DONE_DRAIN_MAX_MS){
+        forcedDone=true;
+        if(_smdParser) _smdEndParser();
+        onDone();
         return;
       }
       setTimeout(()=>requestAnimationFrame(step), 33);
@@ -1480,6 +1492,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const _prevIn=(S.session&&S.session.input_tokens)||0;
           const _prevOut=(S.session&&S.session.output_tokens)||0;
           const _prevCost=(S.session&&S.session.estimated_cost)||0;
+          const _prevCacheRead=(S.session&&S.session.cache_read_tokens)||0;
+          const _prevCacheWrite=(S.session&&S.session.cache_write_tokens)||0;
           S.session=d.session;S.messages=d.session.messages||[];if(typeof _messagesTruncated!=='undefined')_messagesTruncated=!!d.session._messages_truncated;
           if(S.session&&S.session.session_id){
             try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
@@ -1509,12 +1523,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
               const curIn=d.usage.input_tokens||0;
               const curOut=d.usage.output_tokens||0;
               const curCost=d.usage.estimated_cost||0;
+              const curCacheRead=d.usage.cache_read_tokens||0;
+              const curCacheWrite=d.usage.cache_write_tokens||0;
               // Only set delta if values actually increased (skip no-op turns)
-              if(curIn>prevIn||curOut>prevOut){
+              if(curIn>prevIn||curOut>prevOut||curCacheRead>_prevCacheRead||curCacheWrite>_prevCacheWrite){
                 lastAsst._turnUsage={
                   input_tokens:Math.max(0,curIn-prevIn),
                   output_tokens:Math.max(0,curOut-prevOut),
                   estimated_cost:Math.max(0,curCost-prevCost),
+                  cache_read_tokens:Math.max(0,curCacheRead-_prevCacheRead),
+                  cache_write_tokens:Math.max(0,curCacheWrite-_prevCacheWrite),
                 };
               }
               if(typeof d.usage.duration_seconds==='number'){

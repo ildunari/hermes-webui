@@ -4,7 +4,7 @@
 - **Author:** @Michaelyklam
 - **Updated by:** @franksong2702
 - **Created:** 2026-05-11
-- **Revised:** 2026-05-14
+- **Revised:** 2026-05-16
 - **Tracking issue:** [#1925](https://github.com/nesquena/hermes-webui/issues/1925)
 
 ## Credit and Scope
@@ -48,6 +48,29 @@ truth. Consequences include:
 The immediate goal is not to build a sidecar. The immediate goal is to define the
 browser contract, classify current runtime state, and gate the first reversible
 journal slice.
+
+## Current Gate State — 2026-05-16
+
+Slice 1 is now past the first active validation gate:
+
+- #2283 shipped the run-journal replay layer in v0.51.71.
+- A 100-trial synthetic replay/restart validation pass against current
+  `origin/master` passed on 2026-05-16. The matrix covered completed-run replay,
+  interrupted stale-pending recovery, fresh-pending grace handling, StreamChannel
+  reconnect ordering, duplicate-prevention merge behavior, many-session recovery,
+  large-journal derivation, and stream-to-turn-id lifecycle linking.
+- The focused regression set
+  `tests/test_turn_journal.py tests/test_turn_journal_lifecycle.py tests/test_stale_stream_pending_recovery.py`
+  also passed on the same worktree.
+- #2393, shipped through v0.51.76, capped live chat token SSE transports to the
+  selected conversation pane. Background sessions now rely on existing
+  status/replay/reattach behavior instead of keeping one live `/api/chat/stream`
+  EventSource per active session.
+
+This evidence does not prove the future runner/sidecar path. It does mean the
+project should stop treating Slice 1 as purely passive observation and can move to
+Slice 2 planning: introduce the adapter seam over the still-legacy journaled path
+without moving execution ownership yet.
 
 ## Goals
 
@@ -269,6 +292,12 @@ Success criterion:
 
 ### Slice 2: Adapter interface over the journaled legacy path
 
+Status as of 2026-05-17: shipped. PR #2416 defined the adapter-seam contract,
+PR #2424 added the default-off `LegacyJournalRuntimeAdapter` seam, and PR #2438
+kept `/api/chat/start` response shape identical between `legacy-direct` and the
+flagged `legacy-journal` path. Slice 2 remains a reversible boundary change, not
+a sidecar or execution-ownership move.
+
 Scope:
 
 - introduce the `RuntimeAdapter` interface only after Slice 1 proves replay,
@@ -279,7 +308,111 @@ Scope:
 
 Revert path: switch the feature flag back to direct legacy path.
 
+#### Slice 2 interface contract
+
+The Slice 2 seam should introduce a deliberately small `RuntimeAdapter` boundary
+without changing the execution backend. The first implementation is a
+`LegacyJournalRuntimeAdapter` that delegates to the existing WebUI-owned
+streaming path and reads the Slice 1 journal for status/replay. That makes the
+adapter a protocol translator over the current backend, not a new runtime owner.
+
+Minimal interface shape:
+
+```python
+class RuntimeAdapter:
+    def start_run(self, request: StartRunRequest) -> RunStartResult: ...
+    def observe_run(self, run_id: str, *, cursor: str | None = None) -> RunEventStream: ...
+    def get_run(self, run_id: str) -> RunStatus: ...
+    def cancel_run(self, run_id: str) -> ControlResult: ...
+    def respond_approval(self, run_id: str, approval_id: str, choice: str) -> ControlResult: ...
+    def respond_clarify(self, run_id: str, clarify_id: str, response: str) -> ControlResult: ...
+```
+
+Required data classes / payload fields:
+
+| Type | Required fields | Notes |
+|---|---|---|
+| `StartRunRequest` | `session_id`, `message`, `attachments`, `workspace`, `profile`, `provider`, `model`, `toolsets`, `source`, `metadata` | Mirrors current `/api/chat/start` inputs without introducing new behavior. |
+| `RunStartResult` | `run_id`, `session_id`, `stream_id`, `status`, `started_at`, `cursor`, `active_controls` | `stream_id` may remain the legacy stream id during Slice 2. |
+| `RunStatus` | `run_id`, `session_id`, `status`, `last_event_id`, `terminal_state`, `active_controls`, `pending_approval_id`, `pending_clarify_id` | Backed by live legacy state plus journal/session metadata. |
+| `RunEventStream` | ordered events matching Artifact 1, resumable from cursor | Can be implemented by existing SSE + journal replay at first. |
+| `ControlResult` | `accepted`, `status`, `event_id`, `safe_message` | Controls may still call existing handlers in Slice 2. |
+
+The interface is intentionally narrower than a runner. It does not own `AIAgent`,
+tool execution, callback queues, cancellation flags, approval callbacks, or
+clarify callbacks in Slice 2. Those remain in the legacy path until their
+individual migration slices.
+
+#### Slice 2 feature flag and revert contract
+
+Slice 2 should be guarded by one WebUI-local setting/environment flag, for
+example `HERMES_WEBUI_RUNTIME_ADAPTER=legacy-journal` with default
+`legacy-direct` until the seam is proven. The flag selects only the route/adapter
+entry point:
+
+```text
+legacy-direct   -> current /api/chat/start and /api/chat/stream path
+legacy-journal  -> RuntimeAdapter facade over the same legacy execution path + journal
+```
+
+Reverting must be operationally boring:
+
+1. set the flag back to `legacy-direct`,
+2. restart WebUI if needed,
+3. existing session transcripts and journal files remain readable,
+4. no migration or data deletion is required.
+
+The PR that introduces the seam should include a source-level regression that
+the default path remains `legacy-direct` and that the adapter flag is the only
+way the new entry point is selected.
+
+#### Slice 2 backend mapping
+
+| Adapter method | Slice 2 backend | Explicit non-goal |
+|---|---|---|
+| `start_run` | call the existing chat-start preparation and legacy `_run_agent_streaming` path | do not move `AIAgent` construction or thread ownership |
+| `observe_run` | combine existing live SSE fan-out with journal replay cursor semantics | do not build a second renderer or event protocol |
+| `get_run` | derive status from session metadata, live stream presence, and journal terminal state | do not make `STREAMS` authoritative for durable run existence |
+| `cancel_run` | delegate to existing cancel handler/control path | do not redesign cancellation semantics yet |
+| `respond_approval` | delegate to existing approval response path | do not persist approval callbacks in the main server as a new adapter-owned queue |
+| `respond_clarify` | delegate to existing clarify response path | do not persist clarify callbacks in the main server as a new adapter-owned queue |
+
+Any implementation that needs a new long-lived queue, agent cache, cancellation
+registry, or callback registry inside the main WebUI process is out of scope for
+Slice 2 and should become a spec amendment before code lands.
+
+#### Slice 2 acceptance tests
+
+Before the seam is enabled by default, tests should prove at least:
+
+- the `RuntimeAdapter` interface exists and all methods are implemented by the
+  `LegacyJournalRuntimeAdapter`;
+- the default route remains the legacy direct path unless the adapter flag is
+  explicitly enabled;
+- `start_run` returns the same browser-facing `stream_id` / `session_id` shape as
+  `/api/chat/start` for a synthetic request;
+- `observe_run(..., cursor=...)` preserves the existing journal replay ordering
+  and duplicate-prevention behavior;
+- `get_run` distinguishes live stream, completed, failed, cancelled, and stale /
+  interrupted states using current live state plus journal/session metadata;
+- `cancel_run` delegates to the current cancellation path and still emits one
+  terminal result;
+- approval and clarify methods are present but documented as delegated legacy
+  controls until their migration slices;
+- disabling the flag returns to the old route path without changing session or
+  journal data.
+
+These tests are adapter-seam tests, not runner-survives-restart tests. The
+execution-survives-WebUI-restart gate remains deferred to Slice 4.
+
 ### Slice 3: Control migration
+
+Status as of 2026-05-17: not started. Slice 3 should begin with cancel only.
+Cancel is the smallest control-plane migration because it already has one clear
+browser affordance, one active-run target, and an existing legacy handler to
+delegate to. Approval, clarify, queue/continue, and goal are intentionally held
+behind a successful cancel-control slice because they carry more callback and
+state-lifetime risk.
 
 Scope:
 
@@ -291,6 +424,55 @@ Scope:
 
 Revert path: per-control feature flags or route-level fallback to legacy control
 handlers.
+
+#### Slice 3a: Cancel control gate
+
+The first control migration should route Stop Generation through the
+`RuntimeAdapter.cancel_run(...)` seam while preserving the current legacy cancel
+semantics. It should not introduce a new cancellation registry, worker-owned
+signal table, or sidecar boundary. During this slice, `cancel_run` is still a
+protocol translator over the existing cancellation path.
+
+Acceptance properties:
+
+1. **Same visible result as legacy Stop Generation.** A cancelled turn still
+   emits one terminal cancelled/interrupted state and preserves any already
+   streamed partial assistant content according to the existing cancellation
+   contract.
+2. **Adapter flag is behavior-preserving.** With
+   `HERMES_WEBUI_RUNTIME_ADAPTER=legacy-journal`, Stop Generation uses
+   `RuntimeAdapter.cancel_run(...)`; with the default `legacy-direct` path, the
+   current route remains available as fallback.
+3. **No new runtime-surrogate state.** The implementation must not add a second
+   `CANCEL_FLAGS`-like map, cached `AIAgent` table, long-lived queue, or local
+   callback registry inside the main WebUI process.
+4. **Journal/status coherence.** After cancellation, replay and session reload
+   classify the turn as cancelled/interrupted rather than stale/unknown, and the
+   terminal state is visible through the same journal/session diagnostic surface
+   used by Slice 1.
+5. **Idempotent duplicate cancel.** Repeating cancel for the same run should be
+   safe: one terminal result is recorded, later attempts return a bounded
+   `ControlResult` such as `not-active` rather than creating extra terminal
+   events or resurrecting stale stream state.
+
+Suggested regression coverage:
+
+- a route/source test proving the flagged cancel path calls the adapter seam and
+  the default path remains the legacy route;
+- an adapter unit test proving `cancel_run` delegates exactly once and returns a
+  bounded `ControlResult` for unsupported/not-active runs;
+- an existing cancellation preservation suite run (for example the partial-output
+  and cancelled-turn status tests) under the adapter flag or an equivalent
+  synthetic harness;
+- a replay/session-load assertion that a cancelled run's terminal state remains
+  classifiable from the journal/session surface after reload.
+
+Non-goals for Slice 3a:
+
+- no approval or clarify migration;
+- no queue/continue or goal migration;
+- no runner process, sidecar, or execution-survives-WebUI-restart claim;
+- no public `/api/chat/start` response-shape expansion for adapter-only fields.
 
 ### Slice 4: Runner process / sidecar boundary
 
