@@ -68,6 +68,40 @@ def test_authenticated_same_origin_browser_post_requires_session_csrf_token(monk
         auth._sessions.pop("c" * 64, None)
 
 
+def test_authenticated_allowed_public_origin_accepts_valid_csrf_token(monkeypatch):
+    cookie = _signed_cookie("f" * 64)
+    token = auth.csrf_token_for_session(cookie)
+    monkeypatch.setattr(auth, "is_auth_enabled", lambda: True)
+    monkeypatch.setenv("HERMES_WEBUI_ALLOWED_ORIGINS", "https://myapp.example.com:8000")
+    try:
+        headers = {
+            "Origin": "https://myapp.example.com:8000",
+            "Host": "proxy.internal",
+            "Cookie": f"{auth.COOKIE_NAME}={cookie}",
+            auth.CSRF_HEADER_NAME: token,
+        }
+        assert routes._check_csrf(_FakeHandler(headers))
+    finally:
+        auth._sessions.pop("f" * 64, None)
+
+
+def test_authenticated_reverse_proxy_same_origin_accepts_valid_csrf_token(monkeypatch):
+    cookie = _signed_cookie("g" * 64)
+    token = auth.csrf_token_for_session(cookie)
+    monkeypatch.setattr(auth, "is_auth_enabled", lambda: True)
+    try:
+        headers = {
+            "Origin": "https://example.com",
+            "Host": "127.0.0.1:8787",
+            "X-Forwarded-Host": "example.com:443",
+            "Cookie": f"{auth.COOKIE_NAME}={cookie}",
+            auth.CSRF_HEADER_NAME: token,
+        }
+        assert routes._check_csrf(_FakeHandler(headers))
+    finally:
+        auth._sessions.pop("g" * 64, None)
+
+
 def test_non_browser_mcp_style_authenticated_post_remains_compatible(monkeypatch):
     cookie = _signed_cookie("d" * 64)
     monkeypatch.setattr(auth, "is_auth_enabled", lambda: True)
