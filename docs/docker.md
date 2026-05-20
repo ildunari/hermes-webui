@@ -42,7 +42,14 @@ docker compose up -d
 open http://localhost:8787
 ```
 
-That's it. Your existing `~/.hermes` directory is mounted, your `~/workspace` is browsable, and the WebUI auto-detects your UID/GID from the mounted volume.
+That's it for a real personal Docker install. Your existing `~/.hermes`
+directory is mounted, your `~/workspace` is browsable, and the WebUI
+auto-detects your UID/GID from the mounted volume.
+
+For troubleshooting, reinstall, or onboarding reproduction trials, do not mount
+your real `~/.hermes` unless you intentionally want to test real state. Use an
+isolated Hermes home and follow
+[`docs/onboarding-agent-checklist.md`](onboarding-agent-checklist.md) instead.
 
 ## What goes wrong (and how to fix it)
 
@@ -210,6 +217,8 @@ What multi-container does **not** isolate:
 - **Trust boundary on the agent source.** The WebUI installs Python dependencies from the shared `hermes-agent-src` volume at startup. The read-only mount means a compromised WebUI cannot rewrite the agent source, but it does run code from that volume.
 
 If you need **filesystem isolation** between the chat UI and the agent (e.g. you don't trust the WebUI to read agent state), the multi-container setup is not enough — run the agent on a separate host and connect the WebUI to it via the gateway HTTP API. If you don't need any boundary, the single-container setup is simpler.
+
+The direct source mount is a compatibility bridge, not the long-term API contract. The current source/API boundary inventory and decoupling task list live in [`docs/rfcs/agent-source-boundary.md`](rfcs/agent-source-boundary.md) for [#2453](https://github.com/nesquena/hermes-webui/issues/2453). If you customize the compose files with bind mounts, keep the WebUI-side agent source mount read-only unless you are intentionally doing local development; `docker_init.bash` warns at startup when that path is writable.
 
 ## Bind-mount migration (advanced)
 
