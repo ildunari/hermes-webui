@@ -589,11 +589,12 @@ async function loadSession(sid){
     if(_msgInner){
       if(e.status===404){
         _msgInner.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Session not available in web UI.</div>';
-        // If this 404 was for the saved active-session ID (not a click-into request),
-        // wipe the stale localStorage value and rethrow so boot can fall through to
-        // the empty-state instead of sticking to a broken "Session not available" view.
-        if(!currentSid&&localStorage.getItem('hermes-webui-session')===sid){
+        // Option A (#2798): for boot-time stale URL/localStorage session IDs,
+        // always clear persisted session, strip /session/{id} from URL, and
+        // rethrow so boot can deterministically fall through to empty-state.
+        if(!currentSid){
           localStorage.removeItem('hermes-webui-session');
+          try{ history.replaceState(null,'','/'); }catch(_){ }
           if (_loadingSessionId === sid) _loadingSessionId = null;
           throw e;
         }
@@ -788,7 +789,10 @@ async function loadSession(sid){
       syncTopbar();renderMessages();
       if(typeof resumeManualCompressionForSession==='function') resumeManualCompressionForSession(sid);
       const _dirP=loadDir('.');
-      await _dirP;
+      // Workspace refresh is guarded by session id inside loadDir(); do not
+      // block session-load completion, draft restore, or model resolution on
+      // file-tree IO for users focused on the chat.
+      if(_dirP&&typeof _dirP.catch==='function') _dirP.catch(()=>{});
     }
   }
 
@@ -822,6 +826,8 @@ async function loadSession(sid){
   _resolveSessionModelForDisplaySoon(sid);
   // Clear the in-flight session marker now that this load has completed (#1060).
   if (_loadingSessionId === sid) _loadingSessionId = null;
+
+  if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
 
   // ── Cross-channel handoff hint ──
   // After session fully loaded, check if this is a messaging session with
@@ -1824,26 +1830,24 @@ function _openSessionActionMenu(session, anchorEl){
       }
     ));
   }
-  const pinLimitReached=!session.pinned&&_pinnedSessionCount()>=_getPinnedSessionsLimit();
   menu.appendChild(_buildSessionAction(
     session.pinned?t('session_unpin'):t('session_pin'),
-    pinLimitReached?_pinnedSessionsLimitMessage():(session.pinned?t('session_unpin_desc'):t('session_pin_desc')),
+    session.pinned?t('session_unpin_desc'):t('session_pin_desc'),
     session.pinned?ICONS.pin:ICONS.unpin,
     async()=>{
       closeSessionActionMenu();
-      if(pinLimitReached){
-        if(typeof showToast==='function') showToast(_pinnedSessionsLimitMessage(),3000,'error');
-        return;
-      }
       const newPinned=!session.pinned;
       try{
         await api('/api/session/pin',{method:'POST',body:JSON.stringify({session_id:session.session_id,pinned:newPinned})});
         session.pinned=newPinned;
         if(S.session&&S.session.session_id===session.session_id) S.session.pinned=newPinned;
         renderSessionList();
-      }catch(err){showToast(t('session_pin_failed')+err.message);}
+      }catch(err){
+        showToast(t('session_pin_failed')+err.message);
+        await renderSessionList();
+      }
     },
-    (session.pinned?'is-active':'')+(pinLimitReached?' is-disabled':'')
+    session.pinned?'is-active':''
   ));
   menu.appendChild(_buildSessionAction(
     t('session_move_project'),
@@ -2023,6 +2027,31 @@ function _isOptimisticFirstTurnSessionRow(s){
   );
 }
 
+function _shouldKeepLocalOnlyOptimisticSessionRow(local){
+  if(!_isOptimisticFirstTurnSessionRow(local)) return false;
+  const sid=local.session_id;
+  if(typeof _sendInProgress!=='undefined'&&_sendInProgress&&sid===_sendInProgressSid) return true;
+  const activeSid=S&&S.session&&S.session.session_id;
+  const isActive=Boolean(activeSid&&activeSid===sid);
+  const hasRuntimeConfirmation=Boolean(local.active_stream_id||local.pending_user_message||local.pending_started_at);
+  if(isActive&&S.busy&&hasRuntimeConfirmation) return true;
+  const localTs=Number(local.last_message_at||local.updated_at||0);
+  const ageMs=localTs>0?Date.now()-(localTs*1000):Infinity;
+  return Boolean(isActive&&S.busy&&ageMs>=0&&ageMs<5000);
+}
+
+function _dropStaleOptimisticSessionRow(sid){
+  if(!sid) return;
+  if(INFLIGHT&&INFLIGHT[sid]){
+    delete INFLIGHT[sid];
+    if(typeof clearInflightState==='function') clearInflightState(sid);
+  }
+  if(typeof _sessionStreamingById!=='undefined'&&_sessionStreamingById&&typeof _sessionStreamingById.set==='function'){
+    _sessionStreamingById.set(sid,false);
+  }
+  if(typeof _forgetObservedStreamingSession==='function') _forgetObservedStreamingSession(sid);
+}
+
 function _mergeOptimisticFirstTurnSessions(fetchedSessions){
   const merged=Array.isArray(fetchedSessions)?[...fetchedSessions]:[];
   const bySid=new Map();
@@ -2034,24 +2063,31 @@ function _mergeOptimisticFirstTurnSessions(fetchedSessions){
     if(idx>=0){
       const fetched=merged[idx]||{};
       const fetchedIsServerIdle=_isServerIdleSessionRow(fetched);
+      const keepLocalOptimistic=fetchedIsServerIdle?false:_shouldKeepLocalOnlyOptimisticSessionRow(local);
       const localCount=Number(local.message_count||0);
       const fetchedCount=Number(fetched.message_count||0);
       const localTs=Number(local.last_message_at||local.updated_at||0);
       const fetchedTs=Number(fetched.last_message_at||fetched.updated_at||0);
+      if(!keepLocalOptimistic&&typeof _dropStaleOptimisticSessionRow==='function') _dropStaleOptimisticSessionRow(sid);
       merged[idx]={
         ...local,
         ...fetched,
-        message_count:Math.max(localCount,fetchedCount),
-        last_message_at:Math.max(localTs,fetchedTs),
-        updated_at:Math.max(Number(local.updated_at||0),Number(fetched.updated_at||0),localTs,fetchedTs),
-        active_stream_id:fetchedIsServerIdle?null:(fetched.active_stream_id||local.active_stream_id||null),
-        pending_user_message:fetchedIsServerIdle?null:(fetched.pending_user_message||local.pending_user_message||null),
-        pending_started_at:fetchedIsServerIdle?null:(fetched.pending_started_at||local.pending_started_at||null),
-        is_streaming:fetchedIsServerIdle?false:Boolean(fetched.is_streaming||local.is_streaming||_isSessionLocallyStreaming(local)),
+        title:keepLocalOptimistic?(local.title||fetched.title):fetched.title,
+        message_count:keepLocalOptimistic?Math.max(localCount,fetchedCount):fetchedCount,
+        last_message_at:keepLocalOptimistic?Math.max(localTs,fetchedTs):fetchedTs,
+        updated_at:keepLocalOptimistic?Math.max(Number(local.updated_at||0),Number(fetched.updated_at||0),localTs,fetchedTs):Number(fetched.updated_at||fetchedTs||0),
+        active_stream_id:fetchedIsServerIdle?null:(keepLocalOptimistic?(fetched.active_stream_id||local.active_stream_id||null):null),
+        pending_user_message:fetchedIsServerIdle?null:(keepLocalOptimistic?(fetched.pending_user_message||local.pending_user_message||null):null),
+        pending_started_at:fetchedIsServerIdle?null:(keepLocalOptimistic?(fetched.pending_started_at||local.pending_started_at||null):null),
+        is_streaming:fetchedIsServerIdle?false:(keepLocalOptimistic&&Boolean(fetched.is_streaming||local.is_streaming||_isSessionLocallyStreaming(local))),
       };
     }else{
-      merged.push({...local,is_streaming:true});
-      bySid.set(sid,merged.length-1);
+      if(_shouldKeepLocalOnlyOptimisticSessionRow(local)){
+        merged.push({...local,is_streaming:true});
+        bySid.set(sid,merged.length-1);
+      }else{
+        _dropStaleOptimisticSessionRow(sid);
+      }
     }
   }
   return merged;
@@ -2402,6 +2438,7 @@ function startGatewaySSE(){
       }catch(e){ /* ignore parse errors */ }
     });
     _gatewaySSE.onerror = () => {
+      if(typeof recordClientSSEError==='function') recordClientSSEError('gateway-sessions',{ready_state:_gatewaySSE?_gatewaySSE.readyState:null,reason:'gateway EventSource.onerror'});
       if(_gatewaySSE){
         _gatewaySSE.close();
         _gatewaySSE = null;
