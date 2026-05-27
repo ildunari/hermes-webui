@@ -437,9 +437,14 @@ function _cronGatewayNoticeHtml(status) {
   const body = notConfigured
     ? 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon. If this is a single-container Docker install, jobs can be created and run manually here, but scheduled ticks need a gateway container or `hermes gateway` running outside the WebUI.'
     : 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon to be running. Start the gateway container or `hermes gateway` before relying on offline scheduled runs.';
+  const docsHref = 'https://github.com/nesquena/hermes-webui/blob/master/docs/docker.md#scheduled-jobs-and-the-gateway-daemon';
+  const helpLink = notConfigured
+    ? `<p><a href="${docsHref}" target="_blank" rel="noopener">How to enable scheduled jobs in Docker ↗</a></p>`
+    : '';
   return `
     <div class="detail-alert-title">${esc(title)}</div>
     <p>${esc(body)}</p>
+    ${helpLink}
   `;
 }
 
@@ -842,6 +847,7 @@ let _cronSelectedSkills=[];
 let _cronIsDuplicate = false;
 let _cronSkillsCache=null;
 let _cronProfilesCache=null;
+let _cronDeliveryOptionsCache=null;
 
 function openCronCreate(){
   if (typeof switchPanel === 'function' && _currentPanel !== 'tasks') switchPanel('tasks');
@@ -889,7 +895,6 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
   const isNoAgent = !!no_agent;
   const toastNotifications = toast_notifications !== false;
   title.textContent = isEdit ? (t('edit') + ' · ' + (name || schedule || t('scheduled_jobs'))) : t('new_job');
-  const deliverOpt = (v,l) => `<option value="${v}"${deliver===v?' selected':''}>${esc(l)}</option>`;
   body.innerHTML = `
     <div class="main-view-content">
       <form class="detail-form" onsubmit="event.preventDefault(); saveCronForm();">
@@ -910,11 +915,8 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
         </div>
         <div class="detail-form-row">
           <label for="cronFormDeliver">${esc(t('cron_deliver_label') || 'Deliver output to')}</label>
-          <select id="cronFormDeliver" ${isEdit ? 'disabled' : ''}>
-            ${deliverOpt('local', t('cron_deliver_local') || 'Local (save output only)')}
-            ${deliverOpt('discord','Discord')}
-            ${deliverOpt('telegram','Telegram')}
-            ${deliverOpt('slack','Slack')}
+          <select id="cronFormDeliver">
+            <option value="" disabled>loading...</option>
           </select>
         </div>
         <div class="detail-form-row">
@@ -946,6 +948,7 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
   body.style.display = '';
   if (empty) empty.style.display = 'none';
   _setCronHeaderButtons(isEdit ? 'edit' : 'create');
+  _populateCronDeliverOptions(deliver, isEdit);
   _renderCronSkillTags();
   const scheduleEl = $('cronFormSchedule');
   if (scheduleEl) {
@@ -955,6 +958,37 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
   }
   const focusEl = $('cronFormName');
   if (focusEl) focusEl.focus();
+}
+
+async function _populateCronDeliverOptions(selectedValue, isEdit) {
+  var sel = $('cronFormDeliver');
+  if (!sel) return;
+  sel.disabled = true;
+  try {
+    if (!_cronDeliveryOptionsCache) {
+      var res = await api('/api/crons/delivery-options');
+      _cronDeliveryOptionsCache = res && res.platforms ? res.platforms : [];
+    }
+    sel.innerHTML = '';
+    for (var i = 0; i < _cronDeliveryOptionsCache.length; i++) {
+      var p = _cronDeliveryOptionsCache[i];
+      var opt = document.createElement('option');
+      opt.value = p.value;
+      opt.textContent = p.label;
+      if (p.value === selectedValue) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    if (selectedValue && !sel.querySelector('option[value="' + CSS.escape(selectedValue) + '"]')) {
+      var opt = document.createElement('option');
+      opt.value = selectedValue;
+      opt.textContent = selectedValue + ' *';
+      opt.selected = true;
+      sel.prepend(opt);
+    }
+  } catch (e) {
+    sel.innerHTML = '<option value="local">Local (save output only)</option>';
+  }
+  sel.disabled = false;
 }
 
 function _renderCronSkillTags(){
@@ -1040,6 +1074,7 @@ async function saveCronForm(){
       const updates = {job_id: _editingCronId, schedule, profile: profile, toast_notifications: toastNotifications};
       if (!isNoAgent) updates.prompt = prompt;
       if (name) updates.name = name;
+      if (deliver) updates.deliver = deliver;
       await api('/api/crons/update', {method:'POST', body: JSON.stringify(updates)});
       const editedId = _editingCronId;
       _editingCronId = null;
@@ -6874,7 +6909,19 @@ async function _removeProviderKey(providerId){
       if(els.saveBtn){els.saveBtn.disabled=false;els.saveBtn.textContent=t('providers_save');}
     }
   }catch(e){
-    showToast('Error: '+e.message);
+    // A 403 from /api/providers/delete fires when the CSRF cookie/header
+    // pair has drifted. The server distinguishes three reasons in
+    // api/routes.py:_csrf_rejection_error ("Session expired - reload the
+    // page", "Cross-origin mismatch - check reverse proxy headers", and
+    // the fallback "Cross-origin request rejected"); api()'s catch lifts
+    // that string onto e.message. Pass it through verbatim so the
+    // deployment-shape failure #2572 calls out keeps its actionable hint
+    // instead of being flattened to a single generic toast.
+    if(e&&e.status===403){
+      showToast(e.message||'Session expired. Reload the page and try again.',6000,'error');
+    }else{
+      showToast('Error: '+e.message);
+    }
     if(els.saveBtn){els.saveBtn.disabled=false;els.saveBtn.textContent=t('providers_save');}
   }
 }
