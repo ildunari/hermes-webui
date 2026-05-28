@@ -116,7 +116,14 @@ def test_named_custom_provider_models_endpoint_network_error_uses_short_timeout(
     observed_timeouts = []
 
     def fake_urlopen(req, timeout=10):
-        observed_timeouts.append(timeout)
+        # Only record timeouts for the broken-proxy custom endpoint — unrelated
+        # background probes (Copilot token fetch, OpenRouter free-tier discovery, etc.)
+        # also call urlopen during get_available_models() and would otherwise pollute
+        # the assertion. The contract we're pinning: the broken-proxy /v1/models call
+        # uses CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS, not the urllib default 10.
+        full_url = getattr(req, "full_url", "")
+        if "broken.example" in str(full_url):
+            observed_timeouts.append(timeout)
         raise urllib.error.URLError("timed out")
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)

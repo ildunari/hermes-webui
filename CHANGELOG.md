@@ -3,6 +3,17 @@
 
 ## [Unreleased]
 
+## [v0.51.151] — 2026-05-28 — Release DW (stage-batch33 — 3-PR mid-risk batch: SSE reattach + title-lang + composer cap)
+
+### Fixed
+
+- Live SSE stream now reattaches when returning to a session that lost its connection during a session switch, closing the connection-leak window where stale `EventSource`s could accumulate. Also fixes a `_dirty_suffix` correctness path and yields the GIL after every SSE put so the HTTP server stays responsive under burst load. (#2924, #2925)
+- Generated session titles now stay in the conversation language by adding an explicit title-generation instruction to the auxiliary prompt. Prevents the default prompt from drifting into English for non-English conversations. (#2984)
+
+### Changed
+
+- Composer box max-width is now capped at 1600px on ultrawide viewports (≥1600px) so chips stay anchored against a content-sized boundary instead of stretching across 3440px+ displays. Maintainer-confirmed cap from the #2856 thread. (#2946)
+
 ## [v0.51.150] — 2026-05-28 — Release DV (stage-batch32 — single-PR reasoning-effort agent metadata)
 
 ### Fixed
