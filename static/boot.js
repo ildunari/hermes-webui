@@ -1115,6 +1115,21 @@ function _isVirtualKeyboardLikelyOpen(){
   if(!vv||!window.innerHeight)return true;
   return window.innerHeight-vv.height>120;
 }
+// #3076: a touch-primary device (`pointer:coarse`) can still have a
+// physical keyboard attached (Android tablet + Bluetooth keyboard,
+// detachable Surface in tablet mode, iPad + Magic Keyboard). When that
+// happens we should NOT force the mobile newline-on-Enter override
+// because Shift+Enter / Ctrl+Enter come from real keys and the user
+// expects desktop semantics. `matchMedia('(any-pointer:fine)')` is true
+// whenever ANY available pointing device is fine-grained — which is the
+// strongest signal browsers expose for "there is a real keyboard /
+// trackpad in the picture too". Skip the mobile default in that case.
+function _hasFinePointerCoexisting(){
+  try{ return matchMedia('(any-pointer:fine)').matches; }catch(_){ return false; }
+}
+function _isNumpadEnter(e){
+  return e.key==='Enter'&&(e.code==='NumpadEnter'||e.location===KeyboardEvent.DOM_KEY_LOCATION_NUMPAD);
+}
 $('msg').addEventListener('keydown',e=>{
   // Autocomplete navigation when dropdown is open
   const dd=$('cmdDropdown');
@@ -1139,9 +1154,13 @@ $('msg').addEventListener('keydown',e=>{
   // Users can override in Settings by explicitly choosing 'enter' mode.
   if(e.key==='Enter'){
     if(_isImeEnter(e)){return;}
-    const _mobileDefault=matchMedia('(pointer:coarse)').matches&&window._sendKey==='enter'&&_isVirtualKeyboardLikelyOpen();
+    const isNumpadEnter=_isNumpadEnter(e);
+    const _mobileDefault=matchMedia('(pointer:coarse)').matches
+      &&!_hasFinePointerCoexisting()
+      &&window._sendKey==='enter'
+      &&_isVirtualKeyboardLikelyOpen();
     if(window._sendKey==='ctrl+enter'||_mobileDefault){
-      if(e.ctrlKey||e.metaKey){e.preventDefault();send();}
+      if(isNumpadEnter||e.ctrlKey||e.metaKey){e.preventDefault();send();}
     } else {
       if(!e.shiftKey){e.preventDefault();send();}
     }
@@ -1205,7 +1224,10 @@ document.addEventListener('keydown',async e=>{
     closeWsDropdown();
     // Clear session search
     const ss=$('sessionSearch');
-    if(ss&&ss.value){ss.value='';filterSessions();}
+    if(ss&&ss.value){
+      if(typeof clearSessionSearch==='function') clearSessionSearch(false);
+      else { ss.value=''; filterSessions(); }
+    }
     // Cancel any active message edit
     const editArea=document.querySelector('.msg-edit-area');
     if(editArea){
@@ -1735,6 +1757,7 @@ function applyBotName(){
   // separately below by a `pageshow` listener — the async IIFE here does NOT
   // re-run when the browser restores the page from bfcache.
   const _srch = document.getElementById('sessionSearch'); if (_srch) _srch.value = '';
+  if (typeof syncSessionSearchClear === 'function') syncSessionSearchClear();
   // Initialize reasoning chip on boot (fixes #1103 — chip hidden until session load)
   if(typeof fetchReasoningChip==='function') fetchReasoningChip();
   if(typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator();
@@ -1839,6 +1862,7 @@ window.addEventListener('pageshow', async (event) => {
   if (!event.persisted) return;  // fresh loads are handled by the IIFE above
   const _srch = document.getElementById('sessionSearch');
   if (_srch) _srch.value = '';
+  if (typeof syncSessionSearchClear === 'function') syncSessionSearchClear();
   // Close any dropdowns/popovers that were open when the user navigated away.
   // bfcache freezes DOM state, so a dropdown left open remains open on restore.
   if (typeof closeModelDropdown === 'function') try { closeModelDropdown(); } catch (_) {}
