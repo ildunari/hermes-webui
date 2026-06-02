@@ -451,6 +451,8 @@ const LOCALES = {
     empty_dir: '(empty)',
     upload_failed: 'Upload failed: ',
     upload_too_large: (maxMb, fileMb) => `File is too large (${fileMb} MB). Maximum upload size is ${maxMb} MB.`,
+    uploading: 'Uploading…',
+    uploaded: 'Uploaded',
     all_uploads_failed: (n) => `All ${n} upload(s) failed`,
     archive_extracted: (n, c) => `Extracted ${n} file(s) from ${c} archive(s)`,
     session_pin: 'Pin conversation',
@@ -551,6 +553,7 @@ const LOCALES = {
     settings_tab_preferences: 'Preferences',
     settings_tab_plugins: 'Plugins',
     settings_plugins_title: 'Plugins',
+    plugins_enable_toggle: 'Enable',
     settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',
     settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',
     plugins_unnamed: 'Unnamed plugin',
@@ -849,6 +852,8 @@ const LOCALES = {
     settings_desc_tts_voice: "Preferred voice. Populated from your browser's available voices.",
     settings_label_tts_rate: 'Speech rate',
     settings_label_tts_pitch: 'Speech pitch',
+    settings_label_tts_engine: 'TTS Engine',
+    settings_desc_tts_engine: 'Choose speech engine. Edge TTS uses Microsoft neural voices via the server.',
     settings_label_notifications: 'Browser notifications',
     settings_desc_notifications: 'Show a system notification when a response completes while the app is in the background.',
     settings_desc_token_usage: 'Displays input/output token count below each assistant reply. Also toggled with /usage.',
@@ -1777,6 +1782,8 @@ const LOCALES = {
     empty_dir: '(vuota)',
     upload_failed: 'Upload fallito: ',
     upload_too_large: (maxMb, fileMb) => `File troppo grande (${fileMb} MB). La dimensione massima è ${maxMb} MB.`,
+    uploading: 'Caricamento…',
+    uploaded: 'Caricato',
     all_uploads_failed: (n) => `Tutti gli ${n} upload sono falliti`,
     archive_extracted: (n, c) => `Estratti ${n} file da ${c} archivio/i`,
     session_pin: 'Fissa conversazione',
@@ -1877,6 +1884,7 @@ const LOCALES = {
     settings_tab_preferences: 'Preferenze',
     settings_tab_plugins: 'Plugin',
     settings_plugins_title: 'Plugins',  // TODO: translate
+    plugins_enable_toggle: 'Abilita',
     settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
     settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
     plugins_unnamed: 'Unnamed plugin',  // TODO: translate
@@ -2167,6 +2175,8 @@ const LOCALES = {
     settings_desc_tts_voice: 'Voce preferita. Popolata dalle voci disponibili nel browser.',
     settings_label_tts_rate: 'Velocità voce',
     settings_label_tts_pitch: 'Tono voce',
+    settings_label_tts_engine: 'Motore TTS',
+    settings_desc_tts_engine: 'Scegli il motore vocale. Edge TTS utilizza le voci neurali Microsoft tramite il server.',
     settings_label_notifications: 'Notifiche browser',
     settings_desc_notifications: 'Mostra una notifica di sistema quando una risposta termina mentre l\'app è in background.',
     settings_desc_token_usage: 'Mostra il conteggio token input/output sotto ogni risposta dell\'assistente. Attivabile anche con /usage.',
@@ -3095,6 +3105,8 @@ const LOCALES = {
     empty_dir: '(空)',
     upload_failed: 'アップロード失敗: ',
     upload_too_large: (maxMb, fileMb) => `ファイルが大きすぎます (${fileMb} MB)。最大アップロードサイズは ${maxMb} MB です。`,
+    uploading: 'アップロード中…',
+    uploaded: 'アップロード完了',
     all_uploads_failed: (n) => `${n} 件のアップロードがすべて失敗しました`,
     archive_extracted: (n, c) => `${c} 個のアーカイブから ${n} 件のファイルを展開しました`,
     session_pin: '会話をピン留め',
@@ -3195,6 +3207,7 @@ const LOCALES = {
     settings_tab_preferences: '環境設定',
     settings_tab_plugins: 'プラグイン',
     settings_plugins_title: 'Plugins',  // TODO: translate
+    plugins_enable_toggle: '有効化',
     settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
     settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
     plugins_unnamed: 'Unnamed plugin',  // TODO: translate
@@ -3490,6 +3503,8 @@ const LOCALES = {
     settings_desc_tts_voice: '優先する声。ブラウザで利用可能な声から選択されます。',
     settings_label_tts_rate: '読み上げ速度',
     settings_label_tts_pitch: '読み上げピッチ',
+    settings_label_tts_engine: 'TTSエンジン',
+    settings_desc_tts_engine: '音声エンジンを選択してください。Edge TTSはサーバー経由でMicrosoftのニューラル音声を使用します。',
     settings_label_notifications: 'ブラウザ通知',
     settings_desc_notifications: 'アプリがバックグラウンドの間に応答が完了したらシステム通知を表示します。',
     settings_desc_token_usage: 'アシスタント応答の下に入力/出力トークン数を表示します。/usage でも切替可能。',
@@ -4338,6 +4353,8 @@ const LOCALES = {
     empty_dir: '(пусто)',
     upload_failed: 'Не удалось загрузить: ',
     upload_too_large: (maxMb, fileMb) => `Файл слишком большой (${fileMb} МБ). Максимальный размер загрузки: ${maxMb} МБ.`,
+    uploading: 'Загрузка…',
+    uploaded: 'Загружено',
     all_uploads_failed: (n) => `Не удалось загрузить все ${n} файлов`,
     archive_extracted: (n, c) => `Извлечено ${n} файл(ов) из ${c} архив(ов)`,
     settings_title: 'Настройки',
@@ -5083,6 +5100,7 @@ const LOCALES = {
     settings_tab_preferences: 'Preferences',
     settings_tab_plugins: 'Плагины',
     settings_plugins_title: 'Plugins',  // TODO: translate
+    plugins_enable_toggle: 'Включить',
     settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
     settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
     plugins_unnamed: 'Unnamed plugin',  // TODO: translate
@@ -5176,6 +5194,8 @@ const LOCALES = {
     settings_desc_tts_voice: 'Выберите голос для синтеза речи',
     settings_label_tts_rate: 'Скорость речи',
     settings_label_tts_pitch: 'Тон речи',
+    settings_label_tts_engine: 'Движок TTS',
+    settings_desc_tts_engine: 'Выберите движок синтеза речи. Edge TTS использует нейронные голоса Microsoft через сервер.',
 
     checkpoint_date: 'Date',  // TODO: translate
     checkpoint_diff_files_changed: (n) => `${n} file${n === 1 ? '' : 's'} changed`,  // TODO: translate
@@ -5572,6 +5592,8 @@ const LOCALES = {
     empty_dir: '(vacío)',
     upload_failed: 'Error al subir: ',
     upload_too_large: (maxMb, fileMb) => `El archivo es demasiado grande (${fileMb} MB). El tamaño máximo de subida es ${maxMb} MB.`,
+    uploading: 'Subiendo…',
+    uploaded: 'Subido',
     all_uploads_failed: (n) => `Fallaron las ${n} subida(s)`,
     archive_extracted: (n, c) => `${n} archivo(s) extraído(s) de ${c} archivo(s) comprimido(s)`,
     // settings panel
@@ -6326,6 +6348,7 @@ const LOCALES = {
     settings_tab_preferences: 'Preferences',
     settings_tab_plugins: 'Plugins',
     settings_plugins_title: 'Plugins',  // TODO: translate
+    plugins_enable_toggle: 'Activar',
     settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
     settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
     plugins_unnamed: 'Unnamed plugin',  // TODO: translate
@@ -6419,6 +6442,8 @@ const LOCALES = {
     settings_desc_tts_voice: 'Seleccionar voz para síntesis de voz',
     settings_label_tts_rate: 'Velocidad de voz',
     settings_label_tts_pitch: 'Tono de voz',
+    settings_label_tts_engine: 'Motor TTS',
+    settings_desc_tts_engine: 'Elija el motor de voz. Edge TTS utiliza voces neuronales de Microsoft a través del servidor.',
     checkpoint_date: 'Date',  // TODO: translate
     checkpoint_diff_files_changed: (n) => `${n} file${n === 1 ? '' : 's'} changed`,  // TODO: translate
     checkpoint_diff_no_changes: 'No differences found between this checkpoint and the current workspace.',  // TODO: translate
@@ -6812,6 +6837,8 @@ const LOCALES = {
     empty_dir: '(leer)',
     upload_failed: 'Upload fehlgeschlagen: ',
     upload_too_large: (maxMb, fileMb) => `Datei ist zu groß (${fileMb} MB). Die maximale Uploadgröße beträgt ${maxMb} MB.`,
+    uploading: 'Wird hochgeladen…',
+    uploaded: 'Hochgeladen',
     all_uploads_failed: (n) => `Alle ${n} Upload(s) fehlgeschlagen`,
     // settings panel
     settings_title: 'Einstellungen',
@@ -7285,6 +7312,7 @@ const LOCALES = {
     settings_tab_preferences: 'Preferences',
     settings_tab_plugins: 'Plugins',
     settings_plugins_title: 'Plugins',  // TODO: translate
+    plugins_enable_toggle: 'Aktivieren',
     settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
     settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
     plugins_unnamed: 'Unnamed plugin',  // TODO: translate
@@ -7676,6 +7704,8 @@ const LOCALES = {
     settings_desc_tts_voice: 'Stimme für Sprachsynthese auswählen',
     settings_label_tts_rate: 'Sprechgeschwindigkeit',
     settings_label_tts_pitch: 'Tonhöhe',
+    settings_label_tts_engine: 'TTS-Engine',
+    settings_desc_tts_engine: 'Sprach-Engine auswählen. Edge TTS verwendet Microsoft Neural Voices über den Server.',
 
     checkpoint_date: 'Date',  // TODO: translate
     checkpoint_diff_files_changed: (n) => `${n} file${n === 1 ? '' : 's'} changed`,  // TODO: translate
@@ -7999,6 +8029,7 @@ const LOCALES = {
     settings_busy_input_mode_interrupt: '中断当前轮次',
     settings_busy_input_mode_steer: '引导（中间修正）',
     settings_plugins_title: '插件',
+    plugins_enable_toggle: '启用',
     settings_plugins_meta: '查看已安装的 Hermes 插件及其注册的生命周期挂钩。此面板为只读。',
     settings_plugins_empty: '当前没有可见的 Hermes 插件。通过 Hermes CLI/配置文件安装或启用插件后即可在此查看。',
     plugins_unnamed: '未命名插件',
@@ -8103,6 +8134,8 @@ const LOCALES = {
     empty_dir: '(空)',
     upload_failed: '上传失败：',
     upload_too_large: (maxMb, fileMb) => `\u6587\u4ef6\u8fc7\u5927\uff08${fileMb} MB\uff09\u3002\u6700\u5927\u4e0a\u4f20\u5927\u5c0f\u4e3a ${maxMb} MB\u3002`,
+    uploading: '上传中…',
+    uploaded: '已上传',
     all_uploads_failed: (n) => `${n} 个文件全部上传失败`,
     // settings panel
     settings_title: '设置',
@@ -8928,6 +8961,8 @@ const LOCALES = {
     settings_desc_tts_voice: '选择语音合成声音',
     settings_label_tts_rate: '语速',
     settings_label_tts_pitch: '音调',
+    settings_label_tts_engine: 'TTS 引擎',
+    settings_desc_tts_engine: '选择语音引擎。Edge TTS 通过服务器使用微软神经语音。',
     checkpoint_date: '日期',
     checkpoint_diff_files_changed: (n) => `${n} file${n === 1 ? '' : 's'} changed`,  // TODO: translate
     checkpoint_diff_no_changes: '此检查点与当前工作区之间无差异。',
@@ -9256,6 +9291,8 @@ const LOCALES = {
     empty_dir: '(空)',
     upload_failed: '上傳失敗：',
     upload_too_large: (maxMb, fileMb) => `檔案過大（${fileMb} MB）。最大上傳大小為 ${maxMb} MB。`,
+    uploading: '上传中…',
+    uploaded: '已上传',
     all_uploads_failed: (n) => `${n} 個檔案全部上傳失敗`,
     session_pin: '釘選對話',
     session_unpin: '取消釘選',
@@ -9355,6 +9392,7 @@ const LOCALES = {
     settings_tab_preferences: '偏好設定',
     settings_tab_plugins: '外掛',
     settings_plugins_title: '外掛',
+    plugins_enable_toggle: '啟用',
     settings_plugins_meta: '檢視已安裝的 Hermes 外掛及其註冊的生命週期鉤子。此面板為唯讀。',
     settings_plugins_empty: '目前沒有可見的 Hermes 外掛。透過 Hermes CLI/設定檔安裝或啟用外掛後即可在此檢視。',
     plugins_unnamed: '未命名外掛',
@@ -9776,6 +9814,8 @@ const LOCALES = {
     todos_no_active: '\u6b64\u6703\u8a71\u4e2d\u7121\u6d3b\u8e8d\u4efb\u52d9\u6e05\u55ae\u3002',
     upload_failed: '\u4e0a\u50b3\u5931\u6557\uff1a',
     upload_too_large: (maxMb, fileMb) => `\u6a94\u6848\u904e\u5927\uff08${fileMb} MB\uff09\u3002\u6700\u5927\u4e0a\u50b3\u5927\u5c0f\u70ba ${maxMb} MB\u3002`,
+    uploading: '上传中…',
+    uploaded: '已上传',
     active_conversation_none: '\u672a\u9078\u53d6\u6d3b\u8e8d\u6703\u8a71\u3002',
     add: '\u65b0\u589e',
     add_failed: '\u65b0\u589e\u5931\u6557\uff1a',
@@ -10253,6 +10293,8 @@ const LOCALES = {
     settings_desc_tts_voice: '選擇語音合成聲音',
     settings_label_tts_rate: '語速',
     settings_label_tts_pitch: '音調',
+    settings_label_tts_engine: 'TTS 引擎',
+    settings_desc_tts_engine: '选择语音引擎。Edge TTS 通过服务器使用微软神经语音。',
 
     checkpoint_date: 'Date',  // TODO: translate
     checkpoint_diff_files_changed: (n) => `${n} file${n === 1 ? '' : 's'} changed`,  // TODO: translate
@@ -10654,6 +10696,8 @@ const LOCALES = {
     empty_dir: '(vazio)',
     upload_failed: 'Falha ao upload: ',
     upload_too_large: (maxMb, fileMb) => `O arquivo é grande demais (${fileMb} MB). O tamanho máximo de upload é ${maxMb} MB.`,
+    uploading: 'Enviando…',
+    uploaded: 'Enviado',
     all_uploads_failed: (n) => `Todos ${n} upload(s) falharam`,
     session_pin: 'Fixar conversa',
     session_unpin: 'Desfixar conversa',
@@ -10749,6 +10793,7 @@ const LOCALES = {
     settings_tab_preferences: 'Preferências',
     settings_tab_plugins: 'Plugins',
     settings_plugins_title: 'Plugins',  // TODO: translate
+    plugins_enable_toggle: 'Ativar',
     settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
     settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
     plugins_unnamed: 'Unnamed plugin',  // TODO: translate
@@ -11394,6 +11439,8 @@ const LOCALES = {
     settings_desc_tts_voice: 'Selecionar voz para síntese de voz',
     settings_label_tts_rate: 'Velocidade da fala',
     settings_label_tts_pitch: 'Tom da fala',
+    settings_label_tts_engine: 'Motor TTS',
+    settings_desc_tts_engine: 'Escolha o mecanismo de fala. Edge TTS usa vozes neurais da Microsoft através do servidor.',
     checkpoint_date: 'Date',  // TODO: translate
     checkpoint_diff_files_changed: (n) => `${n} file${n === 1 ? '' : 's'} changed`,  // TODO: translate
     checkpoint_diff_no_changes: 'No differences found between this checkpoint and the current workspace.',  // TODO: translate
@@ -11870,6 +11917,8 @@ const LOCALES = {
     empty_dir: '(비어 있음)',
     upload_failed: 'Upload failed: ',
     upload_too_large: (maxMb, fileMb) => `File is too large (${fileMb} MB). Maximum upload size is ${maxMb} MB.`,
+    uploading: 'Uploading…',
+    uploaded: 'Uploaded',
     all_uploads_failed: (n) => `All ${n} upload(s) failed`,
     session_pin: 'Pin conversation',
     session_unpin: 'Unpin conversation',
@@ -11969,6 +12018,7 @@ const LOCALES = {
     settings_tab_preferences: '환경설정',
     settings_tab_plugins: '플러그인',
     settings_plugins_title: 'Plugins',  // TODO: translate
+    plugins_enable_toggle: '활성화',
     settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
     settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
     plugins_unnamed: 'Unnamed plugin',  // TODO: translate
@@ -12698,6 +12748,8 @@ const LOCALES = {
     settings_desc_tts_voice: '음성 합성 음성 선택',
     settings_label_tts_rate: '말 속도',
     settings_label_tts_pitch: '말 톤',
+    settings_label_tts_engine: 'TTS 엔진',
+    settings_desc_tts_engine: '음성 엔진을 선택하세요. Edge TTS는 서버를 통해 Microsoft 신경 음성을 사용합니다.',
     checkpoint_date: 'Date',  // TODO: translate
     checkpoint_diff_files_changed: (n) => `${n} file${n === 1 ? '' : 's'} changed`,  // TODO: translate
     checkpoint_diff_no_changes: 'No differences found between this checkpoint and the current workspace.',  // TODO: translate
@@ -13109,7 +13161,9 @@ const LOCALES = {
     folder_create_failed: 'Échec de la création du dossier :',
     remove_title: 'Retirer',
     empty_dir: '(vide)',
-    upload_failed: 'Échec du téléchargement :',
+    upload_failed: 'Échec du téléchargement :',
+    uploading: 'Téléversement…',
+    uploaded: 'Téléversé',
     session_pin: 'Épingler la conversation',
     session_unpin: 'Désépingler la conversation',
     session_pin_desc: 'Gardez cette conversation en haut',
@@ -13204,6 +13258,7 @@ const LOCALES = {
     settings_tab_preferences: 'Préférences',
     settings_tab_plugins: 'Plugins',
     settings_plugins_title: 'Plugins',  // TODO: translate
+    plugins_enable_toggle: 'Activer',
     settings_plugins_meta: 'View installed Hermes plugins and the lifecycle hooks they register. This panel is read-only.',  // TODO: translate
     settings_plugins_empty: 'No Hermes plugins are currently visible. Install or enable plugins from the Hermes CLI/config to see them here.',  // TODO: translate
     plugins_unnamed: 'Unnamed plugin',  // TODO: translate
@@ -13461,6 +13516,8 @@ const LOCALES = {
     settings_desc_tts_voice: 'Voix préférée. Rempli à partir des voix disponibles dans votre navigateur.',
     settings_label_tts_rate: 'Taux de parole',
     settings_label_tts_pitch: 'Emplacement du discours',
+    settings_label_tts_engine: 'Moteur TTS',
+    settings_desc_tts_engine: 'Choisissez le moteur de synthèse vocale. Edge TTS utilise les voix neuronales Microsoft via le serveur.',
     settings_label_notifications: 'Notifications du navigateur',
     settings_desc_notifications: 'Afficher une notification système lorsqu\'une réponse est terminée alors que l\'application est en arrière-plan.',
     settings_desc_token_usage: 'Affiche le nombre de jetons d’entrée/sortie sous chaque réponse de l’assistant. Également basculé avec /usage.',
@@ -14442,6 +14499,8 @@ const LOCALES = {
     empty_dir: '(boş)',
     upload_failed: 'Yükleme başarısız oldu:',
     upload_too_large: (maxMb, fileMb) => `Dosya çok büyük (${fileMb} MB). Maksimum yükleme boyutu ${maxMb} MB'tır.`,
+    uploading: 'Yükleniyor…',
+    uploaded: 'Yüklendi',
     all_uploads_failed: (n) => `${n} yüklemenin tümü başarısız oldu`,
     session_pin: 'Görüşmeyi sabitle',
     session_unpin: 'Görüşmenin sabitlemesini kaldır',
@@ -14541,6 +14600,7 @@ const LOCALES = {
     settings_tab_preferences: 'Tercihler',
     settings_tab_plugins: 'Eklentiler',
     settings_plugins_title: 'Eklentiler',
+    plugins_enable_toggle: 'Etkinleştir',
     settings_plugins_meta: 'Yüklü Hermes eklentilerini ve yaşam döngüsü kancalarını görüntüleyin. Bu panel salt okunurdur.',
     settings_plugins_empty: 'Görünür Hermes eklentisi yok. Burada görmek için Hermes CLI/config üzerinden yükleyin veya etkinleştirin.',
     plugins_unnamed: 'Adsız eklenti',
@@ -15268,6 +15328,8 @@ const LOCALES = {
     settings_desc_tts_voice: 'Ses sentezi sesini seçin',
     settings_label_tts_rate: 'Konuşma hızı',
     settings_label_tts_pitch: 'Konuşma perdesi',
+    settings_label_tts_engine: 'TTS Motoru',
+    settings_desc_tts_engine: 'Ses motorunu seçin. Edge TTS, sunucu üzerinden Microsoft sinirsel seslerini kullanır.',
     checkpoint_date: 'Tarih',
     checkpoint_diff_files_changed: (n) => `${n} dosya değişti`,
     checkpoint_diff_no_changes: 'Bu kontrol noktası ile mevcut çalışma alanı arasında fark bulunamadı.',

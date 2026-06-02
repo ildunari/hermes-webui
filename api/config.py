@@ -3076,9 +3076,9 @@ def _get_label_for_model(model_id: str, existing_groups: list) -> str:
             if m.get("label") and _norm(str(m.get("id", ""))) == norm_lookup:
                 return m["label"]
 
-    # Fall back: capitalize each hyphen-separated word, preserve dots in version numbers.
-    # The catalog lookup above handles well-known models; this only fires for unlisted IDs.
-    bare = lookup_id.split("/")[-1] if "/" in lookup_id else lookup_id
+    # Fall back: strip only the first slash-segment (provider prefix),
+    # preserving vendor hierarchy for multi-slash IDs (#3360).
+    bare = lookup_id.split("/", 1)[1] if "/" in lookup_id else lookup_id
     return " ".join(
         w.upper() if (len(w) <= 3 and w.replace(".", "").isalnum() and not w.isdigit()) else w.capitalize()
         for w in bare.replace("_", "-").split("-")
@@ -3231,11 +3231,14 @@ def get_available_models() -> dict:
             if s.startswith("@") and ":" in s:
                 parts = s.split(":")
                 s = parts[-1] or s
-            # Strip provider/model prefix (e.g., custom:jingdong/GLM-5 -> GLM-5).
-            # Same trailing-empty guard.
+            # Strip only the first slash-segment (provider prefix), preserving
+            # any remaining vendor hierarchy.  Using parts[-1] here previously
+            # discarded ALL segments except the last, collapsing distinct
+            # multi-slash IDs like 'vendor_a/deepseek-v4-pro' and
+            # 'vendor_b/deepseek/deepseek-v4-pro' to the same key (#3360).
             if "/" in s:
-                parts = s.split("/")
-                s = parts[-1] or s
+                stripped = s.split("/", 1)[1]
+                s = stripped or s
             return s.replace("-", ".")
 
         def _build_configured_model_badges() -> dict[str, dict[str, str]]:
@@ -4866,6 +4869,7 @@ _SETTINGS_DEFAULTS = {
     "show_thinking": True,  # show/hide thinking/reasoning blocks in chat view
     "simplified_tool_calling": True,  # render tools/thinking as compact inline timeline activity
     "api_redact_enabled": True,  # redact sensitive data (API keys, secrets) from API responses
+    "dashboard_plugins": {},  # plugin_name -> bool, opt-in per plugin (default off per PF-10b)
     "sidebar_density": "compact",  # compact | detailed
     "auto_title_refresh_every": "0",  # adaptive title refresh: 0=off, 5/10/20=every N exchanges
     "busy_input_mode": "queue",  # behavior when sending while agent is running: queue | interrupt | steer
@@ -5037,7 +5041,19 @@ def save_settings(settings: dict) -> dict:
     if settings.pop("_clear_password", False):
         current["password_hash"] = None
         _password_changed = True
+    # Deep-merge dashboard_plugins dict (plugin_name -> bool)
+    _dashboard_plugins = settings.get("dashboard_plugins")
+    if isinstance(_dashboard_plugins, dict):
+        current_dash = current.get("dashboard_plugins", {})
+        if isinstance(current_dash, dict):
+            # Coerce values to bool + keep only str keys so settings.json can't be
+            # polluted with non-bool/non-str junk from a crafted POST.
+            current_dash.update({k: bool(v) for k, v in _dashboard_plugins.items() if isinstance(k, str)})
+            current["dashboard_plugins"] = current_dash
     for k, v in settings.items():
+        # dashboard_plugins is deep-merged above (not a flat allowlisted scalar).
+        if k == "dashboard_plugins":
+            continue
         if k in _SETTINGS_ALLOWED_KEYS:
             if k == "theme":
                 if isinstance(v, str) and v.strip():

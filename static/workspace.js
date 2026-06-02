@@ -594,7 +594,15 @@ const _PRISM_LANG_MAP={
   diff:'diff',patch:'diff',
   txt:'',log:'',csv:'',tsv:'',
 };
+const _PRISM_BASENAME_LANG_MAP={
+  'dockerfile':'docker','makefile':'makefile','gnumakefile':'makefile',
+  'cmakelists.txt':'cmake',
+  '.gitignore':'ignore','.dockerignore':'ignore',
+};
 function _prismLanguageForPath(path){
+  const base=String(path||'').split(/[\\/]/).pop().toLowerCase();
+  if(base.startsWith('dockerfile.')) return 'docker';
+  if(_PRISM_BASENAME_LANG_MAP[base]!==undefined) return _PRISM_BASENAME_LANG_MAP[base];
   const ext=fileExt(path).replace(/^\./,'');
   return _PRISM_LANG_MAP[ext]!==undefined?_PRISM_LANG_MAP[ext]:'plaintext';
 }
@@ -767,4 +775,84 @@ function openInBrowser(){
   if(!_previewCurrentPath||!S.session) return;
   const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(_previewCurrentPath)}&inline=1`;
   window.open(url,'_blank','noopener');
+}
+
+// ── Workspace upload ──────────────────────────────────────────────────
+function triggerWorkspaceUpload() {
+  const input = $('workspaceFileInput');
+  if (!input) return;
+  input.value = '';
+  input.onchange = async () => {
+    const files = input.files;
+    if (!files || !files.length) return;
+    for (const file of files) {
+      await uploadToWorkspace(file, S.currentDir || '.');
+    }
+    if (S.session) loadDir(S.currentDir);
+  };
+  input.click();
+}
+
+async function uploadToWorkspace(file, dir) {
+  if (!S.session) return;
+  const formData = new FormData();
+  formData.append('session_id', S.session.session_id);
+  formData.append('path', dir || '.');
+  formData.append('file', file, file.name);
+  try {
+    showToast(t('uploading') || 'Uploading\u2026', 2000);
+    const data = await api('/api/workspace/upload', {
+      method: 'POST',
+      body: formData,
+      headers: {},
+      timeoutMs: 120000,
+    });
+    if (data && data.error) {
+      showToast(data.error, 5000, 'error');
+    } else if (data && (data.extract_error || (Array.isArray(data.files) && data.files.some(function(f){return f && f.extract_error;})))) {
+      // Archive was rejected (zip-slip / zip-bomb / corrupt / too-many-members):
+      // the file uploaded but extraction failed. Surface it as an error instead
+      // of a misleading "Uploaded" success toast.
+      var msg = data.extract_error
+        || (data.files.find(function(f){return f && f.extract_error;}) || {}).extract_error
+        || 'Archive extraction failed';
+      showToast(msg, 5000, 'error');
+    } else {
+      showToast(t('uploaded') || ('Uploaded ' + (data.filename || file.name)), 2000);
+    }
+  } catch (e) {
+    showToast(t('upload_failed') || ('Upload failed: ' + e.message), 5000, 'error');
+  }
+}
+
+// Drag-and-drop files onto workspace file tree
+if (typeof document !== 'undefined') {
+  const _wsUploadInit = () => {
+    const tree = $('fileTree');
+    if (!tree) return;
+    tree.addEventListener('dragover', (e) => {
+      if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes('Files')) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+        tree.classList.add('drag-over-upload');
+      }
+    });
+    tree.addEventListener('dragleave', () => {
+      tree.classList.remove('drag-over-upload');
+    });
+    tree.addEventListener('drop', async (e) => {
+      tree.classList.remove('drag-over-upload');
+      if (!e.dataTransfer || !e.dataTransfer.types || !e.dataTransfer.types.includes('Files')) return;
+      e.preventDefault();
+      for (const file of e.dataTransfer.files) {
+        await uploadToWorkspace(file, S.currentDir || '.');
+      }
+      if (S.session) loadDir(S.currentDir);
+    });
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _wsUploadInit, {once: true});
+  } else {
+    _wsUploadInit();
+  }
 }
