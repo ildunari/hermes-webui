@@ -109,6 +109,13 @@ def test_rendered_apply_patch_tool_card_html_contains_diff_lines():
         "_cliPatchSnippetFromArgs",
         "_cliToolCardSnippet",
         "_cliToolCardHasDiffSnippet",
+        "_toolArgPreviewValue",
+        "_toolArgPreviewKeyIsHidden",
+        "_formatToolArgPreview",
+        "_toolCardPreviewText",
+        # #3336: buildToolCard now wraps diff snippets via these helpers.
+        "_snippetLooksLikeDiff",
+        "_colorDiffLines",
         "buildToolCard",
     ]
     functions = "\n".join(_function_source(UI_JS, name) for name in function_names)

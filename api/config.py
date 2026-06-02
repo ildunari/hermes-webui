@@ -26,22 +26,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 # ── Basic layout ──────────────────────────────────────────────────────────────
-HOME = Path.home()
+import api.paths as _paths
+
+HOME = _paths.HOME
+_hermes_home_has_webui_state = _paths._hermes_home_has_webui_state
+_platform_default_hermes_home = _paths._platform_default_hermes_home
+
 # REPO_ROOT is the directory that contains this file's parent (api/ -> repo root)
 REPO_ROOT = Path(__file__).parent.parent.resolve()
-
-
-def _platform_default_hermes_home() -> Path:
-    """Return the platform-aware default Hermes home when HERMES_HOME is unset.
-
-    Native Windows Hermes Agent installs default to %LOCALAPPDATA%\\hermes,
-    while POSIX installs use ~/.hermes.
-    """
-    if os.name == "nt":
-        local_app_data = os.getenv("LOCALAPPDATA", "").strip()
-        if local_app_data:
-            return Path(local_app_data) / "hermes"
-    return HOME / ".hermes"
 
 # ── Network config (env-overridable) ─────────────────────────────────────────
 HOST = os.getenv("HERMES_WEBUI_HOST", "127.0.0.1")
@@ -2102,6 +2094,61 @@ def _strip_provider_hint_for_reasoning(model_id: str) -> str:
     return model
 
 
+def _reasoning_name_candidates(model_id: str) -> list[str]:
+    """Return normalized model-name candidates for heuristic capability checks."""
+    bare = str(model_id or "").strip().lower().rsplit("/", 1)[-1]
+    if not bare:
+        return []
+
+    candidates: list[str] = []
+
+    def _add(value: str) -> None:
+        candidate = str(value or "").strip().lower()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    _add(bare)
+
+    dot_parts = [part for part in bare.split(".") if part]
+    if len(dot_parts) > 1:
+        # Try progressively stripping dot-separated vendor namespaces so inputs like
+        # "moonshotai.kimi-k2.5" and "vendor.deepseek.v3.2" both surface the real
+        # model family rather than treating every dot as part of the provider slug.
+        for index in range(1, len(dot_parts)):
+            suffix = ".".join(dot_parts[index:])
+            if any(ch.isalpha() for ch in suffix):
+                _add(suffix)
+
+    for candidate in list(candidates):
+        normalized = re.sub(r"[^a-z0-9]+", "-", candidate).strip("-")
+        _add(normalized)
+
+    return candidates
+
+
+def _candidate_supports_reasoning(candidate: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "-", str(candidate or "").strip().lower()).strip("-")
+    if not normalized:
+        return False
+
+    tokens = [token for token in normalized.split("-") if token]
+    token_set = set(tokens)
+
+    if "thinking" in token_set or "reasoning" in token_set:
+        return True
+    if normalized in {"o1", "o3", "o4"} or normalized.startswith(("o1-", "o3-", "o4-")):
+        return True
+    if normalized.startswith(("kimi-k2", "kimi-thinking", "claude-3", "claude-4")):
+        return True
+    if normalized.startswith("qwen3") or "qwen3" in token_set:
+        return True
+    if normalized.startswith(("deepseek-v3", "deepseek-v4", "deepseek-r1", "deepseek-r2")):
+        return True
+    if len(tokens) >= 2 and tokens[0] == "deepseek" and tokens[1] in {"v3", "v4", "r1", "r2"}:
+        return True
+    return False
+
+
 def _heuristic_reasoning_efforts(model_id: str, provider_id: str) -> list[str]:
     """Fallback when hermes_cli is unavailable."""
     model = _strip_provider_hint_for_reasoning(model_id).lower()
@@ -2130,6 +2177,12 @@ def _heuristic_reasoning_efforts(model_id: str, provider_id: str) -> list[str]:
         "xiaomi/",
     )
     if any(model.startswith(prefix) for prefix in prefixes):
+        return list(VALID_REASONING_EFFORTS)
+    # Named custom providers often rewrite model ids with dots, underscores, or
+    # extra vendor namespaces. Normalize those shapes before applying family-level
+    # reasoning heuristics so "deepseek.v3.2", "deepseek_v4_flash", and
+    # "vendor.deepseek.v3.2" are treated consistently.
+    if any(_candidate_supports_reasoning(candidate) for candidate in _reasoning_name_candidates(bare)):
         return list(VALID_REASONING_EFFORTS)
     return []
 
@@ -2501,7 +2554,7 @@ _cache_build_in_progress = False  # True while a cold path is actively building
 # session is expensive (~10s for zai due to endpoint probing).  The credential pool
 # only changes when the user adds/removes credentials, which is rare; a 24h TTL
 # is plenty safe and ensures get_available_models() cold paths are fast.
-_CREDENTIAL_POOL_CACHE: dict[str, tuple[float, "CredentialPool"]] = {}  # pid -> (ts, pool)
+_CREDENTIAL_POOL_CACHE: dict[str, tuple[float, "CredentialPool"]] = {}  # noqa: F821  forward-ref string annotation, resolved at runtime  # pid -> (ts, pool)
 _provider_models_invalidated_ts: dict[str, float] = {}  # provider_id -> timestamp of last invalidation
 
 # Disk-backed in-memory cache for get_available_models().

@@ -224,6 +224,8 @@ class TestUpdateChecker:
                 return 'v0.51.35\nv0.51.34\nv0.51.33', True
             if args[:3] == ['describe', '--tags', '--abbrev=0']:
                 return 'v0.51.34', True
+            if args == ['merge-base', '--is-ancestor', 'HEAD', 'v0.51.35']:
+                return '', True
             if args[:2] == ['remote', 'get-url']:
                 return 'https://github.com/nesquena/hermes-webui.git', True
             return '', False
@@ -558,6 +560,10 @@ class TestSuccessfulUpdateReturnsRestartScheduled:
                 return '', True
             if args[0] == 'tag':
                 return 'v0.51.106\nv0.51.105\nv0.51.104', True
+            if args == ['describe', '--tags', '--abbrev=0']:
+                return 'v0.51.105', True
+            if args == ['merge-base', '--is-ancestor', 'v0.51.106', 'HEAD']:
+                return '', False
             if args[:2] == ['status', '--porcelain']:
                 return '', True
             if args[0] == 'pull':
