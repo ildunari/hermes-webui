@@ -40,6 +40,13 @@ _MAX_EXTRACTED_BYTES = 10 * MAX_UPLOAD_BYTES
 
 def parse_multipart(rfile, content_type, content_length) -> tuple:
     import re as _re, email.parser as _ep
+    # Imported locally (not just module-level) so the function stays
+    # self-contained — some tests exec() this function's source in an isolated
+    # namespace, and a bare module global would NameError there.
+    try:
+        from api.config import MAX_UPLOAD_BYTES as _MAX_UPLOAD_BYTES
+    except Exception:
+        _MAX_UPLOAD_BYTES = 20 * 1024 * 1024
     m = _re.search(r'boundary=([^;\s]+)', content_type)
     if not m:
         raise ValueError('No boundary in Content-Type')
@@ -54,8 +61,8 @@ def parse_multipart(rfile, content_type, content_length) -> tuple:
         raise ValueError('Invalid Content-Length') from None
     if length < 0:
         raise ValueError('Invalid Content-Length (negative)')
-    if length > MAX_UPLOAD_BYTES:
-        raise ValueError(f'Upload too large (max {MAX_UPLOAD_BYTES} bytes)')
+    if length > _MAX_UPLOAD_BYTES:
+        raise ValueError(f'Upload too large (max {_MAX_UPLOAD_BYTES} bytes)')
     raw = rfile.read(length)
     fields = {}
     files = {}
