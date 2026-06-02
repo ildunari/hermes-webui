@@ -573,6 +573,32 @@ function cancelEditMode(){
   updateEditBtn();
 }
 
+// Map file extensions to Prism.js language identifiers.
+// Prism autoloader fetches missing language components from CDN on demand.
+const _PRISM_LANG_MAP={
+  js:'javascript',mjs:'javascript',jsx:'jsx',ts:'typescript',tsx:'tsx',
+  py:'python',pyw:'python',pyi:'python',
+  rb:'ruby',go:'go',rs:'rust',java:'java',kt:'kotlin',kts:'kotlin',
+  c:'c',h:'c',cpp:'cpp',cxx:'cpp',hpp:'cpp',cc:'cpp',
+  cs:'csharp',swift:'swift',scala:'scala',
+  php:'php',pl:'perl',pm:'perl',r:'r',lua:'lua',
+  sh:'bash',bash:'bash',zsh:'bash',fish:'bash',
+  ps1:'powershell',psm1:'powershell',
+  sql:'sql',graphql:'graphql',
+  json:'json',yaml:'yaml',yml:'yaml',toml:'toml',xml:'xml',
+  html:'markup',htm:'markup',svg:'markup',vue:'markup',
+  css:'css',scss:'scss',sass:'sass',less:'less',
+  md:'markdown',markdown:'markdown',
+  dockerfile:'docker',makefile:'makefile',cmake:'cmake',
+  ini:'ini',cfg:'ini',conf:'ini',properties:'properties',
+  diff:'diff',patch:'diff',
+  txt:'',log:'',csv:'',tsv:'',
+};
+function _prismLanguageForPath(path){
+  const ext=fileExt(path).replace(/^\./,'');
+  return _PRISM_LANG_MAP[ext]!==undefined?_PRISM_LANG_MAP[ext]:'plaintext';
+}
+
 async function openFile(path, opts={}){
   if(!S.session)return;
   const ext=fileExt(path);
@@ -659,7 +685,26 @@ async function openFile(path, opts={}){
         return;
       }
       showPreview('code');
-      $('previewCode').textContent=data.content;
+      // Syntax highlighting with Prism.js (already loaded on the page).
+      const codeEl=document.createElement('code');
+      codeEl.textContent=data.content;
+      const lang=_prismLanguageForPath(path);
+      if(lang) codeEl.className='language-'+lang;
+      const pre=$('previewCode');
+      pre.textContent='';
+      // Prism.highlightElement() propagates the language-* class onto the
+      // parent <pre>, so a previously-previewed code file leaves e.g.
+      // "language-css" on #previewCode. A subsequent plain-text file builds a
+      // class-less <code>, and Prism walks up to that stale ancestor class and
+      // mis-highlights prose. Strip any inherited language-* token from the
+      // <pre> before each render so highlighting never leaks across files.
+      pre.className=pre.className.replace(/\blanguage-\S+/g,'').replace(/\s+/g,' ').trim();
+      pre.appendChild(codeEl);
+      // Only invoke Prism when we actually assigned a language; otherwise the
+      // class-less <code> would inherit any ancestor language-* class.
+      if(lang&&typeof Prism!=='undefined'&&typeof Prism.highlightElement==='function'){
+        Prism.highlightElement(codeEl);
+      }
     }catch(e){
       // If it's a 400/too-large error, offer download instead
       downloadFile(path);

@@ -3,6 +3,13 @@
 
 ## [Unreleased]
 
+## [v0.51.205] — 2026-06-01 — Release FY (stage-hi1 — workspace syntax highlighting + generated-image cards + manual title regeneration)
+
+### Added
+- Workspace file previews now render with syntax highlighting via Prism.js (already loaded for chat code blocks), covering common languages (Python, JS/TS, CSS, JSON, SQL, shell, and more) and degrading gracefully to plain text for unknown/plain files and when offline. The preview code surface uses a single uniform background across light and dark themes (#3337, @mysoul12138).
+- Generated local image artifacts now render as a clean inline image (with click-to-zoom lightbox) plus a hover/focus-revealed **Download** action overlaid on the image, served through authenticated `/api/media` URLs — matching the common AI-chat pattern of letting the image be the hero rather than wrapping it in a permanent card (#3220, @AJV20).
+- The session action menu can regenerate conversation titles on demand from the saved transcript, updating the sidebar without touching conversation chronology and syncing the new title through to state.db when Insights sync is enabled. The menu was also streamlined to a compact icon + label layout (descriptions move to hover tooltips). Closes #3106 (#3223, @AJV20).
+
 ## [v0.51.204] — 2026-06-01 — Release FX (stage-batch17 — project/session operations honor the session's own profile)
 
 ### Fixed
@@ -81,6 +88,7 @@
 ### Fixed
 - A global `model.context_length` cap (set in config for the default model, e.g. 232000) no longer silently shrinks **non-default** models' real context windows. The cap is now applied only when the session model equals `model.default`; other models (e.g. a 1M-context variant) keep their real metadata window. The guard is applied consistently across the session context-length resolver (`api/routes.py`), the per-turn persistence path, and the live SSE usage payload, and the auto-compress `threshold_tokens` is rescaled to the real cap so the context-window indicator and compression trigger reflect the actual window. The live-usage perf path caches the resolved per-model window once per stream (it runs ~10×/sec during streaming) so non-default-model streams don't take a config/metadata lookup on every metering tick. Backend-only; default-model sessions are unaffected. Closes #3256 (#3263, @allenliang2022).
 
+
 ## [v0.51.191] — 2026-05-31 — Release FK (stage-batch3 — skills-detail markdown styling + launchd duplicate-start guard)
 
 ### Fixed
@@ -119,6 +127,7 @@
 ### Fixed
 - Agent self-update no longer advertises or applies unreachable release tags when the checkout tracks `main` past an older tag but the newest published tag lives on a divergent side branch (for example `v2026.5.29` → `v2026.5.29.2`). The update checker and apply path now fall through to the configured upstream branch when `git pull --ff-only <latest-tag>` cannot fast-forward, matching the existing #2653/#3140 release-vs-branch routing (#3257, @pamnard).
 - Added regression coverage pinning `_run_git()`'s UTF-8 decoding (`encoding='utf-8'`, `errors='replace'`) and its defensive `None`-stdout guard, so version detection cannot crash on non-UTF-8 Windows console output (#3254, @zapabob).
+
 
 ## [v0.51.185] — 2026-05-31 — Release FE (stage-batchE — clarify-card bug-fix batch: identical-prompt dedup + autofill guard + GBK startup crash)
 
