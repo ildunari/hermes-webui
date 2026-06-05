@@ -58,7 +58,9 @@ function syncAppTitlebar() {
     mainText = S.session.title || (typeof t === 'function' ? t('untitled') : 'Untitled');
     const vis = Array.isArray(S.messages) ? S.messages.filter(m => m && m.role && m.role !== 'tool') : [];
     if (typeof t === 'function') subText = t('n_messages', vis.length);
-    if (S.session.is_cli_session) sourceLabel = S.session.source_label || S.session.source_tag || S.session.raw_source || '';
+    sourceLabel = S.session.source_label || S.session.source_tag || S.session.raw_source || '';
+    // Recovered sidecars stamp source_label 'WebUI' (api/session_recovery.py); don't badge a native session as its own source (#3338).
+    if (/^webui$/i.test(sourceLabel)) sourceLabel = '';
   } else {
     const key = APP_TITLEBAR_KEYS[panel];
     mainText = key && typeof t === 'function' ? t(key) : (panel.charAt(0).toUpperCase() + panel.slice(1));
@@ -428,17 +430,34 @@ function _cronDiagnostics(job) {
   return JSON.stringify(fields, null, 2);
 }
 
+function _gatewayStatusReason(status) {
+  const health = status && typeof status.health === 'object' ? status.health : null;
+  if (!health) return '';
+  return typeof health.reason === 'string' ? health.reason.trim() : '';
+}
+
 function _cronGatewayNoticeHtml(status) {
   if (!status || (status.configured && status.running)) return '';
+  const reason = _gatewayStatusReason(status);
+  const isStaleMetadata = reason === 'gateway_stale_running_state';
+  const isRemoteUnreachable = reason === 'remote_gateway_unreachable';
   const notConfigured = !status.configured;
   const title = notConfigured
     ? 'Gateway not configured'
-    : 'Gateway not running';
+    : isStaleMetadata
+      ? 'Gateway metadata stale'
+      : isRemoteUnreachable
+        ? 'Gateway endpoint not reachable'
+        : 'Gateway not running';
   const body = notConfigured
     ? 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon. If this is a single-container Docker install, jobs can be created and run manually here, but scheduled ticks need a gateway container or `hermes gateway` running outside the WebUI.'
-    : 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon to be running. Start the gateway container or `hermes gateway` before relying on offline scheduled runs.';
+    : isStaleMetadata
+      ? 'The gateway is marked as configured, but its health metadata has gone stale. In Docker, scheduled jobs require a live gateway daemon that refreshes runtime metadata while ticking cron.'
+      : isRemoteUnreachable
+        ? 'The gateway health endpoint is not reachable from WebUI. Verify the configured gateway URL env var (`GATEWAY_HEALTH_URL`, `HERMES_GATEWAY_HEALTH_URL`, `HERMES_API_URL`, or `HERMES_WEBUI_GATEWAY_BASE_URL`) points to a reachable gateway service and network path before relying on cron ticking.'
+        : 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon to be running. Start the gateway container or `hermes gateway` before relying on offline scheduled runs.';
   const docsHref = 'https://github.com/nesquena/hermes-webui/blob/master/docs/docker.md#scheduled-jobs-and-the-gateway-daemon';
-  const helpLink = notConfigured
+  const helpLink = notConfigured || isRemoteUnreachable || isStaleMetadata
     ? `<p><a href="${docsHref}" target="_blank" rel="noopener">How to enable scheduled jobs in Docker ↗</a></p>`
     : '';
   return `
@@ -2647,38 +2666,86 @@ async function loadKanbanTask(taskId){
   } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
 }
 
+// Phase 2: Single-source-of-truth render.
+//
+// Reads `S.todos` (set by the `todo_state` SSE listener, INFLIGHT
+// restore, or session cold-load — see _hydrateTodosFromSession in
+// ui.js).  When `S.todoStateMeta` is null we have never seen an
+// explicit signal and fall through to the legacy reverse-scan over
+// settled tool messages — this keeps the panel populated against
+// pre-Phase-1 servers and during the upgrade window.
+//
+// The render is short-circuited via `_todosLastRenderedHash` (defined
+// in ui.js): repeated emissions that yield identical DOM are no-ops.
+// Coalescing of bursty live updates happens upstream in
+// scheduleTodosRefresh().
 function loadTodos() {
   const panel = $('todoPanel');
   if (!panel) return;
-  const sourceMessages = (S.session && Array.isArray(S.session.messages) && S.session.messages.length) ? S.session.messages : S.messages;
-  // Parse the most recent todo state from message history
-  let todos = [];
-  for (let i = sourceMessages.length - 1; i >= 0; i--) {
-    const m = sourceMessages[i];
-    if (m && m.role === 'tool') {
-      try {
-        const d = JSON.parse(typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
-        if (d && Array.isArray(d.todos) && d.todos.length) {
-          todos = d.todos;
-          break;
-        }
-      } catch(e) {}
-    }
+
+  let todos;
+  if (S.todoStateMeta) {
+    todos = Array.isArray(S.todos) ? S.todos : [];
+  } else {
+    todos = _legacyTodosFromMessages();
   }
+
   if (!todos.length) {
+    if (typeof _todosLastRenderedHash !== 'undefined' && _todosLastRenderedHash === '__empty__') return;
     panel.innerHTML = `<div style="color:var(--muted);font-size:12px;padding:4px 0">${esc(t('todos_no_active'))}</div>`;
+    if (typeof _todosLastRenderedHash !== 'undefined') _todosLastRenderedHash = '__empty__';
     return;
   }
+
+  if (typeof _todosHash === 'function' && typeof _todosLastRenderedHash !== 'undefined') {
+    const hash = _todosHash(todos);
+    if (hash === _todosLastRenderedHash) return;
+    _todosLastRenderedHash = hash;
+  }
+
   const statusIcon = {pending:li('square',14), in_progress:li('loader',14), completed:li('check',14), cancelled:li('x',14)};
   const statusColor = {pending:'var(--muted)', in_progress:'var(--blue)', completed:'rgba(100,200,100,.8)', cancelled:'rgba(200,100,100,.5)'};
-  panel.innerHTML = todos.map(t => `
+  // Single innerHTML join is the cheapest correct way to materialize
+  // ~10–50 leaf nodes.  All user-controlled content goes through esc().
+  panel.innerHTML = todos.map(td => `
     <div style="display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);">
-      <span style="font-size:14px;display:inline-flex;align-items:center;flex-shrink:0;margin-top:1px;color:${statusColor[t.status]||'var(--muted)'}">${statusIcon[t.status]||li('square',14)}</span>
+      <span style="font-size:14px;display:inline-flex;align-items:center;flex-shrink:0;margin-top:1px;color:${statusColor[td.status]||'var(--muted)'}">${statusIcon[td.status]||li('square',14)}</span>
       <div style="flex:1;min-width:0">
-        <div style="font-size:13px;color:${t.status==='completed'?'var(--muted)':t.status==='in_progress'?'var(--text)':'var(--text)'};${t.status==='completed'?'text-decoration:line-through;opacity:.5':''};line-height:1.4">${esc(t.content)}</div>
-        <div style="font-size:10px;color:var(--muted);margin-top:2px;opacity:.6">${esc(t.id)} · ${esc(t.status)}</div>
+        <div style="font-size:13px;color:${td.status==='completed'?'var(--muted)':td.status==='in_progress'?'var(--text)':'var(--text)'};${td.status==='completed'?'text-decoration:line-through;opacity:.5':''};line-height:1.4">${esc(td.content)}</div>
+        <div style="font-size:10px;color:var(--muted);margin-top:2px;opacity:.6">${esc(td.id)} · ${esc(td.status)}</div>
       </div>
     </div>`).join('');
+}
+
+// Legacy fallback: reverse-scan settled tool messages for the most
+// recent {"todos":[...]} payload.  Used only when no `todo_state`
+// signal has been seen for the current session — primarily during
+// upgrade windows where the server has not yet been redeployed with
+// Phase 1.  Once Phase 1 is universally deployed and a stabilization
+// period has passed, this can be removed (Phase 3).
+//
+// Variable name `sourceMessages` is preserved verbatim from the
+// original loadTodos() implementation so the matching regression
+// test (R-todo-survive-refresh in tests/test_regressions.py) keeps
+// catching any future refactor that drops the raw-session-messages
+// fallback. See the test for the exact contract.
+function _legacyTodosFromMessages() {
+  const sourceMessages = (S.session && Array.isArray(S.session.messages) && S.session.messages.length) ? S.session.messages : S.messages;
+  if (!Array.isArray(sourceMessages)) return [];
+  for (let i = sourceMessages.length - 1; i >= 0; i--) {
+    const m = sourceMessages[i];
+    if (!m || m.role !== 'tool') continue;
+    let content = m.content;
+    if (typeof content !== 'string') {
+      try { content = JSON.stringify(content); } catch (_) { continue; }
+    }
+    if (!content || content.indexOf('"todos"') < 0) continue;
+    try {
+      const d = JSON.parse(content);
+      if (d && Array.isArray(d.todos)) return d.todos;
+    } catch (_) {}
+  }
+  return [];
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -5278,6 +5345,7 @@ async function switchToProfile(name) {
     const data = await api('/api/profile/switch', { method: 'POST', body: JSON.stringify({ name }) });
     if (_switchGen !== _profileSwitchGeneration) return;
     S.activeProfile = data.active || name;
+    S.activeProfileIsDefault = !!data.is_default;
 
     // Update composer placeholder and title bar while the core profile-switch
     // state is still close to the profile API response.
@@ -5581,7 +5649,18 @@ async function loadMemory(force) {
 // Drag and drop
 const wrap=$('composerWrap');let dragCounter=0;
 document.addEventListener('dragover',e=>e.preventDefault());
-document.addEventListener('dragenter',e=>{e.preventDefault();if(e.dataTransfer.types.includes('Files')||e.dataTransfer.types.includes('application/ws-path')){dragCounter++;wrap.classList.add('drag-over');}});
+document.addEventListener('dragenter',e=>{e.preventDefault();
+  const isWsPath=e.dataTransfer.types.includes('application/ws-path');
+  const isFiles=e.dataTransfer.types.includes('Files');
+  if(isFiles||isWsPath){
+    dragCounter++;
+    // Context-aware hint: a workspace-file drag inserts an @path reference;
+    // an OS-file drag attaches the file to the message.
+    const hint=$('dropHintText');
+    if(hint) hint.textContent=isWsPath?'Drop to insert workspace reference':'Drop files to attach';
+    wrap.classList.add('drag-over');
+  }
+});
 document.addEventListener('dragleave',e=>{dragCounter--;if(dragCounter<=0){dragCounter=0;wrap.classList.remove('drag-over');}});
 document.addEventListener('drop',e=>{
   e.preventDefault();dragCounter=0;wrap.classList.remove('drag-over');
@@ -5710,7 +5789,16 @@ function switchSettingsSection(name){
       });
     }
   }
-  const section=(name==='appearance'||name==='preferences'||name==='providers'||name==='plugins'||name==='system')?name:'conversation';
+  let section=(name==='appearance'||name==='preferences'||name==='providers'||name==='plugins'||name==='system')?name:'conversation';
+  // Deep-linking to the Plugins pane when the tab is hidden (no plugins
+  // installed, #3457) falls back to Conversation. Resolve this BEFORE toggling
+  // panes/sidebar/dropdown below so every downstream selection uses the
+  // corrected section — otherwise the plugins pane would still render active
+  // but empty. (#3457)
+  if(section==='plugins'){
+    const pluginsTabBtn=document.querySelector('[data-settings-section="plugins"]');
+    if(pluginsTabBtn && pluginsTabBtn.style.display==='none') section='conversation';
+  }
   _settingsSection=section;
   _currentSettingsSection=section;
   const map={conversation:'Conversation',appearance:'Appearance',preferences:'Preferences',providers:'Providers',plugins:'Plugins',system:'System'};
@@ -5836,6 +5924,7 @@ function _appearancePayloadFromUi(){
     font_size: ($('settingsFontSize')||{}).value || localStorage.getItem('hermes-font-size') || 'default',
     session_jump_buttons: !!($('settingsSessionJumpButtons')||{}).checked,
     session_endless_scroll: !!($('settingsSessionEndlessScroll')||{}).checked,
+    activity_feed_expanded_default: !!($('settingsActivityFeedExpandedDefault')||{}).checked,
     hidden_tabs: _getHiddenTabs(),
   };
 }
@@ -5889,6 +5978,9 @@ async function _autosaveAppearanceSettings(payload){
       if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
     }
     window._sessionEndlessScrollEnabled=!!(saved&&saved.session_endless_scroll);
+    if(saved&&Object.prototype.hasOwnProperty.call(saved,'activity_feed_expanded_default')){
+      window._activityFeedExpandedDefault=!!saved.activity_feed_expanded_default;
+    }
     _setAppearanceAutosaveStatus('saved');
   }catch(e){
     console.warn('[settings] appearance autosave failed', e);
@@ -5922,6 +6014,8 @@ function _preferencesPayloadFromUi(){
   if(fadeTextCb) payload.fade_text_effect=fadeTextCb.checked;
   const simplifiedToolCb=$('settingsSimplifiedToolCalling');
   if(simplifiedToolCb) payload.simplified_tool_calling=simplifiedToolCb.checked;
+  const terminalAutoExpandCb=$('settingsTerminalAutoExpand');
+  if(terminalAutoExpandCb) payload.terminal_auto_expand_on_output=terminalAutoExpandCb.checked;
   const apiRedactCb=$('settingsApiRedact');
   if(apiRedactCb) payload.api_redact_enabled=apiRedactCb.checked;
   const showCliCb=$('settingsShowCliSessions');
@@ -5995,6 +6089,9 @@ async function _autosavePreferencesSettings(payload){
       window._simplifiedToolCalling=(saved&&saved.simplified_tool_calling!==false);
       if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
       if(typeof renderMessages==='function') renderMessages();
+    }
+    if(payload&&payload.terminal_auto_expand_on_output!==undefined){
+      window._terminalAutoExpandOnOutput=!!(saved&&saved.terminal_auto_expand_on_output);
     }
     if(payload&&Object.prototype.hasOwnProperty.call(payload,'fade_text_effect')) window._fadeTextEffect=!!payload.fade_text_effect;
     if(saved&&Object.prototype.hasOwnProperty.call(saved,'pinned_sessions_limit')) window._pinnedSessionsLimit=parseInt(saved.pinned_sessions_limit,10)||3;
@@ -6103,6 +6200,15 @@ async function loadSettingsPanel(){
         _scheduleAppearanceAutosave();
       };
     }
+    const activityExpandedCb=$('settingsActivityFeedExpandedDefault');
+    if(activityExpandedCb){
+      activityExpandedCb.checked=!!settings.activity_feed_expanded_default;
+      window._activityFeedExpandedDefault=activityExpandedCb.checked;
+      activityExpandedCb.onchange=function(){
+        window._activityFeedExpandedDefault=this.checked;
+        _scheduleAppearanceAutosave();
+      };
+    }
     // Tab visibility chips (dynamically populated from DOM)
     var hiddenTabs=[];
     if(Array.isArray(settings.hidden_tabs)){
@@ -6177,7 +6283,10 @@ async function loadSettingsPanel(){
         }
       }
       langSel.value=resolvedLanguage;
-      langSel.addEventListener('change',_schedulePreferencesAutosave,{once:false});
+      langSel.addEventListener('change',function(){
+        if(typeof setLocale==='function'){setLocale(this.value);if(typeof applyLocaleToDOM==='function')applyLocaleToDOM();}
+        _schedulePreferencesAutosave();
+      },{once:false});
     }
     const showUsageCb=$('settingsShowTokenUsage');
     if(showUsageCb){showUsageCb.checked=!!settings.show_token_usage;showUsageCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
@@ -6217,6 +6326,8 @@ async function loadSettingsPanel(){
     if(fadeTextCb){fadeTextCb.checked=!!settings.fade_text_effect;window._fadeTextEffect=fadeTextCb.checked;fadeTextCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const simplifiedToolCb=$('settingsSimplifiedToolCalling');
     if(simplifiedToolCb){simplifiedToolCb.checked=settings.simplified_tool_calling!==false;simplifiedToolCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const terminalAutoExpandCb=$('settingsTerminalAutoExpand');
+    if(terminalAutoExpandCb){terminalAutoExpandCb.checked=!!settings.terminal_auto_expand_on_output;window._terminalAutoExpandOnOutput=terminalAutoExpandCb.checked;terminalAutoExpandCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const apiRedactCb=$('settingsApiRedact');
     if(apiRedactCb){apiRedactCb.checked=settings.api_redact_enabled!==false;apiRedactCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const showCliCb=$('settingsShowCliSessions');
@@ -6431,6 +6542,9 @@ async function loadPluginsPanel(){
   try{
     const data=await api('/api/plugins');
     const plugins=Array.isArray((data||{}).plugins)?data.plugins:[];
+    // Hide the Plugins tab when no plugins are installed (#3457)
+    const tabBtn=document.querySelector('[data-settings-section="plugins"]');
+    if(tabBtn) tabBtn.style.display=(data&&data.empty)?'none':'';
     list.innerHTML='';
     if(plugins.length===0){
       list.style.display='none';
@@ -6602,7 +6716,7 @@ async function loadProvidersPanel(){
   try{
     const data=await api('/api/providers');
     const quota=await _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()}));
-    const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth||p.is_custom);
+    const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth||p.is_custom||p.is_plugin_provider);
     list.innerHTML='';
     _providerCardEls.clear();
     const quotaCard=_buildProviderQuotaCard(quota);
@@ -7151,11 +7265,12 @@ async function _refreshProviderModels(providerId, btn){
     const res=await api('/api/models/refresh',{method:'POST',body:JSON.stringify({provider:providerId})});
     if(res.ok){
       showToast(t('providers_models_refreshed')||('Models refreshed for '+res.provider));
+      _refreshModelDropdownsAfterProviderChange();
     }else{
       showToast(res.error||'Failed to refresh models');
     }
   }catch(e){
-    showToast('Error: '+e.message);
+    showToast(e.status===404?'Refresh not available for this provider.':(e.message||'Failed to refresh models'));
   }finally{
     btn.disabled=false;
     btn.innerHTML=orig;
@@ -7271,6 +7386,7 @@ function _applySavedSettingsUi(saved, body, opts){
   window._whatsNewSummaryEnabled=!!body.whats_new_summary_enabled;
   window._showThinking=body.show_thinking!==false;
   window._simplifiedToolCalling=body.simplified_tool_calling!==false;
+  window._terminalAutoExpandOnOutput=!!body.terminal_auto_expand_on_output;
   window._sessionJumpButtonsEnabled=!!body.session_jump_buttons;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
   window._sidebarDensity=sidebarDensity==='detailed'?'detailed':'compact';
@@ -7611,6 +7727,7 @@ async function saveSettings(andClose){
   body.show_tps=showTps;
   body.fade_text_effect=fadeTextEffect;
   body.simplified_tool_calling=!!($('settingsSimplifiedToolCalling')||{}).checked;
+  body.terminal_auto_expand_on_output=!!($('settingsTerminalAutoExpand')||{}).checked;
   body.api_redact_enabled=!!($('settingsApiRedact')||{}).checked;
   body.show_cli_sessions=showCliSessions;
   body.show_previous_messaging_sessions=showPreviousMessagingSessions;
@@ -8019,7 +8136,13 @@ function loadGatewayStatus(){
       return;
     }
     if(!r.running){
-      card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#ef4444;display:inline-block"></span>Gateway not running</div>`;
+      const reason = _gatewayStatusReason(r);
+      const statusLabel = reason === 'gateway_stale_running_state'
+        ? 'Gateway metadata stale'
+        : reason === 'remote_gateway_unreachable'
+          ? 'Gateway endpoint not reachable'
+          : 'Gateway not running';
+      card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#ef4444;display:inline-block"></span>${esc(statusLabel)}</div>`;
       return;
     }
     const platformIcons={telegram:'💬',discord:'🎮',slack:'📝',web:'🌐',api:'🔌'};
