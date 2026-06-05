@@ -3,6 +3,16 @@
 
 ## [Unreleased]
 
+## [v0.51.280] — 2026-06-05 — Release IV (stage-p3i — Windows self-update restart fix)
+
+### Fixed
+- **Self-update now restarts correctly on Windows.** `os.execv` does not replace the current process on Windows (it spawns a new one while the old keeps running), so the old process held port 8787 and the new process failed to bind ("address already in use"), surfacing as "Update failed" after the timeout. On Windows the restart now launches a detached new process (`subprocess.Popen` with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`) and exits the old one immediately to release the port, plus a bounded bind-retry loop in `server_bind()` (up to 10s) to ride out the `SO_EXCLUSIVEADDRUSE` teardown window. POSIX behavior is unchanged (still `os.execv`). (#3647, @jja881)
+
+## [v0.51.279] — 2026-06-05 — Release IU (stage-p3h — preserve Activity/streaming turn on mid-stream scroll)
+
+### Fixed
+- **Loading earlier messages during an active stream no longer wipes the Activity panel or the current streaming turn.** Two causes: (1) the message merge/dedup keys didn't include `tool_calls`, so assistant messages invoking *different* tools with identical empty content and same-second timestamps collapsed into one — dropping every state.db tool-call after the first the sidecar registered; (2) `_syncToolCallsForLoadedMessages` cleared `S.toolCalls` while `S.busy` blocked the `renderMessages` rebuild. `tool_calls` is now part of the merge/dedup/visible keys (with a preservation branch so distinct tool invocations within the sidecar timestamp window aren't skipped), and the frontend keeps the live tool-call/streaming state when paging in history. (#3665, @mysoul12138; fixes #3346)
+
 ## [v0.51.278] — 2026-06-05 — Release IT (stage-p3g — repair inline PDF preview)
 
 ### Fixed
