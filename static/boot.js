@@ -394,6 +394,9 @@ function expandSidebar(){
 // panels.js hasn't loaded yet (typeof guard).
 (function _restoreTabVisibility(){
   try{
+    if(typeof _applyTabOrder==='function'&&typeof _getTabOrder==='function'){
+      _applyTabOrder(_getTabOrder());
+    }
     if(typeof _applyTabVisibility==='function'&&typeof _getHiddenTabs==='function'){
       _applyTabVisibility(_getHiddenTabs());
     }
@@ -1199,12 +1202,11 @@ $('modelSelect').onchange=async()=>{
     model:modelState.model,
     model_provider:modelState.model_provider||null,
   })});
-  if(typeof _readPendingSessionModel==='function'&&typeof _clearPendingSessionModel==='function'){
-    const pending=_readPendingSessionModel(S.session.session_id);
-    if(!pending||(pending.model===modelState.model&&String(pending.model_provider||'')===String(modelState.model_provider||''))){
-      _clearPendingSessionModel(S.session.session_id);
-    }
-  }
+  // NOTE: do NOT clear the pending explicit-pick marker here. It must survive until
+  // the NEXT send() consumes it, otherwise the normal "pick → session-update → send"
+  // flow loses the explicit-pick signal before /api/chat/start runs and the server
+  // re-reverts a cross-family pick (the #3737 bug, Codex catch). send() clears it
+  // after reading a matching pending pick. (#3739/#3737)
   _applySessionContextMetadataUpdate(data);
   // Warn if selected model belongs to a different provider than what Hermes is configured for
   if(typeof _checkProviderMismatch==='function'){
@@ -1502,6 +1504,7 @@ const _SKINS=[
   {name:'Neon',     colors:['#B347FF','#C76BFF','#00DDFF']},
   {name:'Geist Contrast', value:'geist-contrast', colors:['#000000','#ffffff','#FFF175']},
   {name:'Zeus',     colors:['#FFD700','#FFBF00','#1A1A00']},
+  {name:'Verdigris', value:'verdigris', colors:['#C89A5A','#0F1714','#22342C']},
 ];
 const _VALID_THEMES=new Set((_THEMES||[]).map(t=>t.value));
 const _VALID_SKINS=new Set((_SKINS||[]).map(s=>(s.value||s.name).toLowerCase()));
@@ -1839,7 +1842,7 @@ function applyBotName(){
   const _testUpdates=new URLSearchParams(location.search).get('test_updates')==='1';
   if(_testUpdates||(_bootSettings.check_for_updates!==false&&!sessionStorage.getItem('hermes-update-checked')&&!sessionStorage.getItem('hermes-update-dismissed'))){
     const _checkUrl='api/updates/check'+(_testUpdates?'?simulate=1':'');
-    api(_checkUrl).then(d=>{if(!_testUpdates)sessionStorage.setItem('hermes-update-checked','1');if((d.webui&&d.webui.behind>0)||(d.agent&&d.agent.behind>0))_showUpdateBanner(d);}).catch(()=>{});
+    api(_checkUrl,{method:_testUpdates?'GET':'POST',body:_testUpdates?undefined:JSON.stringify({force:false})}).then(d=>{if(!_testUpdates)sessionStorage.setItem('hermes-update-checked','1');if((d.webui&&d.webui.behind>0)||(d.agent&&d.agent.behind>0))_showUpdateBanner(d);}).catch(()=>{});
   }
   // Fetch active profile
   try{const p=await api('/api/profile/active');S.activeProfile=p.name||'default';S.activeProfileIsDefault=!!p.is_default;}catch(e){S.activeProfile='default';S.activeProfileIsDefault=true;}

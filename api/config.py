@@ -249,6 +249,18 @@ else:
     _HERMES_FOUND = False
 
 # ── Config file (reloadable -- supports profile switching) ──────────────────
+
+def _expand_env_vars(obj):
+    """Recursively expand ${VAR} references in config values using os.environ."""
+    if isinstance(obj, str):
+        return re.sub(r"\${([^}]+)}", lambda m: os.environ.get(m.group(1), m.group(0)), obj)
+    if isinstance(obj, dict):
+        return {k: _expand_env_vars(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env_vars(item) for item in obj]
+    return obj
+
+
 _cfg_cache = {}
 _cfg_lock = threading.Lock()
 _cfg_mtime: float = 0.0  # last known mtime of config.yaml; 0 = never loaded
@@ -308,6 +320,22 @@ def _get_config_path() -> Path:
 
 _WEBUI_SESSION_SAVE_MODES = {"deferred", "eager"}
 _DEFAULT_WEBUI_SESSION_SAVE_MODE = "deferred"
+_DEFAULT_EXPERIMENTAL_CONFIG = {
+    # Dormant first slice for the unified SessionDB migration. Runtime WebUI
+    # session call sites must continue using the existing JSON paths unless a
+    # later PR deliberately enables and wires this flag.
+    "unified_session_db": False,
+}
+
+
+def _apply_config_defaults(config_data: dict) -> None:
+    """Populate documented default-only config keys in-place."""
+    experimental = config_data.get("experimental")
+    if not isinstance(experimental, dict):
+        experimental = {}
+        config_data["experimental"] = experimental
+    for key, value in _DEFAULT_EXPERIMENTAL_CONFIG.items():
+        experimental.setdefault(key, value)
 
 
 def get_config() -> dict:
@@ -355,6 +383,19 @@ def get_webui_session_save_mode(config_data: dict | None = None) -> str:
     return _DEFAULT_WEBUI_SESSION_SAVE_MODE
 
 
+def is_unified_session_db_enabled(config_data: dict | None = None) -> bool:
+    """Return the dormant unified-session-db feature flag.
+
+    The default is intentionally false so adding the JSON adapter cannot change
+    runtime persistence until a later migration PR switches call sites.
+    """
+    active_cfg = config_data if isinstance(config_data, dict) else cfg
+    experimental = active_cfg.get("experimental", {}) if isinstance(active_cfg, dict) else {}
+    if not isinstance(experimental, dict):
+        return False
+    return experimental.get("unified_session_db") is True
+
+
 def reload_config() -> None:
     """Reload config.yaml from the active profile's directory."""
     global _cfg_mtime, _cfg_path, _cfg_fingerprint
@@ -372,13 +413,14 @@ def reload_config() -> None:
             if config_path.exists():
                 loaded = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
-                    _cfg_cache.update(loaded)
+                    _cfg_cache.update(_expand_env_vars(loaded))
                     try:
                         _cfg_mtime = Path(config_path).stat().st_mtime
                     except OSError:
                         _cfg_mtime = 0.0
         except Exception:
             logger.debug("Failed to load yaml config from %s", config_path)
+        _apply_config_defaults(_cfg_cache)
         _cfg_fingerprint = _fingerprint_config(_cfg_cache)
         # Bust the models cache so the next request sees fresh config values.
         # Only delete the disk cache when config has actually changed -- not on
@@ -399,7 +441,7 @@ def _load_yaml_config_file(config_path: Path) -> dict:
         return {}
     try:
         loaded = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        return loaded if isinstance(loaded, dict) else {}
+        return _expand_env_vars(loaded) if isinstance(loaded, dict) else {}
     except Exception:
         logger.debug("Failed to parse yaml config from %s", config_path)
         return {}
@@ -4871,8 +4913,13 @@ class StreamChannel:
         self._lock = threading.Lock()
         self._subscribers: list[queue.Queue] = []
         self._offline_buffer: list[tuple[str, object]] = []
+        self._last_event_id: str | None = None
 
     def subscribe(self) -> queue.Queue:
+        q, _snapshot = self.subscribe_with_snapshot()
+        return q
+
+    def subscribe_with_snapshot(self) -> tuple[queue.Queue, dict[str, object]]:
         q: queue.Queue = queue.Queue()
         with self._lock:
             # Replay buffered events to the new subscriber INSIDE the lock so a
@@ -4882,8 +4929,12 @@ class StreamChannel:
             # is safe. Per Opus advisor on stage-292.
             for item in self._offline_buffer:
                 q.put_nowait(item)
+            snapshot = {
+                "offline_buffered_events": len(self._offline_buffer),
+                "last_event_id": self._last_event_id,
+            }
             self._subscribers.append(q)
-        return q
+        return q, snapshot
 
     def unsubscribe(self, q: queue.Queue) -> None:
         with self._lock:
@@ -4892,8 +4943,18 @@ class StreamChannel:
             except ValueError:
                 pass
 
-    def put_nowait(self, item: tuple[str, object]) -> None:
+    def note_last_event_id(self, event_id: str | None) -> None:
+        """Record the latest journal event id without changing the queue shape."""
+        if not event_id:
+            return
         with self._lock:
+            self._last_event_id = event_id
+
+    def put_nowait(self, item: tuple[str, object] | tuple[str, object, str | None]) -> None:
+        event_id = item[2] if len(item) >= 3 else None
+        with self._lock:
+            if event_id:
+                self._last_event_id = event_id
             subscribers = list(self._subscribers)
             if not subscribers:
                 self._offline_buffer.append(item)
@@ -4902,7 +4963,7 @@ class StreamChannel:
         for q in subscribers:
             q.put_nowait(item)
 
-    def diagnostic_snapshot(self) -> dict[str, int]:
+    def diagnostic_snapshot(self) -> dict[str, object]:
         """Return non-sensitive stream observation counters for health checks."""
         with self._lock:
             return {
@@ -5076,6 +5137,7 @@ _SETTINGS_DEFAULTS = {
     "show_tps": False,  # show tokens-per-second chip in assistant message headers
     "fade_text_effect": False,  # animate newly streamed words with a lightweight fade-in effect
     "show_cli_sessions": False,  # merge CLI sessions from state.db into the sidebar
+    "show_cron_sessions": False,  # surface cron sessions in the sidebar (subordinate to show_cli_sessions)
     "show_previous_messaging_sessions": False,  # show older Telegram/Discord/etc. reset segments
     "sync_to_insights": False,  # mirror WebUI token usage to state.db for /insights
     "check_for_updates": True,  # check if webui/agent repos are behind upstream
@@ -5094,6 +5156,7 @@ _SETTINGS_DEFAULTS = {
     "inflight_state_max_string_chars": 60000,  # max string length kept inside a recovery snapshot field
     "inflight_state_max_json_chars": 1500000,  # max serialized recovery snapshot payload before pruning
     "hidden_tabs": [],  # sidebar tab panel names hidden by user (e.g. ["tasks","kanban"]); chat and settings are always visible
+    "tab_order": [],  # user-defined sidebar/rail tab order for reorderable tabs; chat/settings stay fixed
     "language": "en",  # UI locale code; must match a key in static/i18n.js LOCALES
     "bot_name": os.getenv(
         "HERMES_WEBUI_BOT_NAME", "Hermes"
@@ -5127,6 +5190,7 @@ _SETTINGS_SKIN_VALUES = {
     "nous",
     "geist-contrast",
     "zeus",
+    "verdigris",
 }
 _SETTINGS_LEGACY_THEME_MAP = {
     # Legacy full themes now map onto the closest supported theme + accent skin pair.
@@ -5241,6 +5305,7 @@ _SETTINGS_BOOL_KEYS = {
     "show_tps",
     "fade_text_effect",
     "show_cli_sessions",
+    "show_cron_sessions",
     "show_previous_messaging_sessions",
     "sync_to_insights",
     "check_for_updates",
@@ -5322,18 +5387,23 @@ def save_settings(settings: dict) -> dict:
                 not isinstance(v, str) or not _SETTINGS_LANG_RE.match(v)
             ):
                 continue
-            # Validate hidden_tabs: must be a list of non-empty strings.
-            # Belt-and-suspenders strip of "chat" and "settings" so a
-            # malicious POST cannot lock the user out of the always-visible
-            # nav tabs even though the client also filters them at apply time.
-            # Stage-394 follow-up to #2636 deep review.
-            if k == "hidden_tabs":
+            # Validate list-valued sidebar tab settings. Chat/settings stay fixed
+            # even if a tampered POST tries to persist them, and duplicates are
+            # collapsed while preserving the first requested order.
+            if k in {"hidden_tabs", "tab_order"}:
                 if not isinstance(v, list):
                     continue
-                v = [
-                    s for s in v
-                    if isinstance(s, str) and s.strip() and s not in {"chat", "settings"}
-                ]
+                seen = set()
+                cleaned = []
+                for s in v:
+                    if not isinstance(s, str):
+                        continue
+                    s = s.strip()
+                    if not s or s in {"chat", "settings"} or s in seen:
+                        continue
+                    seen.add(s)
+                    cleaned.append(s)
+                v = cleaned
             # Coerce bool keys
             if k in _SETTINGS_BOOL_KEYS:
                 v = bool(v)

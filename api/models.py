@@ -2369,11 +2369,11 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         s.save()
     return s
 
-def _hide_from_default_sidebar(session: dict) -> bool:
+def _hide_from_default_sidebar(session: dict, *, show_cron: bool = False) -> bool:
     """Return True for internal/background sessions hidden from the default list."""
     sid = str(session.get('session_id') or '')
     source = session.get('source_tag') or session.get('source')
-    if source == 'cron' or sid.startswith('cron_'):
+    if not show_cron and (source == 'cron' or sid.startswith('cron_')):
         return True
     if bool(session.get('pre_compression_snapshot')):
         return not bool(session.get('_show_pre_compression_snapshot'))
@@ -4040,7 +4040,6 @@ def _session_message_visible_key(msg: dict):
 
 def _build_visible_duplicate_lookup(visible_keys: set[tuple]) -> dict:
     by_role = {}
-    loose_by_key = {}
     for key in visible_keys:
         try:
             role = key[0]
@@ -4050,8 +4049,10 @@ def _build_visible_duplicate_lookup(visible_keys: set[tuple]) -> dict:
         if not content:
             continue
         by_role.setdefault(role, []).append(key)
-        loose_by_key[key] = _loose_session_message_content(content)
-    return {"keys": visible_keys, "by_role": by_role, "loose_by_key": loose_by_key}
+    # Keep loose_by_key lazy.  Some transcripts contain multi-megabyte tool
+    # outputs; eagerly casefolding + regex-tokenizing every visible key on every
+    # duplicate probe made /api/session take 10s+ and blocked /api/sessions.
+    return {"keys": visible_keys, "by_role": by_role, "loose_by_key": {}}
 
 
 def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple], lookup: dict | None = None):
@@ -4064,16 +4065,28 @@ def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple], lo
     if lookup is None:
         lookup = _build_visible_duplicate_lookup(visible_keys)
     loose_content = None
+    loose_by_key = lookup.setdefault("loose_by_key", {})
     for existing_key in lookup.get("by_role", {}).get(role, []):
         existing_role = existing_key[0]
         existing_content = existing_key[1] if len(existing_key) > 1 else ""
         if role != existing_role or not existing_content:
             continue
+        # Exact visible-key equality was checked above. For very large payloads
+        # (tool logs / request dumps), Python-in substring and fuzzy-token
+        # comparisons are both expensive and low-value; doing them repeatedly
+        # made session loading block the whole WebUI for many seconds. Keep
+        # fuzzy matching for normal chat-sized text, but do exact-only matching
+        # for giant payloads.
+        if max(len(content), len(existing_content)) > 200_000:
+            continue
         if content in existing_content or existing_content in content:
             return existing_key
         if loose_content is None:
             loose_content = _loose_session_message_content(content)
-        loose_existing = lookup.get("loose_by_key", {}).get(existing_key, "")
+        loose_existing = loose_by_key.get(existing_key)
+        if loose_existing is None:
+            loose_existing = _loose_session_message_content(existing_content)
+            loose_by_key[existing_key] = loose_existing
         if loose_content and loose_existing and (
             loose_content in loose_existing or loose_existing in loose_content
         ):
