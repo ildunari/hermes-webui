@@ -516,7 +516,7 @@ async function loadCrons(animate) {
       item.innerHTML = `
         <div class="cron-header">
           ${isNewRun ? '<span class="cron-new-dot" title="New run"></span>' : ''}
-          ${isAgentMode ? '<span class="cron-agent-badge" title="Agent mode">🤖</span>' : ''}
+          ${isAgentMode ? '<span class="cron-agent-badge" title="Agent mode">🤖</span>' : `<span class="cron-script-badge" title="${esc(t('cron_script_badge_title') || 'Script job (no agent)')}">📜</span>`}
           <span class="cron-name" title="${esc(job.name)}">${esc(job.name)}</span>
           <span class="cron-profile-badge" title="${esc(profileTitle)}">${esc(profileLabel)}</span>
           <span class="cron-status ${status.listClass}">${esc(status.label)}</span>
@@ -579,6 +579,55 @@ function toggleCronRunExpanded(jobId, filename, runId){
   }
 }
 
+function _isCronScriptJob(job){
+  return !!(job && job.no_agent);
+}
+
+function _cronModeLabel(job){
+  return _isCronScriptJob(job)
+    ? (t('cron_mode_script') || 'Script')
+    : (t('cron_mode_agent') || 'Agent');
+}
+
+function _cronOutputTitle(job){
+  return _isCronScriptJob(job)
+    ? (t('cron_script_output') || 'Script output')
+    : (t('cron_last_output') || 'Last output');
+}
+
+function _cronScriptJobBannerHtml(){
+  return `<div class="detail-alert cron-script-job-banner">
+        <div class="detail-alert-title">${esc(t('cron_mode_script') || 'Script')}</div>
+        <p>${esc(t('cron_script_job_banner') || 'Runs a script on schedule — stdout is delivered to the target. No agent, prompt, or skills.')}</p>
+      </div>`;
+}
+
+function _cronScriptCardHtml(job){
+  const script = String(job && job.script || '').trim() || '—';
+  const workdir = String(job && job.workdir || '').trim();
+  const workdirRow = workdir
+    ? `<div class="detail-row"><div class="detail-row-label">${esc(t('cron_workdir_label') || 'Working directory')}</div><div class="detail-row-value"><code>${esc(workdir)}</code></div></div>`
+    : '';
+  return `<div class="detail-card cron-script-card">
+        <div class="detail-card-title">${esc(t('cron_script_card_title') || 'Script')}</div>
+        <div class="detail-script">${esc(script)}</div>
+        ${workdirRow}
+        <div class="detail-hint cron-script-card-hint">${esc(t('cron_script_path_hint') || 'Resolved under ~/.hermes/scripts/ unless an absolute path. Edit the script file on the server to change behavior.')}</div>
+      </div>`;
+}
+
+function _cronAgentPromptCardHtml(job){
+  const promptExpanded = _cronExpansionGet(_cronPanelExpandKey(job.id, 'prompt'));
+  const promptToggleLabel = promptExpanded ? (t('cron_collapse_prompt') || 'Collapse prompt') : (t('cron_expand_prompt') || 'Expand prompt');
+  return `<div class="detail-card">
+        <div class="detail-card-title detail-card-title-row">
+          <span>${esc(t('cron_prompt_label') || 'Prompt')}</span>
+          <button type="button" class="detail-expand-toggle" onclick="toggleCronPromptExpanded('${esc(job.id)}')" title="${esc(promptToggleLabel)}" aria-label="${esc(promptToggleLabel)}">${esc(promptExpanded ? '▴' : '▾')}</button>
+        </div>
+        <div class="detail-prompt ${promptExpanded ? 'expanded' : ''}">${esc(job.prompt || '')}</div>
+      </div>`;
+}
+
 function _renderCronDetail(job){
   _currentCronDetail = job;
   const title = $('taskDetailTitle');
@@ -592,14 +641,13 @@ function _renderCronDetail(job){
   const schedule = job.schedule_display || (job.schedule && job.schedule.expression) || '';
   const skills = Array.isArray(job.skills) && job.skills.length ? job.skills.join(', ') : '—';
   const deliver = job.deliver || 'local';
-  const isNoAgent = !!job.no_agent;
-  const cronJobMode = isNoAgent ? 'no-agent' : 'agent';
+  const isNoAgent = _isCronScriptJob(job);
+  const cronJobMode = _cronModeLabel(job);
   const modelProvider =
     job.provider && job.model ? `${esc(job.provider)}/${esc(job.model)}` :
     job.model ? esc(job.model) :
     job.provider ? esc(job.provider) :
     isNoAgent ? '' : 'default';
-  const script = job.script || '';
   const profileLabel = _cronProfileLabel(job.profile);
   const profileTitle = _cronProfileTitle(job.profile);
   const lastError = job.last_error ? `<div class="detail-row"><div class="detail-row-label">${esc(t('error_prefix').replace(/:\s*$/,''))}</div><div class="detail-row-value" style="color:var(--accent-text)">${esc(job.last_error)}</div></div>` : '';
@@ -619,11 +667,13 @@ function _renderCronDetail(job){
         </div>
       </div>` : '';
   const toastNotifications = job.toast_notifications !== false;
-  const promptExpanded = _cronExpansionGet(_cronPanelExpandKey(job.id, 'prompt'));
-  const promptToggleLabel = promptExpanded ? (t('cron_collapse_prompt') || 'Collapse prompt') : (t('cron_expand_prompt') || 'Expand prompt');
+  const outputTitle = _cronOutputTitle(job);
+  const skillsRow = isNoAgent ? '' : `<div class="detail-row"><div class="detail-row-label">${esc(t('cron_skills_label') || 'Skills')}</div><div class="detail-row-value">${esc(skills)}</div></div>`;
+  const instructionCard = isNoAgent ? _cronScriptCardHtml(job) : _cronAgentPromptCardHtml(job);
   body.innerHTML = `
     <div class="main-view-content">
       ${attentionBanner}
+      ${isNoAgent ? _cronScriptJobBannerHtml() : ''}
       <div class="detail-card">
         <div class="detail-card-title">${esc(t('cron_status_active').replace(/./,c=>c.toUpperCase()))}</div>
         <div class="detail-row"><div class="detail-row-label">Status</div><div class="detail-row-value"><span class="detail-badge ${status.detailClass}">${esc(status.label)}</span></div></div>
@@ -631,22 +681,15 @@ function _renderCronDetail(job){
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_next'))}</div><div class="detail-row-value">${esc(nextRun)}</div></div>
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_last'))}</div><div class="detail-row-value">${esc(lastRun)}</div></div>
         <div class="detail-row"><div class="detail-row-label">Deliver</div><div class="detail-row-value">${esc(deliver)}</div></div>
-        <div class="detail-row"><div class="detail-row-label">Mode</div><div class="detail-row-value"><span class="detail-badge" id="cronJobMode">${esc(cronJobMode)}</span>${modelProvider ? ` <code>${modelProvider}</code>` : ''}</div></div>
-        ${isNoAgent ? `<div class="detail-row"><div class="detail-row-label">No-agent script</div><div class="detail-row-value"><code>${esc(script || '—')}</code></div></div>` : ''}
+        <div class="detail-row"><div class="detail-row-label">${esc(t('cron_mode_label') || 'Mode')}</div><div class="detail-row-value"><span class="detail-badge cron-mode-badge ${isNoAgent ? 'script' : 'agent'}" id="cronJobMode">${esc(cronJobMode)}</span>${modelProvider ? ` <code>${modelProvider}</code>` : ''}</div></div>
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_profile_label') || 'Profile')}</div><div class="detail-row-value"><span class="detail-badge active" title="${esc(profileTitle)}">${esc(profileLabel)}</span></div></div>
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_toast_notifications_label') || 'Completion toasts')}</div><div class="detail-row-value"><span class="detail-badge ${toastNotifications ? 'active' : ''}">${esc(toastNotifications ? (t('cron_toast_notifications_enabled') || 'Enabled') : (t('cron_toast_notifications_disabled') || 'Disabled'))}</span></div></div>
-        <div class="detail-row"><div class="detail-row-label">Skills</div><div class="detail-row-value">${esc(skills)}</div></div>
+        ${skillsRow}
         ${lastError}
       </div>
-      <div class="detail-card">
-        <div class="detail-card-title detail-card-title-row">
-          <span>Prompt</span>
-          <button type="button" class="detail-expand-toggle" onclick="toggleCronPromptExpanded('${esc(job.id)}')" title="${esc(promptToggleLabel)}" aria-label="${esc(promptToggleLabel)}">${esc(promptExpanded ? '▴' : '▾')}</button>
-        </div>
-        <div class="detail-prompt ${promptExpanded ? 'expanded' : ''}">${esc(job.prompt || '')}</div>
-      </div>
+      ${instructionCard}
       <div class="detail-card ${_cronNewJobIds.has(String(job.id)) ? 'has-new-run' : ''}" id="cronDetailRuns">
-        <div class="detail-card-title">${esc(t('cron_last_output'))}</div>
+        <div class="detail-card-title">${esc(outputTitle)}</div>
         <div style="color:var(--muted);font-size:12px">${esc(t('loading'))}</div>
       </div>
     </div>`;
@@ -693,8 +736,10 @@ async function _loadCronDetailRuns(jobId){
     if (!_currentCronDetail || _currentCronDetail.id !== jobId) return;
     const card = $('cronDetailRuns');
     if (!card) return;
+    const outputTitle = _cronOutputTitle(_currentCronDetail);
+    const isScriptJob = _isCronScriptJob(_currentCronDetail);
     if (!data.runs || !data.runs.length) {
-      card.innerHTML = `<div class="detail-card-title">${esc(t('cron_last_output'))}</div><div style="color:var(--muted);font-size:12px">${esc(t('cron_no_runs_yet'))}</div>`;
+      card.innerHTML = `<div class="detail-card-title">${esc(outputTitle)}</div><div style="color:var(--muted);font-size:12px">${esc(t('cron_no_runs_yet'))}</div>`;
       return;
     }
     const rows = data.runs.map((run, i) => {
@@ -702,7 +747,7 @@ async function _loadCronDetailRuns(jobId){
       const sizeStr = run.size > 1024 ? (run.size/1024).toFixed(1)+' KB' : run.size+' B';
       const dateStr = new Date(run.modified * 1000).toLocaleString();
       const rid = `cron-det-run-${jobId}-${i}`;
-      const usageStrip = _formatCronRunUsageStrip(run.usage);
+      const usageStrip = isScriptJob ? '' : _formatCronRunUsageStrip(run.usage);
       const runExpanded = _cronExpansionGet(_cronRunExpandKey(jobId, run.filename));
       const runToggleLabel = runExpanded ? (t('cron_collapse_output') || 'Collapse output') : (t('cron_expand_output') || 'Expand output');
       return `<div class="detail-run-item" id="${rid}">
@@ -717,7 +762,7 @@ async function _loadCronDetailRuns(jobId){
       </div>`;
     }).join('');
     const countLabel = data.total > 50 ? ` (${data.total} runs, showing latest 50)` : ` (${data.total} runs)`;
-    card.innerHTML = `<div class="detail-card-title">${esc(t('cron_last_output'))}${countLabel}</div>${rows}`;
+    card.innerHTML = `<div class="detail-card-title">${esc(outputTitle)}${countLabel}</div>${rows}`;
   } catch(e) { /* ignore */ }
 }
 
@@ -852,6 +897,10 @@ function duplicateCurrentCron(){
     deliver: job.deliver || 'local',
     profile: job.profile || '',
     toast_notifications: job.toast_notifications !== false,
+    no_agent: !!job.no_agent,
+    script: job.script || '',
+    model: job.model || '',
+    provider: job.provider || '',
     isEdit: false,
   });
   if (!_cronSkillsCache) {
@@ -886,7 +935,7 @@ function openCronCreate(){
   _cronMode = 'create';
   _cronIsDuplicate = false;
   _cronSelectedSkills = [];
-  _renderCronForm({ name:'', schedule:'', prompt:'', deliver:'local', profile:'', toast_notifications:true, isEdit:false });
+  _renderCronForm({ name:'', schedule:'', prompt:'', deliver:'local', profile:'', toast_notifications:true, model:'', provider:'', isEdit:false });
   _cronSkillsCache = null;
   api('/api/skills').then(d=>{_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
   loadCronProfiles().then(()=>_refreshCronProfileSelect('')).catch(()=>{});
@@ -907,6 +956,8 @@ function openCronEdit(job){
     toast_notifications: job.toast_notifications !== false,
     no_agent: !!job.no_agent,
     script: job.script || '',
+    model: job.model || '',
+    provider: job.provider || '',
     isEdit: true,
   });
   if (!_cronSkillsCache) {
@@ -917,7 +968,7 @@ function openCronEdit(job){
   loadCronProfiles().then(()=>_refreshCronProfileSelect(job.profile || '')).catch(()=>{});
 }
 
-function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notifications=true, no_agent=false, script='', isEdit }){
+function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notifications=true, no_agent=false, script='', model='', provider='', isEdit }){
   const title = $('taskDetailTitle');
   const body = $('taskDetailBody');
   const empty = $('taskDetailEmpty');
@@ -925,8 +976,30 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
   const isNoAgent = !!no_agent;
   const toastNotifications = toast_notifications !== false;
   title.textContent = isEdit ? (t('edit') + ' · ' + (name || schedule || t('scheduled_jobs'))) : t('new_job');
+  const promptBlock = isNoAgent ? '' : `
+        <div class="detail-form-row">
+          <label for="cronFormPrompt">${esc(t('cron_prompt_label') || 'Prompt')}</label>
+          <textarea id="cronFormPrompt" rows="6" placeholder="${esc(t('cron_prompt_placeholder') || 'Must be self-contained')}" required>${esc(prompt || '')}</textarea>
+        </div>`;
+  const scriptBlock = isNoAgent ? `
+        <div class="detail-form-row">
+          <label for="cronFormScript">${esc(t('cron_script_path_label') || 'Script path')}</label>
+          <input type="text" id="cronFormScript" value="${esc(script || '')}" readonly autocomplete="off">
+          <div class="detail-form-hint">${esc(t('cron_script_path_hint') || 'Resolved under ~/.hermes/scripts/ unless an absolute path. Edit the script file on the server to change behavior.')}</div>
+        </div>` : '';
+  const skillsBlock = isNoAgent ? '' : `
+        <div class="detail-form-row">
+          <label for="cronFormSkillSearch">${esc(t('cron_skills_label') || 'Skills')}</label>
+          <div class="skill-picker-wrap">
+            <input type="text" id="cronFormSkillSearch" placeholder="${esc(t('cron_skills_placeholder') || 'Add skills (optional)...')}" autocomplete="off" ${isEdit ? 'disabled' : ''}>
+            <div id="cronFormSkillDropdown" class="skill-picker-dropdown" style="display:none"></div>
+            <div id="cronFormSkillTags" class="skill-picker-tags"></div>
+          </div>
+          ${isEdit ? `<div class="detail-form-hint">${esc(t('cron_skills_edit_hint') || 'Skill list is not editable after creation.')}</div>` : ''}
+        </div>`;
   body.innerHTML = `
     <div class="main-view-content">
+      ${isNoAgent ? _cronScriptJobBannerHtml() : ''}
       <form class="detail-form" onsubmit="event.preventDefault(); saveCronForm();">
         <div class="detail-form-row">
           <label for="cronFormName">${esc(t('cron_name_label') || 'Name')}</label>
@@ -938,11 +1011,8 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
           <div class="detail-form-hint">${esc(t('cron_schedule_hint') || "Cron expression or shorthand like 'every 1h'.")}</div>
           <div id="cronFormScheduleOnceWarning" class="detail-form-warning cron-once-warning" style="display:none">${esc(t('cron_schedule_once_warning') || "Duration forms like '30m' run once and are removed after running. Use 'every 30m' to keep a recurring job.")}</div>
         </div>
-        <div class="detail-form-row ${isNoAgent ? 'cron-no-agent-prompt-row' : ''}">
-          <label for="cronFormPrompt">${esc(t('cron_prompt_label') || 'Prompt')}</label>
-          <textarea id="cronFormPrompt" rows="6" placeholder="${esc(t('cron_prompt_placeholder') || 'Must be self-contained')}"${isNoAgent ? ' disabled' : ' required'}>${esc(prompt || '')}</textarea>
-          ${isNoAgent ? `<div class="detail-form-hint cron-no-agent-hint">No-agent mode runs the configured script directly; Prompt is unused. No-agent script: <code>${esc(script || '—')}</code></div>` : ''}
-        </div>
+        ${scriptBlock}
+        ${promptBlock}
         <div class="detail-form-row">
           <label for="cronFormDeliver">${esc(t('cron_deliver_label') || 'Deliver output to')}</label>
           <select id="cronFormDeliver">
@@ -957,21 +1027,20 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
           <div class="detail-form-hint">${esc(t('cron_profile_server_default_hint') || 'Uses the WebUI server default profile at run time')}</div>
         </div>
         <div class="detail-form-row">
+          <label for="cronFormModel">${esc(t('cron_model_label') || 'Model Override')}</label>
+          <select id="cronFormModel"${isNoAgent ? ' disabled' : ''}>
+            <option value="">loading...</option>
+          </select>
+          <div class="detail-form-hint">${esc(t('cron_model_hint') || 'Override the default model for this job.')}</div>
+        </div>
+        <div class="detail-form-row">
           <label for="cronFormToastNotifications">${esc(t('cron_toast_notifications_label') || 'Completion toasts')}</label>
           <label class="detail-form-check" for="cronFormToastNotifications">
             <input type="checkbox" id="cronFormToastNotifications" ${toastNotifications ? 'checked' : ''}>
             <span>${esc(t('cron_toast_notifications_hint') || 'Show a toast when this cron finishes.')}</span>
           </label>
         </div>
-        <div class="detail-form-row">
-          <label for="cronFormSkillSearch">${esc(t('cron_skills_label') || 'Skills')}</label>
-          <div class="skill-picker-wrap">
-            <input type="text" id="cronFormSkillSearch" placeholder="${esc(t('cron_skills_placeholder') || 'Add skills (optional)...')}" autocomplete="off" ${isEdit ? 'disabled' : ''}>
-            <div id="cronFormSkillDropdown" class="skill-picker-dropdown" style="display:none"></div>
-            <div id="cronFormSkillTags" class="skill-picker-tags"></div>
-          </div>
-          ${isEdit ? `<div class="detail-form-hint">${esc(t('cron_skills_edit_hint') || 'Skill list is not editable after creation.')}</div>` : ''}
-        </div>
+        ${skillsBlock}
         <div id="cronFormError" class="detail-form-error" style="display:none"></div>
       </form>
     </div>`;
@@ -979,7 +1048,8 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
   if (empty) empty.style.display = 'none';
   _setCronHeaderButtons(isEdit ? 'edit' : 'create');
   _populateCronDeliverOptions(deliver, isEdit);
-  _renderCronSkillTags();
+  _populateCronFormModelSelect(model, provider, isNoAgent);
+  if (!isNoAgent) _renderCronSkillTags();
   const scheduleEl = $('cronFormSchedule');
   if (scheduleEl) {
     scheduleEl.addEventListener('input', _syncCronScheduleWarning);
@@ -1019,6 +1089,72 @@ async function _populateCronDeliverOptions(selectedValue, isEdit) {
     sel.innerHTML = '<option value="local">Local (save output only)</option>';
   }
   sel.disabled = false;
+}
+
+async function _populateCronFormModelSelect(selectedModel, selectedProvider, disabled){
+  const sel = $('cronFormModel');
+  if (!sel) return;
+  delete sel.dataset.loaded;
+  sel.disabled = true;
+  sel.innerHTML = `<option value="">${esc(t('cron_model_use_default') || 'Default (use profile/system default)')}</option>`;
+  try {
+    const data = await api('/api/models');
+    const groups = (Array.isArray(data && data.groups) && data.groups.length) ? data.groups : [];
+    for (const g of groups) {
+      const og = document.createElement('optgroup');
+      og.label = g.provider || g.provider_id || 'Configured';
+      if (g.provider_id) og.dataset.provider = g.provider_id;
+      for (const m of (Array.isArray(g.models) ? g.models : [])) {
+        if (!m || !m.id) continue;
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = m.label || m.id;
+        if (g.provider_id) opt.dataset.provider = g.provider_id;
+        og.appendChild(opt);
+      }
+      if (og.children.length) sel.appendChild(og);
+    }
+
+    let found = false;
+    if (selectedModel) {
+      if (typeof _applyModelToDropdown === 'function') {
+        found = !!_applyModelToDropdown(selectedModel, sel, selectedProvider || null);
+      }
+      if (!found) {
+        for (const opt of sel.options) {
+          if (opt.value !== selectedModel) continue;
+          const prov = opt.dataset.provider || (opt.parentElement && opt.parentElement.dataset.provider) || '';
+          if (!selectedProvider || prov === selectedProvider) {
+            opt.selected = true;
+            found = true;
+            break;
+          }
+        }
+      }
+    } else {
+      found = true;
+    }
+
+    if (selectedModel && !found) {
+      const opt = document.createElement('option');
+      opt.value = selectedModel;
+      opt.textContent = `${selectedModel} (${t('not_available') || 'not available'})`;
+      if (selectedProvider) opt.dataset.provider = selectedProvider;
+      opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.dataset.loaded = '1';
+  } catch (e) {
+    console.warn('Failed to load cron model picker:', e.message);
+    // Load failed: dataset.loaded stays unset so saveCronForm omits model/provider
+    // and preserves any existing override. Keep the select DISABLED rather than
+    // re-enabling it showing only "Default" — an enabled "Default"-only select
+    // would let the user think they cleared the override when a save actually
+    // preserves it (Opus advisor, stage-345). A reopen retries the load.
+    sel.disabled = true;
+    return;
+  }
+  sel.disabled = !!disabled;
 }
 
 function _renderCronSkillTags(){
@@ -1088,23 +1224,40 @@ async function saveCronForm(){
   const profileEl=$('cronFormProfile');
   const toastEl=$('cronFormToastNotifications');
   const errEl=$('cronFormError');
-  if(!schEl||!promptEl||!errEl) return;
+  if(!schEl||!errEl) return;
+  const isNoAgent = !!(_cronPreFormDetail && _cronPreFormDetail.no_agent);
+  if(!isNoAgent && !promptEl) return;
   const name=(nameEl?nameEl.value:'').trim();
   const schedule=schEl.value.trim();
-  const prompt=promptEl.value.trim();
+  const prompt=promptEl ? promptEl.value.trim() : '';
   const deliver=delivEl?delivEl.value:'local';
   const profile=profileEl?profileEl.value:'';
   const toastNotifications=toastEl?!!toastEl.checked:true;
-  const isNoAgent = !!(_cronPreFormDetail && _cronPreFormDetail.no_agent);
   errEl.style.display='none';
   if(!schedule){errEl.textContent=t('cron_schedule_required_example');errEl.style.display='';return;}
   if(!isNoAgent && !prompt){errEl.textContent=t('cron_prompt_required');errEl.style.display='';return;}
   try{
+    const modelEl = $('cronFormModel');
+    const modelLoaded = !!(modelEl && modelEl.dataset.loaded === '1');
+    const selectedModel = modelEl ? (modelEl.value || '').trim() : '';
     if (_editingCronId) {
       const updates = {job_id: _editingCronId, schedule, profile: profile, toast_notifications: toastNotifications};
       if (!isNoAgent) updates.prompt = prompt;
       if (name) updates.name = name;
       if (deliver) updates.deliver = deliver;
+      if (modelEl) {
+        if (selectedModel && modelLoaded) {
+          const modelState = (typeof _modelStateForSelect === 'function')
+            ? _modelStateForSelect(modelEl, selectedModel)
+            : { model: selectedModel, model_provider: null };
+          updates.model = modelState.model || null;
+          updates.provider = modelState.model_provider || null;
+        } else if (modelLoaded) {
+          updates.model = null;
+          updates.provider = null;
+        }
+        // else: select not yet populated — omit model/provider to preserve saved value
+      }
       await api('/api/crons/update', {method:'POST', body: JSON.stringify(updates)});
       const editedId = _editingCronId;
       _editingCronId = null;
@@ -1119,6 +1272,18 @@ async function saveCronForm(){
     if(_cronIsDuplicate) body.enabled=false;
     if(name)body.name=name;
     if(_cronSelectedSkills.length)body.skills=_cronSelectedSkills;
+    if (modelEl && modelLoaded) {
+      if (selectedModel) {
+        const modelState = (typeof _modelStateForSelect === 'function')
+          ? _modelStateForSelect(modelEl, selectedModel)
+          : { model: selectedModel, model_provider: null };
+        body.model = modelState.model || null;
+        body.provider = modelState.model_provider || null;
+      }
+    } else if (_cronIsDuplicate && _cronPreFormDetail && _cronPreFormDetail.model) {
+      body.model = _cronPreFormDetail.model;
+      body.provider = _cronPreFormDetail.provider || null;
+    }
     const res = await api('/api/crons/create',{method:'POST',body:JSON.stringify(body)});
     _cronPreFormDetail = null;
     _cronIsDuplicate = false;
@@ -5911,7 +6076,7 @@ function switchSettingsSection(name){
       });
     }
   }
-  let section=(name==='appearance'||name==='preferences'||name==='providers'||name==='plugins'||name==='system')?name:'conversation';
+  let section=(name==='appearance'||name==='preferences'||name==='providers'||name==='plugins'||name==='system'||name==='help')?name:'conversation';
   // Deep-linking to the Plugins pane when the tab is hidden (no plugins
   // installed, #3457) falls back to Conversation. Resolve this BEFORE toggling
   // panes/sidebar/dropdown below so every downstream selection uses the
@@ -5923,13 +6088,13 @@ function switchSettingsSection(name){
   }
   _settingsSection=section;
   _currentSettingsSection=section;
-  const map={conversation:'Conversation',appearance:'Appearance',preferences:'Preferences',providers:'Providers',plugins:'Plugins',system:'System'};
+  const map={conversation:'Conversation',appearance:'Appearance',preferences:'Preferences',providers:'Providers',plugins:'Plugins',system:'System',help:'Help'};
   // Sidebar menu items
   document.querySelectorAll('#settingsMenu .side-menu-item').forEach(it=>{
     it.classList.toggle('active', it.dataset.settingsSection===section);
   });
   // Panes in main
-  ['conversation','appearance','preferences','providers','plugins','system'].forEach(key=>{
+  ['conversation','appearance','preferences','providers','plugins','system','help'].forEach(key=>{
     const pane=$('settingsPane'+map[key]);
     if(pane) pane.classList.toggle('active', key===section);
   });
@@ -6863,7 +7028,10 @@ async function loadProvidersPanel(){
     list.innerHTML='';
     _providerCardEls.clear();
     const quotaCard=_buildProviderQuotaCard(quota);
-    if(quotaCard) list.appendChild(quotaCard);
+    if(quotaCard){
+      list.appendChild(quotaCard);
+      renderProviderCostChart(quotaCard); // async, fire-and-forget
+    }
     if(providers.length===0){
       list.style.display='none';
       if(empty) empty.style.display='';
@@ -6899,6 +7067,10 @@ async function _refreshProviderQuota(card,button){
     const fresh=_buildProviderQuotaCard(next);
     if(fresh){
       card.replaceWith(fresh);
+      // Re-render the 7-day spend chart onto the rebuilt card — the quota
+      // refresh replaces the whole card, which would otherwise drop the chart
+      // until the next full panel reload (#3600).
+      renderProviderCostChart(fresh); // async, fire-and-forget
       if(typeof showToast==='function') showToast(failed?t('provider_quota_refresh_failed'):t('provider_quota_refresh_succeeded'));
       return;
     }
@@ -7123,6 +7295,43 @@ function _buildProviderQuotaCard(status){
     });
   }
   return card;
+}
+
+async function renderProviderCostChart(card){
+  let history;
+  try{
+    history=await api('/api/provider/cost-history?provider=openrouter');
+  }catch(e){
+    return; // silently skip if endpoint unavailable
+  }
+  const body=card.querySelector('.provider-quota-body');
+  if(!body||body.querySelector('.provider-cost-chart-wrap')) return;
+  if(!history||history.ok===false) return;
+  const snaps=Array.isArray(history.snapshots)?history.snapshots:[];
+  // need at least 2 snapshots to have one non-null delta
+  const hasData=snaps.filter(s=>s.delta!=null).length>=1;
+  if(!hasData){
+    const empty=document.createElement('div');
+    empty.className='provider-cost-chart-wrap';
+    empty.innerHTML='<div class="provider-cost-chart-title">7-day spend</div><div class="provider-quota-message">Not enough data yet. Cost chart builds after 2 daily snapshots.</div>';
+    body.appendChild(empty);
+    return;
+  }
+  const maxDelta=Math.max(...snaps.map(s=>s.delta!=null?Number(s.delta):0),1e-9);
+  const nonNull=snaps.filter(s=>s.delta!=null).map(s=>Number(s.delta));
+  const avg=nonNull.length?nonNull.reduce((a,b)=>a+b,0)/nonNull.length:0;
+  const pace='$'+(avg*30).toFixed(2);
+  const bars=snaps.map(s=>{
+    const delta=s.delta!=null?Number(s.delta):null;
+    const pct=delta!=null?Math.max((delta/maxDelta)*100,delta>0?2:0).toFixed(1):'0';
+    const label=String(s.date||'').slice(5);
+    const tip=delta!=null?`${s.date} · $${delta.toFixed(4)}`:`${s.date} · no baseline`;
+    return `<div class="insights-daily-bar" title="${esc(tip)}"><div class="insights-daily-stack" aria-label="${esc(tip)}"><div class="insights-daily-bar-input" style="height:${pct}%"></div></div><span>${esc(label)}</span></div>`;
+  }).join('');
+  const wrap=document.createElement('div');
+  wrap.className='provider-cost-chart-wrap';
+  wrap.innerHTML=`<div class="provider-cost-chart-title">7-day spend <span class="provider-cost-chart-pace">Monthly pace: ${esc(pace)}</span></div><div class="provider-cost-chart-bars insights-daily-token-chart">${bars}</div>`;
+  body.appendChild(wrap);
 }
 
 function _buildProviderCard(p){
@@ -8279,16 +8488,16 @@ function loadGatewayStatus(){
   api('/api/gateway/status').then(r=>{
     if(!r) return;
     if(!r.configured){
-      card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#f59e0b;display:inline-block"></span>Gateway not configured</div>`;
+      card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#f59e0b;display:inline-block"></span>${esc(t('gateway_not_configured'))}</div>`;
       return;
     }
     if(!r.running){
       const reason = _gatewayStatusReason(r);
       const statusLabel = reason === 'gateway_stale_running_state'
-        ? 'Gateway metadata stale'
+        ? t('gateway_metadata_stale')
         : reason === 'remote_gateway_unreachable'
-          ? 'Gateway endpoint not reachable'
-          : 'Gateway not running';
+          ? t('gateway_endpoint_unreachable')
+          : t('gateway_not_running');
       card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#ef4444;display:inline-block"></span>${esc(statusLabel)}</div>`;
       return;
     }
@@ -8300,10 +8509,10 @@ function loadGatewayStatus(){
         return `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:var(--code-bg);border:1px solid var(--border2);border-radius:12px;font-size:12px;font-weight:500">${icon} ${esc(p.label)}</span>`;
       }).join(' ');
     }
-    const lastActive=r.last_active?`<span style="font-size:11px;color:var(--muted)">Last active: ${esc(new Date(r.last_active).toLocaleString())}</span>`:'';
-    const sessionInfo=r.session_count?`<span style="font-size:11px;color:var(--muted)">${r.session_count} session${r.session_count!==1?'s':''}</span>`:'';
-    card.innerHTML=`<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block"></span><span style="font-size:13px;font-weight:500;color:#22c55e">Running</span></div>${badges?`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${badges}</div>`:''}<div style="display:flex;gap:12px">${sessionInfo}${lastActive}</div>`;
-  }).catch(()=>{card.innerHTML=`<div style="color:#ef4444;font-size:12px">Failed to load gateway status</div>`});
+    const lastActive=r.last_active?`<span style="font-size:11px;color:var(--muted)">${esc(t('gateway_last_active'))}${esc(new Date(r.last_active).toLocaleString())}</span>`:'';
+    const sessionInfo=r.session_count?`<span style="font-size:11px;color:var(--muted)">${esc(t('gateway_session_count',r.session_count))}</span>`:'';
+    card.innerHTML=`<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block"></span><span style="font-size:13px;font-weight:500;color:#22c55e">${esc(t('gateway_running_label'))}</span></div>${badges?`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${badges}</div>`:''}<div style="display:flex;gap:12px">${sessionInfo}${lastActive}</div>`;
+  }).catch(()=>{card.innerHTML=`<div style="color:#ef4444;font-size:12px">${esc(t('gateway_load_failed'))}</div>`});
 }
 // Load MCP servers when system settings tab opens
 const _origSwitchSettings=switchSettingsSection;

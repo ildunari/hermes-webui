@@ -1806,7 +1806,31 @@ function renderModelDropdown(){
   };
   // Event handlers for search input
   _si.addEventListener('input',()=>_filterModels(_si.value));
-  _si.addEventListener('keydown',e=>{if(e.key==='Enter') {e.preventDefault();}if(e.key==='Escape') {closeModelDropdown();}});
+  // Keyboard navigation through filtered model rows (#2791).
+  const _visibleModelRows=()=>Array.from(dd.querySelectorAll('.model-opt'));
+  const _activeRowIndex=(rows)=>rows.findIndex(r=>r.classList.contains('is-highlighted'));
+  const _highlightRow=(rows,idx)=>{
+    for(const r of rows) r.classList.remove('is-highlighted');
+    if(idx<0||idx>=rows.length) return;
+    const row=rows[idx];
+    row.classList.add('is-highlighted');
+    if(typeof row.scrollIntoView==='function') row.scrollIntoView({block:'nearest'});
+  };
+  _si.addEventListener('keydown',e=>{
+    if(e.key==='Escape'){closeModelDropdown();return;}
+    if(e.key==='ArrowDown'||e.key==='ArrowUp'||e.key==='Enter'){
+      const rows=_visibleModelRows();
+      if(!rows.length){if(e.key==='Enter') e.preventDefault();return;}
+      const cur=_activeRowIndex(rows);
+      if(e.key==='ArrowDown'){e.preventDefault();_highlightRow(rows,cur<0?0:Math.min(rows.length-1,cur+1));return;}
+      if(e.key==='ArrowUp'){e.preventDefault();_highlightRow(rows,cur<=0?rows.length-1:cur-1);return;}
+      if(e.key==='Enter'){
+        e.preventDefault();
+        const pick=cur>=0?rows[cur]:rows[0];
+        if(pick) pick.click();
+      }
+    }
+  });
   _si.addEventListener('click',e=>e.stopPropagation());
   // Event handlers for clear button
   _sc.onclick=()=>{ _si.value=''; _filterModels(''); _si.focus(); };
@@ -2330,6 +2354,7 @@ let _messageUserUnpinned=false;
 let _bottomSettleToken=0;
 const NON_MESSAGE_SCROLL_INTENT_SUPPRESS_MS=350;
 let _touchStartY=null;
+let _newMessageCueVisible=false;
 function _cancelBottomSettle(){ _bottomSettleToken++; }
 function _recordNonMessageScrollIntent(e){
   const el=document.getElementById('messages');
@@ -2360,6 +2385,46 @@ function _recordNonMessageScrollIntent(e){
 function _recentNonMessageScrollIntent(){
   return performance.now()-_lastNonMessageScrollIntentMs<NON_MESSAGE_SCROLL_INTENT_SUPPRESS_MS;
 }
+function _setScrollToBottomCueText(btn, textKey, labelKey){
+  if(!btn) return;
+  const label=btn.querySelector('.session-jump-btn__text');
+  if(label){
+    label.setAttribute('data-i18n',textKey);
+    label.textContent=(typeof t==='function')?t(textKey):label.textContent;
+  }
+  btn.setAttribute('data-i18n-aria-label',labelKey);
+  btn.setAttribute('data-i18n-title',labelKey);
+  const accessible=(typeof t==='function')?t(labelKey):btn.getAttribute('aria-label')||'';
+  if(accessible){
+    btn.setAttribute('aria-label',accessible);
+    btn.setAttribute('title',accessible);
+  }
+}
+function _syncScrollToBottomCue(show, opts){
+  const btn=$('scrollToBottomBtn');
+  if(!btn) return;
+  const newMessage=!!(opts&&opts.newMessage);
+  btn.classList.toggle('scroll-to-bottom-btn--new-message',newMessage);
+  if(newMessage) _setScrollToBottomCueText(btn,'session_new_message','session_new_message_label');
+  else _setScrollToBottomCueText(btn,'session_jump_end','session_jump_end_label');
+  btn.style.display=show?'flex':'none';
+}
+function _showNewMessageScrollCue(){
+  _newMessageCueVisible=true;
+  _syncScrollToBottomCue(true,{newMessage:true});
+}
+function _clearNewMessageScrollCue(){
+  _newMessageCueVisible=false;
+  _syncScrollToBottomCue(false,{newMessage:false});
+}
+function _maybeShowNewMessageScrollCue(scrollSnapshot){
+  const el=document.getElementById('messages');
+  if(!el||!scrollSnapshot) return;
+  const previousHeight=Number(scrollSnapshot.scrollHeight)||0;
+  const distance=el.scrollHeight-el.scrollTop-el.clientHeight;
+  if(el.scrollHeight>previousHeight+24 && distance>80) _showNewMessageScrollCue();
+  else _syncScrollToBottomCue(distance>80,{newMessage:_newMessageCueVisible});
+}
 if(typeof document!=='undefined'){
   document.addEventListener('wheel',_recordNonMessageScrollIntent,{capture:true,passive:true});
   document.addEventListener('touchmove',_recordNonMessageScrollIntent,{capture:true,passive:true});
@@ -2373,6 +2438,7 @@ if(typeof document!=='undefined'){
 // prevent the new chat's first scroll comparing against the previous chat's
 // scrollTop (Opus stage-302 SHOULD-FIX, #1731 follow-up).
 function _resetScrollDirectionTracker(){
+  _clearNewMessageScrollCue();
   _lastScrollTop=null;
   _messageUserUnpinned=false;
   _scrollPinned=true;
@@ -2380,6 +2446,7 @@ function _resetScrollDirectionTracker(){
   _touchStartY=null;
 }
 function _resetStreamScrollFollow(){
+  _clearNewMessageScrollCue();
   _messageUserUnpinned=false;
   _scrollPinned=true;
   _nearBottomCount=0;
@@ -2495,9 +2562,9 @@ if(typeof window!=='undefined'){
         _nearBottomCount=0;
         _scrollPinned=false;
       }
-      const btn=$('scrollToBottomBtn');
+      if(nearBottom) _clearNewMessageScrollCue();
       const showBottomButton=!_scrollPinned && el.scrollHeight-top-el.clientHeight>80;
-      if(btn) btn.style.display=showBottomButton?'flex':'none';
+      _syncScrollToBottomCue(showBottomButton,{newMessage:_newMessageCueVisible});
       if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
       // Prefetch older messages before the reader hits the hard top. Prepending
       // then preserving scrollTop is seamless only if there is runway left for
@@ -2992,6 +3059,7 @@ function scrollIfPinned(){
   _settleMessageScrollToBottom(false);
 }
 function scrollToBottom(){
+  _clearNewMessageScrollCue();
   _scrollPinned=true;
   _messageUserUnpinned=false;
   // Write the first bottom position synchronously. A final renderMessages()
@@ -3000,8 +3068,7 @@ function scrollToBottom(){
   // them before the viewport ever reaches the bottom.
   _setMessageScrollToBottom();
   _settleMessageScrollToBottom(true);
-  const btn=$('scrollToBottomBtn');
-  if(btn) btn.style.display='none';
+  _syncScrollToBottomCue(false,{newMessage:false});
   if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
 }
 
@@ -4311,6 +4378,12 @@ const TOAST_DEFAULT_MS=2800;
 const TOAST_ERROR_DEFAULT_MS=20000;
 function clearToastDismissTimer(el){if(!el)return;clearTimeout(el._t);el._t=null;}
 function setToastDismissTimer(el,duration){if(!el)return;clearToastDismissTimer(el);el._t=setTimeout(()=>{el.classList.remove('show');},duration);}
+function dismissToast(btnOrEl){
+  const el=btnOrEl&&btnOrEl.closest?btnOrEl.closest('#toast'):(btnOrEl&&btnOrEl.id==='toast'?btnOrEl:null);
+  if(!el)return;
+  clearToastDismissTimer(el);
+  el.classList.remove('show');
+}
 function copyToastText(btn){
   const el=btn&&btn.closest?btn.closest('#toast'):null;
   const text=el?(el.dataset.toastMessage||el.textContent||''):'';
@@ -4324,12 +4397,13 @@ function showToast(msg,ms,type){
   const duration=(ms==null)?(t==='error'?TOAST_ERROR_DEFAULT_MS:TOAST_DEFAULT_MS):ms;
   el.className='toast show '+t;
   el.dataset.toastMessage=s;
-  if(t==='error') el.innerHTML=`<span class="toast-message">${esc(s)}</span><button class="toast-copy" type="button" data-toast-copy="1" onclick="copyToastText(this);event.stopPropagation()">Copy</button>`;
+  if(t==='error') el.innerHTML=`<span class="toast-message">${esc(s)}</span><button class="toast-copy" type="button" data-toast-copy="1" onclick="copyToastText(this);event.stopPropagation()">Copy</button><button class="toast-dismiss" type="button" aria-label="Dismiss error toast" data-toast-dismiss="1" onclick="dismissToast(this);event.stopPropagation()">Dismiss</button>`;
   else el.textContent=s;
   el.onmouseenter=()=>clearToastDismissTimer(el);
   el.onmouseleave=()=>setToastDismissTimer(el,duration);
   el.onfocusin=()=>clearToastDismissTimer(el);
   el.onfocusout=()=>setToastDismissTimer(el,duration);
+  el.onclick=t==='error'?null:()=>dismissToast(el);
   setToastDismissTimer(el,duration);
 }
 
@@ -6153,6 +6227,10 @@ function _messageHasReasoningPayload(m){
   if(!m||m.role!=='assistant') return false;
   if(m.reasoning||m.reasoning_content||m.thinking||m._reasoning) return true;
   if(Array.isArray(m.content)) return m.content.some(p=>p&&(p.type==='thinking'||p.type==='reasoning'));
+  if(typeof window!=='undefined'&&typeof window._extractInlineThinkingFromContentForRender==='function'){
+    const split=window._extractInlineThinkingFromContentForRender(String(m.content||''),'');
+    return !!(split&&split.reasoning);
+  }
   return /^\s*(?:<think>[\s\S]*?<\/think>|<\|channel\|?>thought\n?[\s\S]*?<channel\|>|<\|turn\|>thinking\n[\s\S]*?<turn\|>)/.test(String(m.content||''));
 }
 function _isAssistantEmptyPlaceholderContent(m, content){
@@ -6235,6 +6313,10 @@ function _assistantReasoningPayloadText(m){
     return parts.join('\n').trim();
   }
   const text=String(m.content||'');
+  if(typeof window!=='undefined'&&typeof window._extractInlineThinkingFromContentForRender==='function'){
+    const split=window._extractInlineThinkingFromContentForRender(text,'');
+    if(split&&String(split.reasoning||'').trim()) return String(split.reasoning).trim();
+  }
   // Extract a LEADING thinking block even when visible answer text follows it
   // (e.g. "<think>…</think>4"). The matching display-content stripper
   // (_stripLeadingAssistantThinkingMarkup) is non-anchored, so the extractor must
@@ -6265,7 +6347,14 @@ function _assistantVisibleContentForReasoningCompare(m){
   if(Array.isArray(content)){
     content=content.filter(p=>p&&p.type==='text').map(p=>p.text||p.content||'').join('\n');
   }
-  if(typeof content==='string') content=_stripLeadingAssistantThinkingMarkup(content);
+  if(typeof content==='string'){
+    if(typeof window!=='undefined'&&typeof window._extractInlineThinkingFromContentForRender==='function'){
+      const split=window._extractInlineThinkingFromContentForRender(content,'');
+      content=split&&typeof split.content==='string'?split.content:_stripLeadingAssistantThinkingMarkup(content);
+    } else {
+      content=_stripLeadingAssistantThinkingMarkup(content);
+    }
+  }
   if(_isMarkerOnlyAssistantCompressionMessage(m)){
     content='**Error:** No response received after context compression. Please retry.';
   }
@@ -7687,6 +7776,7 @@ function _captureMessageScrollSnapshot(){
   return {
     top:el.scrollTop,
     bottom,
+    scrollHeight:el.scrollHeight,
     pinned:_shouldFollowMessagesOnDomReplace(),
     userUnpinned:_messageUserUnpinned,
   };
@@ -7734,8 +7824,17 @@ function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
   // pinned users stay at bottom; users who manually scrolled up get their
   // pre-render scrollTop restored after the DOM replacement.
   if(preserveScroll){
+    // Keep master's follow heuristic for pinned / still-near-bottom users:
+    // _followMessagesAfterDomReplace() does a FORCED scrollToBottom() (synchronous
+    // bottom write + forced settle), so the final settled response can't leave a
+    // pinned reader a few lines short. Only genuinely-scrolled-up (unpinned, not
+    // near bottom) users fall through to keep their position and get the
+    // new-message cue. (Using scrollIfPinned() here instead would skip the forced
+    // write unless distance>500 and let the DOM-rebuild scroll event cancel the
+    // delayed settles — Codex CORE catch on #3631.)
     if(_followMessagesAfterDomReplace()) return;
     _restoreMessageScrollSnapshot(scrollSnapshot);
+    _maybeShowNewMessageScrollCue(scrollSnapshot);
     return;
   }
   if(S.activeStreamId){
@@ -8012,23 +8111,30 @@ function renderMessages(options){
     if(Array.isArray(content)){
       content=content.filter(p=>p&&p.type==='text').map(p=>p.text||p.content||'').join('\n');
     }
-    if(!thinkingText && typeof content==='string'){
-      const thinkMatch=content.match(/^\s*<think>([\s\S]*?)<\/think>\s*/);
-      if(thinkMatch){
-        content=content.replace(/^\s*<think>[\s\S]*?<\/think>\s*/,'').trimStart();
-      }
-      if(!thinkingText){
-        // Historical name "gemmaMatch" refers to MiniMax <|channel>thought format.
-        const gemmaMatch=content.match(/^\s*<\|channel\|?>thought\n?([\s\S]*?)<channel\|>\s*/);
-        if(gemmaMatch){
-          content=content.replace(/^\s*<\|channel\|?>thought\n?[\s\S]*?<channel\|>\s*/,'').trimStart();
+    if(typeof content==='string'){
+      if(typeof window!=='undefined'&&typeof window._extractInlineThinkingFromContentForRender==='function'){
+        const split=window._extractInlineThinkingFromContentForRender(content, thinkingText);
+        thinkingText=split.reasoning||thinkingText;
+        content=split.content;
+      }else if(!thinkingText){
+        const thinkMatch=content.match(/^\s*<think>([\s\S]*?)<\/think>\s*/);
+        if(thinkMatch){
+          thinkingText=thinkMatch[1].trim();
+          content=content.replace(/^\s*<think>[\s\S]*?<\/think>\s*/,'').trimStart();
         }
-      }
-      if(!thinkingText){
-        // Gemma 4 uses asymmetric <|turn|>thinking\n...<turn|> delimiters.
-        const gemmaTurnMatch=content.match(/^\s*<\|turn\|>thinking\n([\s\S]*?)<turn\|>\s*/);
-        if(gemmaTurnMatch){
-          content=content.replace(/^\s*<\|turn\|>thinking\n[\s\S]*?<turn\|>\s*/,'').trimStart();
+        if(!thinkingText){
+          const gemmaMatch=content.match(/^\s*<\|channel\|?>thought\n?([\s\S]*?)<channel\|>\s*/);
+          if(gemmaMatch){
+            thinkingText=gemmaMatch[1].trim();
+            content=content.replace(/^\s*<\|channel\|?>thought\n?[\s\S]*?<channel\|>\s*/,'').trimStart();
+          }
+        }
+        if(!thinkingText){
+          const gemmaTurnMatch=content.match(/^\s*<\|turn\|>thinking\n([\s\S]*?)<turn\|>\s*/);
+          if(gemmaTurnMatch){
+            thinkingText=gemmaTurnMatch[1].trim();
+            content=content.replace(/^\s*<\|turn\|>thinking\n[\s\S]*?<turn\|>\s*/,'').trimStart();
+          }
         }
       }
     }
@@ -8617,6 +8723,69 @@ function renderMessages(options){
       if(fragments.length){
         targetFoot.classList.add('msg-foot-with-usage');
         for(let i=fragments.length-1;i>=0;i--) targetFoot.insertBefore(fragments[i], targetFoot.firstChild);
+      }
+    }
+  }
+  // Fail-safe invariant (#3875): a settled assistant turn must never render with
+  // ZERO visible content. The Worklog redesign (#3401) folds intermediate
+  // assistant segments into a collapsed Worklog card and hides the source segment
+  // (`assistant-segment-worklog-source` → display:none). That is correct WHEN the
+  // turn also has a visible final answer. But when a turn's ONLY content is folded
+  // into a collapsed Worklog (e.g. an autonomous/interrupted run whose final
+  // assistant message is empty, or a reload where S.toolCalls didn't hydrate so the
+  // worklog card built with no expandable tool steps), every segment is hidden and
+  // the turn paints as nothing — leaving the transcript a bare stack of date
+  // separators (#3875 brick). Reveal such turns so their content is never silently
+  // swallowed: expand the turn's Worklog group(s) when the turn has no other
+  // visible content. This NEVER touches a turn that has any visible segment, so the
+  // intended collapsed-Worklog UX is preserved whenever a visible answer exists.
+  // The live turn is excluded by its `liveAssistantTurn` id (it drives its own
+  // state during a stream), so this sweep is safe to run even while busy — a
+  // historical blank turn must not re-paint blank during a follow-up stream
+  // (Opus advisor, stage-342).
+  {
+    const _turnHasVisibleContent=(turn)=>{
+      const segs=turn.querySelectorAll('.assistant-segment');
+      for(const seg of segs){
+        // A segment shows real content only when it is NOT worklog-folded AND its
+        // body/files/status actually painted (the anchor-only placeholder class
+        // carries no visible body).
+        if(seg.classList.contains('assistant-segment-worklog-source')) continue;
+        if(seg.classList.contains('assistant-segment-anchor')) continue;
+        if((seg.textContent||'').trim()) return true;
+      }
+      return false;
+    };
+    for(const turn of inner.querySelectorAll('.assistant-turn')){
+      if(turn.id==='liveAssistantTurn') continue; // live turn drives its own state
+      if(_turnHasVisibleContent(turn)) continue;
+      // No visible content — surface the folded Worklog so the turn isn't blank.
+      const groups=turn.querySelectorAll('.tool-worklog-group,.tool-call-group');
+      let revealed=false;
+      for(const group of groups){
+        if(!(group.textContent||'').trim()) continue; // empty group can't help
+        if(group.classList.contains('tool-call-group-collapsed')){
+          group.classList.remove('tool-call-group-collapsed');
+          group.classList.add('open');
+          const summary=group.querySelector('.tool-call-group-summary,.activity-summary');
+          if(summary) summary.setAttribute('aria-expanded','true');
+        }
+        // `revealed` means "this turn has a non-empty Worklog group that the user
+        // can see" — NOT "we just expanded something". An already-open non-empty
+        // group is itself visible (it slips past _turnHasVisibleContent only
+        // because that check inspects .assistant-segment nodes, not group bodies),
+        // so the turn isn't truly blank and the last-resort un-hide below is
+        // unnecessary. Keep this assignment OUTSIDE the if(collapsed) branch.
+        revealed=true;
+      }
+      // Last resort: no usable worklog group either, but hidden worklog-source
+      // segments carry the real text — un-hide them so nothing is lost.
+      if(!revealed){
+        for(const seg of turn.querySelectorAll('.assistant-segment-worklog-source')){
+          if(!(seg.textContent||'').trim()) continue;
+          seg.classList.remove('assistant-segment-worklog-source');
+          seg.removeAttribute('aria-hidden');
+        }
       }
     }
   }
@@ -10083,7 +10252,7 @@ function finalizeThinkingCard(){
     if(!row) return;
     // If the row is still just a spinner (no thinking content rendered),
     // remove it entirely — it's the initial waiting dots.
-    const hasContent=row.querySelector('.thinking-card') || row.classList.contains('thinking-card-row');
+    const hasContent=!!row.querySelector('.thinking-card');
     if(!hasContent && row.getAttribute('data-thinking-active')==='1'){
       row.remove();
       return;
@@ -10479,6 +10648,16 @@ function _copyTextWithFallback(text, successMsg, failurePrefix){
   return Promise.resolve();
 }
 
+function _workspaceCreateTargetLabel(targetDir){
+  return targetDir && targetDir !== '.' ? targetDir : t('workspace_root');
+}
+
+function _workspaceJoinTargetPath(targetDir, name){
+  const cleanName=String(name||'').trim();
+  if(!cleanName) return '';
+  return (!targetDir||targetDir==='.') ? cleanName : `${targetDir}/${cleanName}`;
+}
+
 function _showWorkspaceRootContextMenu(e){
   document.querySelectorAll('.file-ctx-menu').forEach(el=>el.remove());
   const menu=document.createElement('div');
@@ -10487,6 +10666,20 @@ function _showWorkspaceRootContextMenu(e){
   const vw=window.innerWidth,vh=window.innerHeight;
   menu.style.left=(e.clientX+160>vw?e.clientX-170:e.clientX)+'px';
   menu.style.top=(e.clientY+80>vh?e.clientY-80:e.clientY)+'px';
+
+  menu.appendChild(_workspaceContextMenuItem(t('new_file'),async()=>{
+    menu.remove();
+    await promptNewFile('.');
+  }));
+
+  menu.appendChild(_workspaceContextMenuItem(t('new_folder'),async()=>{
+    menu.remove();
+    await promptNewFolder('.');
+  }));
+
+  const createSep=document.createElement('hr');
+  createSep.style.cssText='border:none;border-top:1px solid var(--border);margin:4px 0;';
+  menu.appendChild(createSep);
 
   menu.appendChild(_workspaceContextMenuItem(t('reveal_in_finder'),async()=>{
     menu.remove();
@@ -10824,6 +11017,21 @@ function _showFileContextMenu(e, item){
   const vw=window.innerWidth,vh=window.innerHeight;
   menu.style.left=(e.clientX+140>vw?e.clientX-150:e.clientX)+'px';
   menu.style.top=(e.clientY+100>vh?e.clientY-100:e.clientY)+'px';
+  const targetDir=item.type==='dir' ? item.path : _workspaceParentDir(item.path);
+
+  menu.appendChild(_workspaceContextMenuItem(t('new_file'),async()=>{
+    menu.remove();
+    await promptNewFile(targetDir);
+  }));
+
+  menu.appendChild(_workspaceContextMenuItem(t('new_folder'),async()=>{
+    menu.remove();
+    await promptNewFolder(targetDir);
+  }));
+
+  const createSep=document.createElement('hr');
+  createSep.style.cssText='border:none;border-top:1px solid var(--border);margin:4px 0;';
+  menu.appendChild(createSep);
 
   // Rename
   const renameItem=document.createElement('div');
@@ -10871,10 +11079,6 @@ function _showFileContextMenu(e, item){
         await navigator.clipboard.writeText(abs);
         showToast(t('path_copied'));
       }catch(clipErr){
-        // Fallback for browsers where Clipboard API is gated (older Safari,
-        // non-secure contexts). Use the legacy execCommand path against a
-        // hidden textarea — this is the same pattern boot.js uses for the
-        // "Copy" buttons on code blocks.
         const ta=document.createElement('textarea');
         ta.value=abs;
         ta.style.cssText='position:fixed;left:-9999px;top:-9999px;';
@@ -10892,8 +11096,6 @@ function _showFileContextMenu(e, item){
   };
   menu.appendChild(copyPathItem);
 
-  // Download as zip — only for directories. Streams the folder contents
-  // through /api/folder/download which builds the zip on the fly.
   if(item.type==='dir'){
     const dlItem=document.createElement('div');
     dlItem.textContent=t('download_folder');
@@ -10909,7 +11111,6 @@ function _showFileContextMenu(e, item){
     menu.appendChild(dlItem);
   }
 
-  // Divider + Delete
   const sep=document.createElement('hr');
   sep.style.cssText='border:none;border-top:1px solid var(--border);margin:4px 0;';
   menu.appendChild(sep);
@@ -10971,9 +11172,7 @@ async function deleteWorkspaceFile(relPath, name){
   }catch(e){setStatus(t('delete_failed')+e.message);}
 }
 
-async function promptNewFile(){
-  // If no active session but a default workspace is configured, auto-create
-  // a session bound to it so workspace actions work on the blank new-chat page.
+async function promptNewFile(targetDir = S.currentDir || '.'){
   if(!S.session){
     const ws=(typeof S._profileDefaultWorkspace==='string'&&S._profileDefaultWorkspace)||'';
     if(!ws) return;
@@ -10983,19 +11182,24 @@ async function promptNewFile(){
     }catch(e){setStatus(t('create_failed')+e.message);return;}
   }
   if(!S.session)return;
-  const name=await showPromptDialog({title:t('new_file_prompt'),placeholder:'filename.txt',confirmLabel:t('create')});
-  if(!name||!name.trim())return;
-  const relPath=S.currentDir==='.'?name.trim():(S.currentDir+'/'+name.trim());
+  const targetLabel=_workspaceCreateTargetLabel(targetDir);
+  const name=await showPromptDialog({
+    title:t('new_file_prompt_title', targetLabel),
+    placeholder:'filename.txt',
+    confirmLabel:t('create')
+  });
+  if(!name||!name.trim()) return;
+  const relPath=_workspaceJoinTargetPath(targetDir,name);
   try{
     await api('/api/file/create',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:relPath,content:''})});
     showToast(t('created')+name.trim());
+    delete S._dirCache[targetDir || '.'];
     await loadDir(S.currentDir);
     openFile(relPath);
   }catch(e){setStatus(t('create_failed')+e.message);}
 }
 
-async function promptNewFolder(){
-  // Same auto-create-session logic as promptNewFile for the blank page.
+async function promptNewFolder(targetDir = S.currentDir || '.'){
   if(!S.session){
     const ws=(typeof S._profileDefaultWorkspace==='string'&&S._profileDefaultWorkspace)||'';
     if(!ws) return;
@@ -11005,20 +11209,26 @@ async function promptNewFolder(){
     }catch(e){setStatus(t('folder_create_failed')+e.message);return;}
   }
   if(!S.session)return;
-  const name=await showPromptDialog({title:t('new_folder_prompt'),placeholder:'folder-name',confirmLabel:t('create')});
-  if(!name||!name.trim())return;
-  const relPath=S.currentDir==='.'?name.trim():(S.currentDir+'/'+name.trim());
+  const targetLabel=_workspaceCreateTargetLabel(targetDir);
+  const name=await showPromptDialog({
+    title:t('new_folder_prompt_title', targetLabel),
+    placeholder:'folder-name',
+    confirmLabel:t('create')
+  });
+  if(!name||!name.trim()) return;
+  const relPath=_workspaceJoinTargetPath(targetDir,name);
   try{
     await api('/api/file/create-dir',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:relPath})});
     showToast(t('folder_created')+name.trim());
+    delete S._dirCache[targetDir || '.'];
     await loadDir(S.currentDir);
-    // Offer to add the new folder as a space (#782)
-    const absPath=S.session.workspace?((S.currentDir==='.'?S.session.workspace:S.session.workspace+'/'+S.currentDir)+'/'+name.trim()):null;
+    const absPath=S.session.workspace?(targetDir==='.'?`${S.session.workspace}/${name.trim()}`:`${S.session.workspace}/${targetDir}/${name.trim()}`):null;
     if(absPath){
       const addAsSpace=await showConfirmDialog({
         title:t('folder_add_as_space_title'),
         message:t('folder_add_as_space_msg'),
         confirmLabel:t('folder_add_as_space_btn'),
+        cancelLabel:t('status_no'),
         focusCancel:true
       });
       if(addAsSpace){

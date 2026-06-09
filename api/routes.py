@@ -1105,6 +1105,7 @@ from api.config import (
     _save_yaml_config_file,
     reload_config,
     _cfg_lock,
+    PENDING_BG_TASK_COMPLETIONS,
 )
 from api.helpers import (
     require,
@@ -2255,6 +2256,7 @@ def _resolve_compatible_session_model_state(
     profile_provider: str | None = None,
     profile_default_model: str | None = None,
     explicit_model_pick: bool = False,
+    prefer_cached_catalog: bool = False,
 ) -> tuple[str, str | None, bool]:
     """Return (effective_model, effective_provider, model_was_normalized).
 
@@ -2276,6 +2278,16 @@ def _resolve_compatible_session_model_state(
     OpenRouter ``/models``, LM Studio ``/models``, credential pool refresh) —
     those used to wedge the handler for >100s and trigger 502s on default-60s
     reverse proxies, even though the WebUI itself eventually responded.
+
+    ``prefer_cached_catalog=True`` (ours-original) makes the catalog lookup
+    non-blocking: it resolves from the warm/disk cache or a network-free
+    minimal catalog and NEVER triggers a live per-provider rebuild (the
+    Copilot token-exchange HTTPS call that hangs a server-initiated wakeup
+    turn — see rebase report §1/§3/model-resolve-hang). Human-initiated
+    chat/start leaves this False to keep full live discovery; a session that
+    already has a persisted model still resolves correctly because the
+    persisted model wins over the catalog and the catalog is only consulted
+    for the default-model backstop.
     """
     model = str(model_id or "").strip()
     requested_provider = _clean_session_model_provider(model_provider)
@@ -2292,7 +2304,33 @@ def _resolve_compatible_session_model_state(
         if not explicit_provider and not stale_codex_openai_slash_id:
             return model, requested_provider, False
 
-    catalog = get_available_models()
+    # Default (human chat/start) path calls get_available_models() with NO
+    # kwargs so it stays signature-compatible with the many tests that stub
+    # get_available_models as a zero-arg callable. Only the server-side wakeup
+    # path (prefer_cached_catalog=True) opts into the cache-only mode. Some
+    # tests monkeypatch get_available_models as a zero-arg callable, so probe
+    # the (possibly monkeypatched) signature for ``prefer_cache`` rather than
+    # catching TypeError — a blanket ``except TypeError`` would also swallow a
+    # genuine TypeError raised *inside* get_available_models(prefer_cache=True)
+    # and silently fall back to the slow live provider rebuild that
+    # prefer_cached_catalog=True is meant to avoid.
+    if prefer_cached_catalog:
+        import inspect as _inspect
+
+        try:
+            _gam_accepts_prefer_cache = (
+                "prefer_cache" in _inspect.signature(get_available_models).parameters
+            )
+        except (TypeError, ValueError):
+            # Builtins / C-callables can refuse introspection; assume the
+            # zero-arg stub shape in that case.
+            _gam_accepts_prefer_cache = False
+        if _gam_accepts_prefer_cache:
+            catalog = get_available_models(prefer_cache=True)
+        else:
+            catalog = get_available_models()
+    else:
+        catalog = get_available_models()
     default_model = str(catalog.get("default_model") or DEFAULT_MODEL or "").strip()
 
     # Profile-aware resolution: when the caller supplies profile context
@@ -2547,6 +2585,17 @@ def _resolve_effective_session_model_for_display(session) -> str:
         requested_provider,
         profile_provider=_pp_provider,
         profile_default_model=_pp_default,
+        # GET /api/session is a hot, side-effect-free per-tab/per-poll path.
+        # It must never pay the cold live provider-catalog rebuild (a
+        # botocore IMDS probe that cannot resolve on a non-AWS / WSL / corp
+        # network, plus anthropic/openrouter /models). That rebuild is
+        # un-cacheable here (auth.json fingerprint churn) so every cold call
+        # cost ~10s and, run concurrently across browser tabs, serialized on
+        # the models-cache lock and starved SSE/streaming -> BrokenPipe storm
+        # (#multi-tab-streaming-interlock). The persisted session model is
+        # authoritative; the catalog is only a default-model backstop, which
+        # the network-free minimal catalog already provides.
+        prefer_cached_catalog=True,
     )
     return effective_model or original_model
 
@@ -2559,6 +2608,11 @@ def _resolve_effective_session_model_provider_for_display(session) -> str | None
         requested_provider,
         profile_provider=_pp_provider,
         profile_default_model=_pp_default,
+        # See _resolve_effective_session_model_for_display: same hot
+        # side-effect-free GET /api/session path; must not trigger the cold
+        # live rebuild. prefer_cached_catalog resolves from warm/disk cache
+        # or the network-free minimal catalog.
+        prefer_cached_catalog=True,
     )
     return provider
 
@@ -2833,7 +2887,7 @@ def _message_counts_as_renderable_for_window(message) -> bool:
     return bool(role and role != "tool")
 
 
-def _message_window_for_display(messages, msg_limit=None, msg_before=None) -> tuple[list, int]:
+def _message_window_for_display(messages, msg_limit=None, msg_before=None, expand_renderable=False) -> tuple[list, int]:
     """Return a paginated message window plus its offset in ``messages``.
 
     The normal fast path is a raw tail window. If that window contains no
@@ -2863,19 +2917,110 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None) -> tu
                 start_idx = max(0, end_idx - limit)
                 window = source[start_idx:end_idx]
                 break
+    if limit > 1 and window and expand_renderable:
+        # ``msg_limit`` is a raw-message transport cap, but the WebUI renders a
+        # filtered transcript: role=tool rows, empty separator assistants, and
+        # compression markers can all disappear. A long tool-heavy tail can
+        # therefore produce a cold reload that visibly contains only one or two
+        # messages plus a huge "Load earlier" button. Expand the raw window
+        # backwards until it contains roughly ``limit`` renderable transcript
+        # rows, while keeping the raw offset cursor honest.
+        #
+        # Gated behind the explicit ``expand_renderable`` flag, which the
+        # frontend sends ONLY on the initial cold-load fetch. It must NOT apply
+        # to the "Load earlier" cumulative path (which re-requests with a larger
+        # msg_limit and no msg_before) nor the msg_before fallback page — those
+        # keep the raw transport cap so one scroll-up can't pull a whole
+        # tool-heavy transcript back in a single response. Cold loads are the
+        # only place the "1-2 visible messages" cliff happens.
+        renderable_count = sum(1 for msg in window if _message_counts_as_renderable_for_window(msg))
+        if renderable_count < limit:
+            target_renderable = min(
+                limit,
+                sum(1 for msg in source if _message_counts_as_renderable_for_window(msg)),
+            )
+            while start_idx > 0 and renderable_count < target_renderable:
+                start_idx -= 1
+                if _message_counts_as_renderable_for_window(source[start_idx]):
+                    renderable_count += 1
+            window = source[start_idx:end_idx]
     return window, start_idx
+
+
+def _messages_start_with_visible_prefix(messages, prefix) -> bool:
+    """Return True when ``messages`` already replays ``prefix`` in display order."""
+    messages = list(messages or [])
+    prefix = list(prefix or [])
+    if not prefix:
+        return True
+    if len(messages) < len(prefix):
+        return False
+    try:
+        return all(
+            _session_message_visible_key(messages[idx]) == _session_message_visible_key(prefix_msg)
+            for idx, prefix_msg in enumerate(prefix)
+        )
+    except Exception:
+        return False
+
+
+def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) -> list:
+    """Return WebUI sidecar messages stitched across compression snapshots.
+
+    WebUI compression continuations persist the archived transcript in a parent
+    sidecar marked ``pre_compression_snapshot`` and keep subsequent turns in the
+    child sidecar. Opening the child alone makes older turns look lost. Stitch
+    only those snapshot parents for display; ordinary forks also carry
+    ``parent_session_id`` but must remain independent conversations.
+    """
+    segments = []
+    current = session
+    session_messages = list(getattr(session, "messages", []) or [])
+    seen = {str(getattr(session, "session_id", "") or "")}
+    for _ in range(max(0, int(max_hops))):
+        parent_id = str(getattr(current, "parent_session_id", "") or "").strip()
+        if not parent_id or parent_id in seen or not is_safe_session_id(parent_id):
+            break
+        parent = Session.load(parent_id)
+        if not parent or not getattr(parent, "pre_compression_snapshot", False):
+            break
+        if not segments and _messages_start_with_visible_prefix(
+            session_messages,
+            getattr(parent, "messages", []) or [],
+        ):
+            return session_messages
+        segments.append(parent)
+        seen.add(parent_id)
+        current = parent
+
+    if not segments:
+        return list(getattr(session, "messages", []) or [])
+
+    merged = []
+    for segment in reversed(segments):
+        merged = merge_session_messages_append_only(
+            merged,
+            getattr(segment, "messages", []) or [],
+            truncation_watermark=getattr(segment, "truncation_watermark", None),
+        )
+    return merge_session_messages_append_only(
+        merged,
+        getattr(session, "messages", []) or [],
+        truncation_watermark=None,
+    )
 
 
 def _merged_session_messages_for_display(session, cli_messages=None) -> list:
     """Return the message coordinate space exposed by ``GET /api/session``.
 
     Messaging sessions can have a WebUI sidecar transcript plus messages from
-    the Agent/CLI store. The frontend computes fork keep-counts against this
-    merged display list, so branch/fork must slice the same list rather than
-    the sidecar-only ``session.messages`` array.
+    the Agent/CLI store. WebUI compression continuations can have an archived
+    snapshot parent plus a child continuation sidecar. The frontend computes
+    fork keep-counts against this merged display list, so branch/fork must slice
+    the same list rather than the sidecar-only ``session.messages`` array.
     """
     cli_messages = list(cli_messages or [])
-    sidecar_messages = list(getattr(session, "messages", []) or [])
+    sidecar_messages = _webui_sidecar_lineage_messages_for_display(session)
     if cli_messages:
         if sidecar_messages and sidecar_messages != cli_messages:
             if len(sidecar_messages) >= len(cli_messages):
@@ -3274,6 +3419,7 @@ from api.models import (
     merge_session_messages_append_only,
     _active_stream_ids,
     _session_message_merge_key,
+    _session_message_visible_key,
     _is_empty_partial_activity_message,
     _hide_from_default_sidebar,
     prune_session_from_index,
@@ -3307,9 +3453,16 @@ from api.workspace import (
     _is_remote_terminal_backend,
     _workspace_blocked_roots,
 )
-from api.upload import handle_upload, handle_upload_extract, handle_transcribe, handle_workspace_upload
+from api.upload import (
+    handle_upload,
+    handle_upload_extract,
+    handle_transcribe,
+    handle_transcribe_capability,
+    handle_workspace_upload,
+)
 from api.streaming import (
     _sse,
+    _sse_set_write_deadline,
     _run_agent_streaming,
     cancel_stream,
     _materialize_pending_user_turn_before_error,
@@ -3519,6 +3672,15 @@ _LOGIN_LOCALE = {
         "btn": "Oturum a\u00e7",
         "invalid_pw": "Ge\u00e7ersiz \u015fifre",
         "conn_failed": "Ba\u011flant\u0131 ba\u015far\u0131s\u0131z",
+    },
+    "pl": {
+        "lang": "pl-PL",
+        "title": "Zaloguj si\u0119",
+        "subtitle": "Wpisz has\u0142o, aby kontynuowa\u0107",
+        "placeholder": "Has\u0142o",
+        "btn": "Zaloguj si\u0119",
+        "invalid_pw": "Nieprawid\u0142owe has\u0142o",
+        "conn_failed": "Po\u0142\u0105czenie nie powiod\u0142o si\u0119",
     },
 }
 
@@ -4980,6 +5142,30 @@ def _serve_manifest(handler) -> bool:
     return j(handler, {"error": "not found"}, status=404)
 
 
+def _saved_prompts_path() -> "Path":
+    try:
+        from api.profiles import get_active_hermes_home
+        return Path(get_active_hermes_home()).expanduser() / "webui" / "saved_prompts.json"
+    except Exception:
+        return Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser() / "webui" / "saved_prompts.json"
+
+
+def _load_saved_prompts() -> list:
+    p = _saved_prompts_path()
+    if not p.exists():
+        return []
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _save_saved_prompts(prompts: list) -> None:
+    p = _saved_prompts_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(prompts, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
 
@@ -5227,6 +5413,9 @@ def handle_get(handler, parsed) -> bool:
             pass
         return j(handler, settings)
 
+    if parsed.path == "/api/transcribe/capability":
+        return handle_transcribe_capability(handler)
+
     if parsed.path == "/api/reasoning":
         # Current reasoning config (shared source of truth with the CLI —
         # reads display.show_reasoning and agent.reasoning_effort from
@@ -5312,6 +5501,14 @@ def handle_get(handler, parsed) -> bool:
             msg_before = int(_msg_before) if _msg_before else None
         except (ValueError, TypeError):
             msg_before = None
+        # ?expand_renderable=1 — sent ONLY by the initial cold-load fetch. When
+        # set, the tail window is expanded backward until it holds ~msg_limit
+        # *renderable* rows (tool/separator/compression rows are UI-filtered) so
+        # a tool-heavy session doesn't cold-load showing 1-2 visible messages.
+        # The "Load earlier" cumulative path and msg_before pages do NOT send it,
+        # keeping their raw transport cap (#3790).
+        _expand_renderable = query.get("expand_renderable", [None])[0]
+        expand_renderable = str(_expand_renderable).strip() in ("1", "true", "True")
         try:
             _t1 = _time.monotonic()
             s = get_session(sid, metadata_only=(not load_messages))
@@ -5358,7 +5555,7 @@ def handle_get(handler, parsed) -> bool:
                     _all_msgs = _merged_session_messages_for_display(s, cli_messages)
                 else:
                     _all_msgs = merge_session_messages_append_only(
-                        s.messages,
+                        _webui_sidecar_lineage_messages_for_display(s),
                         state_db_messages,
                         truncation_watermark=getattr(s, "truncation_watermark", None),
                     )
@@ -5396,6 +5593,7 @@ def handle_get(handler, parsed) -> bool:
                     _all_msgs,
                     msg_limit=msg_limit,
                     msg_before=msg_before,
+                    expand_renderable=expand_renderable,
                 )
                 if msg_before is not None:
                     _before_idx = max(0, min(int(msg_before), len(_all_msgs)))
@@ -5862,6 +6060,9 @@ def handle_get(handler, parsed) -> bool:
             "other_profile_count": len(all_projects) - len(scoped),
         })
 
+    if parsed.path == "/api/prompts":
+        return j(handler, {"prompts": _load_saved_prompts()})
+
     if parsed.path == "/api/session/export":
         return _handle_session_export(handler, parsed)
 
@@ -6061,6 +6262,9 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/clarify/stream":
         return _handle_clarify_sse_stream(handler, parsed)
+
+    if parsed.path == "/api/session/stream":
+        return _handle_session_sse_stream(handler, parsed)
 
     if parsed.path == "/api/clarify/inject_test":
         # Loopback-only: used by automated tests; blocked from any remote client
@@ -6516,6 +6720,37 @@ def handle_post(handler, parsed) -> bool:
         finally:
             if diag:
                 diag.finish()
+    # T1 deprecation alias for the legacy ack endpoint that the pre-rename
+    # WebUI used to POST to after handling ``process_complete``. The new
+    # canonical SSE event is ``bg_task_complete`` and the new ack endpoint
+    # will be ``/api/bg-task-complete-ack`` (introduced by PR (b), the WebUI
+    # half of the split). Until PR (b) lands we keep the old path responding
+    # with HTTP 410 Gone + ``X-Replaced-By`` so any stale tab posting under
+    # the old name fails loudly with a discoverable hint. The handler runs
+    # BEFORE the CSRF gate on purpose: an old tab will not carry a CSRF token
+    # for the deprecated path, and surfacing 410 (not 403) is the correct
+    # contract here.
+    if parsed.path == "/api/process-complete-ack":
+        if diag:
+            diag.stage("process_complete_ack_deprecated")
+        try:
+            j(
+                handler,
+                {
+                    "error": (
+                        "gone: /api/process-complete-ack was replaced by "
+                        "/api/bg-task-complete-ack as part of the "
+                        "process_complete -> bg_task_complete event rename"
+                    ),
+                    "replaced_by": "/api/bg-task-complete-ack",
+                },
+                status=410,
+                extra_headers={"X-Replaced-By": "/api/bg-task-complete-ack"},
+            )
+            return True
+        finally:
+            if diag:
+                diag.finish()
     # CSRF: reject cross-origin or tokenless authenticated browser requests.
     # /api/auth/login has no authenticated session token yet, and /api/csp-report
     # is intentionally unauthenticated for browser-generated violation reports.
@@ -6596,6 +6831,21 @@ def handle_post(handler, parsed) -> bool:
             logger.exception("dashboard config save failed")
             bad(handler, str(exc), status=500)
         return True
+
+    if parsed.path == "/api/prompts":
+        text = str(body.get("text") or "").strip()
+        label = str(body.get("label") or "").strip()
+        if not text:
+            return bad(handler, "text is required")
+        if len(text) > 8000:
+            return bad(handler, "text too long (max 8000 chars)")
+        prompts = _load_saved_prompts()
+        if len(prompts) >= 200:
+            return bad(handler, "saved prompts limit reached (max 200)")
+        new_prompt = {"id": uuid.uuid4().hex[:12], "label": label or text[:60], "text": text, "created_at": time.time()}
+        prompts.append(new_prompt)
+        _save_saved_prompts(prompts)
+        return j(handler, {"ok": True, "prompt": new_prompt})
 
     if parsed.path == "/api/session/new":
         try:
@@ -7166,6 +7416,23 @@ def handle_post(handler, parsed) -> bool:
             shutil.rmtree(_session_attachment_dir(sid), ignore_errors=True)
         except Exception:
             logger.debug("Failed to clean attachment dir for deleted session %s", sid)
+        # Remove the turn-journal shards and the run-journal directory so a
+        # deleted conversation is not recoverable from disk. The session JSON +
+        # state.db rows are cleared above, but these journals retain the user's
+        # messages (turn journal) and the full request/response payloads (run
+        # journal) in plaintext. (#3802)
+        try:
+            from api.turn_journal import delete_turn_journal
+
+            delete_turn_journal(sid)
+        except Exception:
+            logger.debug("Failed to delete turn journal for deleted session %s", sid)
+        try:
+            from api.run_journal import delete_run_journal
+
+            delete_run_journal(sid)
+        except Exception:
+            logger.debug("Failed to delete run journal for deleted session %s", sid)
         # Prune the per-session agent lock so deleted sessions don't leak
         # Lock entries in SESSION_AGENT_LOCKS forever.
         with SESSION_AGENT_LOCKS_LOCK:
@@ -7446,6 +7713,9 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/goal":
         return _handle_goal_command(handler, body)
+
+    if parsed.path == "/api/bg-task-complete-ack":
+        return _handle_bg_task_complete_ack(handler, body)
 
     if parsed.path == "/api/chat/start":
         return _handle_chat_start(handler, body, diag=diag)
@@ -8445,6 +8715,14 @@ def handle_delete(handler, parsed) -> bool:
     if parsed.path.startswith("/api/mcp/servers/"):
         name = parsed.path[len("/api/mcp/servers/"):]
         return _handle_mcp_server_delete(handler, name)
+    if parsed.path == "/api/prompts":
+        pid = str(body.get("id") or "").strip()
+        if not pid:
+            return bad(handler, "id is required")
+        prompts = [p for p in _load_saved_prompts() if p.get("id") != pid]
+        _save_saved_prompts(prompts)
+        return j(handler, {"ok": True})
+
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_delete
 
@@ -8953,6 +9231,7 @@ def _handle_sse_stream(handler, parsed):
     handler.send_header("X-Accel-Buffering", "no")
     handler.send_header("Connection", "close")
     handler.end_headers()
+    _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
     replay_cutoff_seq = None
     if qs.get("replay", [""])[0] or qs.get("after_seq", [None])[0] not in (None, "") or qs.get("after_event_id", [None])[0]:
         snapshot_cutoff_seq = _run_journal_same_run_seq(
@@ -9132,6 +9411,7 @@ def _handle_terminal_output(handler, parsed):
     handler.send_header("X-Accel-Buffering", "no")
     handler.send_header("Connection", "close")
     handler.end_headers()
+    _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
     try:
         while True:
             try:
@@ -9217,6 +9497,7 @@ def _handle_gateway_sse_stream(handler, parsed):
     # session list every ~1s. Letting the server close the socket
     # naturally after the stream ends is sufficient.
     handler.end_headers()
+    _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
 
     q = watcher.subscribe()
     try:
@@ -10292,6 +10573,7 @@ def _handle_approval_sse_stream(handler, parsed):
     handler.send_header('X-Accel-Buffering', 'no')
     handler.send_header('Connection', 'close')
     handler.end_headers()
+    _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
 
     from api.streaming import _sse
 
@@ -10393,6 +10675,7 @@ def _handle_clarify_sse_stream(handler, parsed):
     handler.send_header('X-Accel-Buffering', 'no')
     handler.send_header('Connection', 'close')
     handler.end_headers()
+    _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
 
     from api.streaming import _sse
 
@@ -10414,6 +10697,126 @@ def _handle_clarify_sse_stream(handler, parsed):
         pass
     finally:
         clarify_sse_unsubscribe(sid, q)
+
+
+def _handle_session_sse_stream(handler, parsed):
+    """SSE endpoint for the persistent per-session channel (Option X).
+
+    Subscribes to ``api.background_process.SESSION_CHANNELS[sid]`` — a channel
+    that lives across agent turns (unlike STREAMS, which is torn down at
+    end-of-turn). Used to deliver ``bg_task_complete`` events that fire while
+    no agent turn is active.
+
+    Lifecycle: opened by the frontend at session mount, closed at unmount or
+    on tab close. Multiple tabs share one SessionChannel (refcounted via
+    subscribe/unsubscribe). 30s SSE keepalive comments keep the proxy alive.
+    Reaper-driven idle TTL (default 4h) prevents zombie channels.
+    """
+    sid = parse_qs(parsed.query).get("session_id", [""])[0]
+    if not sid:
+        return bad(handler, "session_id is required")
+
+    from api.background_process import (
+        subscribe_to_session_channel,
+        active_stream_id_for_session,
+    )
+
+    # Atomic get-or-create + subscribe under SESSION_CHANNELS_LOCK. Doing these
+    # two steps separately (get_or_create_session_channel then ch.subscribe)
+    # left a TOCTOU gap where the reaper — which also holds
+    # SESSION_CHANNELS_LOCK and collects idle 0-subscriber channels in one
+    # critical section — could collect the channel between the two calls,
+    # orphaning this subscriber on a channel no longer in SESSION_CHANNELS.
+    # bg_task_complete emits would then never reach this queue. See
+    # subscribe_to_session_channel for the full rationale (PR #2971 Greptile P1).
+    ch, q = subscribe_to_session_channel(sid, maxsize=64)
+
+    # NOTE: ``subscribe_to_session_channel`` above acquires a subscriber slot
+    # that MUST be released on every exit path. Header setup
+    # (``send_response`` / ``send_header`` / ``end_headers`` /
+    # ``_sse_set_write_deadline``) and the initial-frame + on-subscribe
+    # recovery writes below all touch the socket and can raise a member of
+    # ``_CLIENT_DISCONNECT_ERRORS`` (BrokenPipeError / ConnectionResetError) if
+    # the client drops immediately after subscribing. If that happened outside
+    # this try/finally the ``ch.unsubscribe(q)`` cleanup would be skipped,
+    # permanently leaking a subscriber. Because
+    # ``SessionChannel.reaper_should_collect()`` refuses to collect any channel
+    # with ``sub_count > 0``, a single ghost subscriber blocks the reaper
+    # forever and the channel zombies in SESSION_CHANNELS. So EVERYTHING from
+    # the subscribe onward — header setup included — runs inside one
+    # try/finally that unconditionally unsubscribes.
+    try:
+        handler.send_response(200)
+        handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        handler.send_header('Cache-Control', 'no-cache')
+        handler.send_header('X-Accel-Buffering', 'no')
+        # #3103: omit the Connection header — rely on the HTTP/1.1 keep-alive
+        # default, matching the other long-lived SSE handlers (gateway/session
+        # events) that fixed the reconnect-storm. An explicit value here is a
+        # third, inconsistent approach (greptile flag).
+        handler.end_headers()
+        _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
+
+        from api.streaming import _sse
+
+        # Push an initial frame so the client has confirmation the channel is
+        # live (mirrors approval/clarify which send an 'initial' frame). No
+        # snapshot data is needed — this channel only carries forward-looking
+        # events, not pending state.
+        _sse(handler, 'initial', {"session_id": sid})
+
+        # ── Open-tab live-view self-heal (root cause: lost server_turn_started) ──
+        # The `server_turn_started` fan-out (routes.start_session_turn) is a
+        # fire-and-forget SessionChannel.emit with NO replay buffer: it reaches
+        # only the subscribers connected at the exact emit instant. A tab whose
+        # per-session EventSource was momentarily absent at that instant — a
+        # transient SSE drop, a reverse-proxy idle-timeout, or browser
+        # connection-pool starvation (all common behind a corporate proxy) —
+        # misses the frame permanently, so a SERVER-initiated wakeup turn never
+        # renders live and the user must hard-refresh (the reported defect). The
+        # server-side wakeup itself ran and persisted fine; only the live-view
+        # was lost. On (re)subscribe, if the session has a live run RIGHT NOW,
+        # replay a synthetic `server_turn_started` to THIS new subscriber so the
+        # open tab attaches its existing chat-stream renderer (attachLiveStream)
+        # and self-heals with no refresh. `recovered: True` lets the frontend
+        # use the replay (reconnecting) attach so the renderer picks up the
+        # in-progress stream from the run journal rather than expecting token 0.
+        # Idempotent: the frontend dedupes by (session_id, stream_id) — if the
+        # original frame WAS delivered this is a harmless no-op there.
+        try:
+            recover_stream_id = active_stream_id_for_session(sid)
+            if recover_stream_id:
+                _sse(handler, 'server_turn_started', {
+                    "session_id": sid,
+                    "stream_id": recover_stream_id,
+                    "source": "subscribe_recovery",
+                    "recovered": True,
+                })
+        except _CLIENT_DISCONNECT_ERRORS:
+            # Client vanished mid-recovery — re-raise so the outer handler
+            # treats it as a normal disconnect and the finally still cleans up.
+            raise
+        except Exception:
+            logger.debug(
+                "session-stream on-subscribe recovery failed for %s", sid,
+                exc_info=True,
+            )
+
+        while True:
+            try:
+                payload = q.get(timeout=_SSE_HEARTBEAT_INTERVAL_SECONDS)
+            except queue.Empty:
+                handler.wfile.write(b': keepalive\n\n')
+                handler.wfile.flush()
+                continue
+            if payload is None:
+                break
+            event_name, data = payload
+            _sse(handler, event_name, data)
+    except _CLIENT_DISCONNECT_ERRORS:
+        pass  # client went away — normal for long-lived connections
+    finally:
+        ch.unsubscribe(q)
 
 
 def _handle_clarify_inject(handler, parsed):
@@ -10614,15 +11017,15 @@ def _handle_live_models(handler, parsed):
                                 ids = [m.get("id", "") for m in _data if m.get("id")]
                         elif isinstance(_body, list):
                             ids = [m.get("id", m) if isinstance(m, dict) else m for m in _body]
-                        
+
                         if ids:
                             logger.debug("Live-fetched %d models from custom provider %s", len(ids), _base_url)
                         else:
                             logger.debug("Custom provider returned no models from %s", _base_url)
-                    
+
                     except Exception as _fetch_err:
                         logger.debug("Live fetch from custom provider failed: %s", _fetch_err)
-                
+
                 # If live fetch succeeded, merge with config entries (live takes
                 # priority).  If live fetch failed, fall back to config-only list.
                 if ids:
@@ -11227,6 +11630,15 @@ def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, st
     if attachments:
         user_msg["attachments"] = list(attachments)
     s.messages.append(user_msg)
+    # The new user turn is now committed to messages (#3831): a positive
+    # truncation watermark from a prior retry/undo/edit has been superseded and
+    # must retire, else it freezes at the old edit boundary and later drops these
+    # post-edit turns on an empty-sidecar reconcile. Safe here (not at chat-start)
+    # because the row is durably in messages, so the merge's max-sidecar guard now
+    # suppresses the replaced tail without the watermark. Cleared to None — never
+    # 0.0, which is the truncate-to-empty sentinel (#2914).
+    if getattr(s, "truncation_watermark", None):
+        s.truncation_watermark = None
 
 
 def _is_default_or_empty_session_title(title) -> bool:
@@ -11327,6 +11739,52 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
     return False
 
 
+def _active_run_stream_for_session(session_id: str | None) -> str | None:
+    """Return a live worker stream for this session even if sidecar stream id is clear.
+
+    cancel_stream() intentionally clears ``session.active_stream_id`` before the
+    worker thread fully exits so Stop remains responsive. During that unwind
+    window ACTIVE_RUNS is the worker-lifecycle truth; a successor chat/start for
+    the same session must wait or it can reuse the cached agent while the old
+    interrupt is still landing (#3808).
+
+    Bounded: the post-cancel unwind is short (dominated by the worker finally's
+    ``_ckpt_thread.join(timeout=15)``), and ``unregister_active_run`` runs in that
+    finally, so a healthy worker leaves ACTIVE_RUNS within seconds. A detached /
+    wedged worker that never reaches its finally (e.g. stuck in a provider call,
+    or leaked by SIGKILL without restart) must NOT 409 the session forever — so an
+    entry older than the unwind ceiling (180s) is treated as stale and ignored
+    here. A legitimately long-running turn keeps ``active_stream_id`` SET
+    and is handled by ``_active_stream_blocks_chat_start`` above; this guard only
+    covers the cleared-stream-id unwind window. (Codex brick-gate hardening, #3822.)
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    ceiling = 180.0  # generous vs the 15s checkpoint-join unwind; finite to avoid permanent-409
+    now = time.time()
+    try:
+        from api import config as _live_config
+        with _live_config.ACTIVE_RUNS_LOCK:
+            for run_stream_id, raw in (_live_config.ACTIVE_RUNS or {}).items():
+                stream_id = str((raw or {}).get("stream_id") or run_stream_id or "").strip()
+                run_sid = str((raw or {}).get("session_id") or "").strip()
+                if run_sid != sid or not stream_id:
+                    continue
+                try:
+                    started_at = float((raw or {}).get("started_at") or 0)
+                except (TypeError, ValueError):
+                    started_at = 0.0
+                # Ignore a stale/wedged entry past the unwind ceiling so it can't
+                # block the session permanently.
+                if started_at and (now - started_at) > ceiling:
+                    continue
+                return stream_id
+    except Exception:
+        return None
+    return None
+
+
 def _start_chat_stream_for_session(
     s,
     *,
@@ -11365,6 +11823,14 @@ def _start_chat_stream_for_session(
         goal_related = True
         PENDING_GOAL_CONTINUATION.discard(s.session_id)
 
+    # process_complete wakeup (ours-original, Option B): if this session has a
+    # pending process_complete marker (set by api/background_process.py drain),
+    # discard it atomically here. Mirrors the goal_continue pattern (#1932).
+    # The marker is server-internal telemetry; the actual wakeup is delivered
+    # either server-side (Option Z) or via the PR #2279 next-turn drain.
+    if s.session_id in PENDING_BG_TASK_COMPLETIONS:
+        PENDING_BG_TASK_COMPLETIONS.discard(s.session_id)
+
     session_lock = _get_session_agent_lock(s.session_id)
     diag.stage("session_lock_wait") if diag else None
     while True:
@@ -11380,6 +11846,14 @@ def _start_chat_stream_for_session(
                     }
                 needs_stale_cleanup = True
             else:
+                blocking_run_stream_id = _active_run_stream_for_session(s.session_id)
+                if blocking_run_stream_id:
+                    diag.stage("response_write") if diag else None
+                    return {
+                        "error": "session already has an active stream",
+                        "active_stream_id": blocking_run_stream_id,
+                        "_status": 409,
+                    }
                 needs_stale_cleanup = False
                 stream_id = uuid.uuid4().hex
                 diag.stage("save_pending_state") if diag else None
@@ -11512,6 +11986,263 @@ def _runtime_adapter_goal_action(goal_args: str) -> str:
     if action in ("clear", "stop", "done"):
         return "clear"
     return "set"
+
+
+def _start_run(
+    s,
+    *,
+    msg: str,
+    attachments,
+    workspace: str,
+    model,
+    model_provider,
+    normalized_model,
+    source: str,
+    route: str,
+    diag=None,
+):
+    """Shared start-run helper for /api/chat/start and start_session_turn.
+
+    Centralizes the runtime-adapter selection block (Q-2979-A2 / Copilot
+    discussion_r3305864087/r3305864173) so both entrypoints honor
+    ``runtime_adapter_enabled()`` / ``runtime_adapter_runner_enabled()`` the
+    same way. Prior to this helper ``start_session_turn`` bypassed the
+    adapter path entirely, so a process-wakeup turn skipped the adapter that
+    a human-typed turn would have hit — a behavioral divergence.
+
+    ``source`` is the StartRunRequest.source (``"webui"`` for browser POSTs,
+    ``"process_wakeup"`` for the drain-thread wakeup). ``route`` is the
+    metadata.route label that lands on the run record for observability.
+
+    Returns a dict with ``_status`` plus the legacy chat-start response
+    fields (``stream_id``, ``session_id``, etc.). Adapter selection that
+    returns no adapter is surfaced as ``{"error": str(exc), "_status": 501}``
+    so both call sites can map it onto their own HTTP shape.
+    """
+    from api.runtime_adapter import (
+        LegacyJournalRuntimeAdapter,
+        StartRunRequest,
+        build_runtime_adapter,
+        runtime_adapter_enabled,
+        runtime_adapter_runner_enabled,
+    )
+
+    if runtime_adapter_enabled() or runtime_adapter_runner_enabled():
+        def _legacy_start_run(request: StartRunRequest) -> dict:
+            return _start_chat_stream_for_session(
+                s,
+                msg=request.message,
+                attachments=request.attachments,
+                workspace=request.workspace or workspace,
+                model=request.model or model,
+                model_provider=request.provider or model_provider,
+                normalized_model=normalized_model,
+                diag=diag,
+            )
+
+        def _legacy_adapter_factory():
+            return LegacyJournalRuntimeAdapter(start_run_delegate=_legacy_start_run)
+
+        try:
+            adapter = build_runtime_adapter(
+                legacy_adapter_factory=_legacy_adapter_factory,
+                runner_client_factory=_runtime_runner_client_factory,
+            )
+            if adapter is None:
+                raise NotImplementedError("runtime adapter selection returned no adapter")
+            result = adapter.start_run(
+                StartRunRequest(
+                    session_id=s.session_id,
+                    message=msg,
+                    attachments=attachments,
+                    workspace=workspace,
+                    profile=getattr(s, "profile", None),
+                    provider=model_provider,
+                    model=model,
+                    source=source,
+                    metadata={"route": route},
+                )
+            )
+        except NotImplementedError as exc:
+            return {"error": str(exc), "_status": 501}
+        return _chat_start_response_from_run_start(result)
+
+    return _start_chat_stream_for_session(
+        s,
+        msg=msg,
+        attachments=attachments,
+        workspace=workspace,
+        model=model,
+        model_provider=model_provider,
+        normalized_model=normalized_model,
+        diag=diag,
+    )
+
+
+def start_session_turn(
+    session_id: str,
+    message: str,
+    *,
+    source: str = "process_wakeup",
+):
+    """Start a server-side agent turn for ``session_id`` with ``message``.
+
+    Option Z primary wakeup entrypoint. This is the minimal, HTTP-handler-free
+    core that ``/api/chat/start`` already reaches via ``_handle_chat_start`` →
+    ``_start_chat_stream_for_session``. The drain thread
+    (``api/background_process._process_one``) calls this directly with a
+    synthetic ``[IMPORTANT: …]`` wakeup_prompt so a background process can wake
+    the agent server-side with NO browser round-trip — exactly how CLI /
+    gateway self-wake from a ``notify_on_complete`` completion.
+
+    Contract:
+      - Resolves the session record (profile/workspace/model/model_provider are
+        already persisted on it; no user auth needed — same trust level as
+        gateway/cron starting a turn).
+      - Resolves workspace + model/provider through the SAME helpers
+        ``_handle_chat_start`` uses, so a process-wakeup turn is constructed
+        identically to a human-typed turn. If the session record has no model
+        persisted, ``_resolve_compatible_session_model_state`` falls back to the
+        configured default model/provider (documented in the impl report §1).
+      - Delegates to ``_start_chat_stream_for_session`` which spawns the agent
+        on a daemon worker thread (the drain thread NEVER blocks) and serializes
+        on the per-session agent lock + active-stream guard, so a concurrent
+        human ``/api/chat/start`` cannot double-start (one wins, the other gets
+        the existing 409 "session already has an active stream").
+
+    Returns the same dict ``_start_chat_stream_for_session`` returns, including
+    ``_status`` (200 on start, 409 when a turn is already active). On 409 the
+    caller must leave the ``PENDING_BG_TASK_COMPLETIONS`` marker in place so the
+    PR #2279 next-turn drain delivers the wakeup when the active turn ends.
+    """
+    msg = str(message or "").strip()
+    if not msg:
+        return {"error": "message is required", "_status": 400}
+    try:
+        s = get_session(session_id)
+    except KeyError:
+        return {"error": "Session not found", "_status": 404}
+
+    try:
+        workspace = _resolve_chat_workspace_with_recovery(s, None)
+    except ValueError as e:
+        return {"error": str(e), "_status": 400}
+
+    requested_model = s.model
+    requested_provider = getattr(s, "model_provider", None)
+    # Server-initiated wakeup (Option Z): resolve persisted model via the
+    # standard helper in cache-only mode so wakeups never trigger a cold
+    # catalog rebuild. Thread the session's PROFILE model defaults through too
+    # (mirrors _handle_chat_start) — a brand-new session that spawned a
+    # background task before its first human turn has an empty s.model, and
+    # without the profile defaults the resolver would fall back to the global
+    # DEFAULT_MODEL instead of the profile's configured default (greptile flag).
+    _pp_provider, _pp_default = _read_profile_model_config(s, requested_provider)
+    model, model_provider, normalized_model = _resolve_compatible_session_model_state(
+        requested_model,
+        requested_provider,
+        profile_provider=_pp_provider,
+        profile_default_model=_pp_default,
+        prefer_cached_catalog=True,
+    )
+    resp = _start_run(
+        s,
+        msg=msg,
+        attachments=[],
+        workspace=workspace,
+        model=model,
+        model_provider=model_provider,
+        normalized_model=normalized_model,
+        source="process_wakeup",
+        route="start_session_turn",
+    )
+
+    # ── Defect B: live-view of server-initiated turns ──────────────────────
+    # Option Z starts this turn server-side, so NO browser EventSource is
+    # attached to the new STREAMS[stream_id] (the browser only opens
+    # /api/chat/stream when IT POSTs /api/chat/start). An already-open tab
+    # would therefore see nothing until a manual refresh re-reads persisted
+    # state. Fix: fan a lightweight `server_turn_started` {stream_id} frame
+    # onto the persistent per-session live-view channel. messages.js handles
+    # it by attaching its EXISTING chat-stream renderer (attachLiveStream) to
+    # that stream_id — no second renderer, no chat/start POST.
+    #
+    # Idempotent with the closed-tab path: get_session_channel() is the
+    # NON-creating accessor, so when no tab is open this is a pure no-op and
+    # the server-side wakeup (the Option Z headline) is completely unaffected.
+    # If the user also has the per-turn chat-stream open, the frontend dedupes
+    # by stream_id so there is no double-render.
+    try:
+        status = int((resp or {}).get("_status", 200) or 200)
+        stream_id = (resp or {}).get("stream_id")
+        if status < 400 and stream_id:
+            from api.background_process import get_session_channel
+
+            ch = get_session_channel(session_id)
+            if ch is not None:
+                ch.emit(
+                    "server_turn_started",
+                    {
+                        "session_id": str(session_id),
+                        "stream_id": str(stream_id),
+                        "source": source,
+                    },
+                )
+    except Exception:
+        logger.debug(
+            "server_turn_started fan-out failed for session %s", session_id, exc_info=True
+        )
+    return resp
+
+
+def _handle_bg_task_complete_ack(handler, body):
+    """Acknowledge a bg_task_complete SSE event (diagnostic only).
+
+    Option Z PIVOT: the agent wakeup is now started SERVER-SIDE by the drain
+    thread (``api/background_process._process_one`` → ``start_session_turn``)
+    with NO browser round-trip — the closed-tab case works (parity with
+    CLI/Telegram). The frontend no longer re-POSTs ``wakeup_prompt`` to
+    /api/chat/start; the per-session SSE channel is demoted to pure live-view.
+
+    This endpoint is therefore a pure no-op for state — it exists so an open
+    tab can confirm receipt of the live-view event and so a future follow-up
+    (analytics, telemetry) has a stable hook. ``PENDING_BG_TASK_COMPLETIONS``
+    is consumed by ``_start_chat_stream_for_session`` when the server-side
+    wakeup turn (or the next human turn / PR #2279 next-turn drain) runs.
+    """
+    from api.helpers import j
+
+    try:
+        require(body, "session_id")
+    except ValueError as e:
+        return bad(handler, str(e))
+    sid = str(body.get("session_id") or "").strip()
+    try:
+        s = get_session(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    # process_id accepted as transitional alias; see Deprecation response header
+    # + maintainer decision on removal milestone / future Sunset header. Only
+    # flag Deprecation when the alias was ACTUALLY used (i.e. process_id present
+    # and not empty), even if task_id is also present.
+    _task_id_present = bool(str(body.get("task_id") or "").strip())
+    _process_id_present = bool(str(body.get("process_id") or "").strip())
+    legacy_process_id_used = _process_id_present
+    pid = str(body.get("task_id") or body.get("process_id") or "").strip()
+    # Post Option-Z pivot this endpoint owns no state: the server-side drain
+    # thread starts the wakeup turn, the browser never re-POSTs /api/chat/start.
+    # `noop` is returned so the diagnostic shape stays explicit about that and
+    # matches the docstring ("pure no-op for state").
+    return j(
+        handler,
+        {
+            "ok": True,
+            "session_id": s.session_id,
+            "task_id": pid,
+            "noop": True,
+        },
+        extra_headers={"Deprecation": "true"} if legacy_process_id_used else {},
+    )
 
 
 def _handle_goal_command(handler, body):
@@ -11719,64 +12450,27 @@ def _handle_chat_start(handler, body, diag=None):
             profile_default_model=_pp_default,
             explicit_model_pick=explicit_model_pick,
         )
-        from api.runtime_adapter import (
-            LegacyJournalRuntimeAdapter,
-            StartRunRequest,
-            build_runtime_adapter,
-            runtime_adapter_enabled,
-            runtime_adapter_runner_enabled,
+        # NOTE: runtime-adapter selection is delegated to _start_run (shared
+        # with start_session_turn so both entry points behave identically
+        # under runtime_adapter_enabled() / runtime_adapter_runner_enabled()
+        # — Q-2979-A2 / Copilot discussion_r3305864087/r3305864173).
+        response = _start_run(
+            s,
+            msg=msg,
+            attachments=attachments,
+            workspace=workspace,
+            model=model,
+            model_provider=model_provider,
+            normalized_model=normalized_model,
+            source="webui",
+            route="/api/chat/start",
+            diag=diag,
         )
-
-        if runtime_adapter_enabled() or runtime_adapter_runner_enabled():
-            def _legacy_start_run(request: StartRunRequest) -> dict:
-                return _start_chat_stream_for_session(
-                    s,
-                    msg=request.message,
-                    attachments=request.attachments,
-                    workspace=request.workspace or workspace,
-                    model=request.model or model,
-                    model_provider=request.provider or model_provider,
-                    normalized_model=normalized_model,
-                    diag=diag,
-                )
-
-            def _legacy_adapter_factory():
-                return LegacyJournalRuntimeAdapter(start_run_delegate=_legacy_start_run)
-
-            try:
-                adapter = build_runtime_adapter(
-                    legacy_adapter_factory=_legacy_adapter_factory,
-                    runner_client_factory=_runtime_runner_client_factory,
-                )
-                if adapter is None:
-                    raise NotImplementedError("runtime adapter selection returned no adapter")
-                result = adapter.start_run(
-                    StartRunRequest(
-                        session_id=s.session_id,
-                        message=msg,
-                        attachments=attachments,
-                        workspace=workspace,
-                        profile=getattr(s, "profile", None),
-                        provider=model_provider,
-                        model=model,
-                        source="webui",
-                        metadata={"route": "/api/chat/start"},
-                    )
-                )
-            except NotImplementedError as exc:
-                return j(handler, {"error": str(exc)}, status=501)
-            response = _chat_start_response_from_run_start(result)
-        else:
-            response = _start_chat_stream_for_session(
-                s,
-                msg=msg,
-                attachments=attachments,
-                workspace=workspace,
-                model=model,
-                model_provider=model_provider,
-                normalized_model=normalized_model,
-                diag=diag,
-            )
+        # Map adapter-selection NotImplementedError (501) onto the legacy
+        # bad-request response shape that this route exposed historically
+        # before the helper extraction.
+        if response.get("_status") == 501 and "error" in response:
+            return j(handler, {"error": response["error"]}, status=501)
         status = int(response.pop("_status", 200) or 200)
         diag.stage("response_write") if diag else None
         return j(handler, response, status=status)
@@ -12043,6 +12737,7 @@ def _handle_cron_create(handler, body):
             deliver=body.get("deliver") or "local",
             skills=body.get("skills") or [],
             model=body.get("model") or None,
+            provider=body.get("provider") or None,
         )
         post_create_updates = {}
         if profile is not None:
@@ -12085,6 +12780,8 @@ def _handle_cron_update(handler, body):
                 continue
             if k == "profile":
                 updates[k] = _normalize_cron_profile_value(v)
+            elif k in ("model", "provider"):
+                updates[k] = v if v else None
             elif v is not None:
                 updates[k] = v
     except ValueError as e:
@@ -13534,10 +14231,7 @@ def _handle_session_compress(handler, body):
         txt = raw_text.strip()
         if not txt:
             return None
-        txt = re.sub(r"\s+", " ", txt)
-        if len(txt) > 320:
-            txt = f"{txt[:314]}…"
-        return txt
+        return re.sub(r"\s+", " ", txt)
 
     try:
         require(body, "session_id")
