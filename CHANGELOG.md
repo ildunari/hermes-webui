@@ -3,6 +3,110 @@
 
 ## [Unreleased]
 
+## [v0.51.359] — 2026-06-11 — Release LW (assistant turn anchor phase 0 scaffold)
+
+### Added
+
+- **Internal Stable Assistant Turn Anchors Phase 0 scaffold.** The browser now ships an inert `HermesAssistantTurnAnchors` helper surface plus a documented state-layer inventory for #3926, pinning current live/replay/settled source classifications and event dedupe precedence without changing visible chat rendering.
+- **New RFC: Stable Assistant Turn Anchors for Live-to-Final rendering.** Defines a frontend presentation/reconciliation model for anchoring one assistant turn across live streaming, settlement, replay/reload/recovery, Compact Worklog, Transparent Stream, terminal states, artifacts, and side effects. (#3926)
+
+## [v0.51.358] — 2026-06-11 — Release LV (first-run password bootstrap hardening)
+
+### Security
+
+- **First-run password setup is now gated to local clients.** While auth is disabled, `POST /api/settings` is intentionally reachable without a session for local first-run setup — but setting `_set_password` establishes WebUI ownership and issues a session. A non-local unauthenticated client could previously win first-run ownership by posting `_set_password`. First-password bootstrap is now gated the same way as onboarding setup (loopback/private networks only, or an explicit `HERMES_WEBUI_ONBOARDING_OPEN=1` opt-in for remote bootstrap), evaluated against the auth state captured at the start of the request. Normal authenticated password changes after auth is enabled are unaffected. (#3964)
+
+## [v0.51.357] — 2026-06-11 — Release LU (mid-stream flicker tie fix)
+
+### Fixed
+
+- **Eliminated the residual mid-stream flicker where streamed text could briefly disappear and reappear (#3877 reopen).** The #3877 fix preserves the live assistant turn's DOM node across a mid-stream `renderMessages()` rebuild, but only re-attached it when the rebuilt turn had *strictly less* streamed text than the preserved (parser-referenced) node (`_rebuiltLen < _preservedLen`). At the throttled session write-back boundary the rebuilt turn's live content can *equal* the preserved length, so the strict guard skipped the swap and left the streaming parser writing into the now-detached node — the leftover blank frame. The guard now restores the preserved node on a tie as well (`<=`), and the swap is done at the segment level (replacing only the rebuilt live segment) so a multi-segment turn keeps the rebuilt structure (earlier segments, tool/worklog groups) intact. (#3877)
+
+## [v0.51.356] — 2026-06-11 — Release LT (per-profile providers & models)
+
+### Fixed
+
+- **On a non-default profile, Settings → Providers no longer times out and the model picker now shows that profile's configured providers/models.** WebUI profile switching is per-client/cookie-scoped (#798), but the read-only `GET /api/providers` and `GET /api/models` endpoints resolved provider credentials from the process-global default profile instead of the active per-request one, and the `/api/models` disk cache was a single file shared across all profiles (whose profile-specific fingerprint forced a cold rebuild — and the serial provider probes behind it — on every non-default-profile open, pushing the request past the 30s frontend timeout). Both endpoints now apply the active profile's `.env` for the duration of the read (mirroring streaming, including the detached models-rebuild worker), and the models disk cache is profile-keyed (`models_cache.<profile>.json`), so each profile keeps its own warm cache and resolves its own credentials. The default profile is unaffected (the env-wrap is a no-op and the cache filename is unchanged). (#3957)
+
+## [v0.51.355] — 2026-06-10 — Release LS (conversation outline panel)
+
+### Added
+
+- **Opt-in conversation outline panel for long chats.** A new desktop-only, off-by-default floating panel (enable it under Settings → Preferences → "Show conversation outline") lists the questions you've asked in the current conversation as a numbered jump-list — click an entry to scroll straight to that point and flash it. It offsets itself when the workspace panel is open so the two never overlap, and it's strictly a chat-view affordance: switching to Settings / Tasks / Insights / any other panel hides the toggle and closes the panel, and it never appears at all while the setting is off. (#3573, #2124)
+
+## [v0.51.354] — 2026-06-10 — Release LR (preserve explicit @provider:model picks across cold catalogs)
+
+### Fixed
+
+- **An explicit `@provider:model` pick no longer snaps back to the default model when the provider's group is briefly missing from the cached catalog.** Providers that discover their models live (ollama-cloud, deepseek, xai) can momentarily lack their group in the cached catalog snapshot used on hot `GET /api/session` and chat-switch paths; a selection like `@ollama-cloud:minimax-m3` was being silently reverted to the global default on the 2nd-and-later turn. The resolver now preserves the explicit selection when the provider is known or configured (decided from the static registry + config, not the cold catalog), while a genuinely-unknown provider still falls back to the default instead of routing to an unrecognized one. The cached-catalog performance path is unchanged. (#3950)
+
+## [v0.51.353] — 2026-06-10 — Release LQ (cross-client live-turn recovery)
+
+### Fixed
+
+- **Opening an in-progress session from a fresh client now shows the already-streamed text and tool activity.** Switching away from an active session and returning from another device — or a tab with no in-memory snapshot — could previously show an empty or stalled turn until the next token arrived, because the already-emitted progress lived only in browser-local memory. The server now builds a live snapshot from the run journal (`runtime_journal_snapshot` in `GET /api/session`) so a fresh client rebuilds the visible assistant text + tool cards from the server. It composes with the existing run-journal replay cursor (seeds the replay-from sequence so events aren't duplicated) and keys tool cards by the same id aliases as the live path so SSE replay replaces rather than duplicates the restored cards. (#3427, part of the #3400 live-to-final epic)
+
+## [v0.51.352] — 2026-06-10 — Release LP (medium round: jump-to-response, STATE_DIR warning, J/K nav)
+
+### Added
+
+- **J/K keyboard shortcuts navigate the session list.** Pressing `j` selects the next session and `k` the previous one (vim-style), guarded so they never fire while typing in the composer or any input/textarea/contenteditable, and modifier-key combos are ignored. (#3941, closes #3845)
+
+### Fixed
+
+- **The per-turn jump button now scrolls to the start of the response, not the user's question.** The ↑ jump affordance on an assistant turn now scrolls to the assistant segment (the start of the response) instead of the user message above it. It targets the first *visible* segment — a folded-Worklog turn whose first segment is hidden no longer suppresses the fallback — and falls back to the question row when no visible response segment is found. Label updated to "to response" across all locales. (#3934, closes #3852)
+- **Startup now warns when the session store is empty but a sibling state directory has sessions.** When `SESSION_DIR` has no session files and the index is empty/absent, `print_startup_config()` scans sibling state directories and, if it finds one with session data, prints a diagnostic pointing at it and the `HERMES_WEBUI_STATE_DIR` to set — so a user who switched launch methods (bootstrap.py / ctl.sh / systemd) and sees an empty sidebar knows their sessions aren't lost. Fully fail-safe (warning only, no behavior change). (#3939, closes #3915)
+
+## [v0.51.351] — 2026-06-10 — Release LO (Phase 0 brick batch: data-loss + mobile stream reattach)
+
+### Fixed
+
+- **A provider error, credential failure, or exception mid-turn no longer discards all accumulated partial work.** When a turn failed partway, the session sidecar threw away the text, reasoning, and tool calls streamed so far — the user lost paid-token output and saw only an error. The two turn-error paths in `_run_agent_streaming` now snapshot the live streaming buffers under `STREAMS_LOCK` and append a `_partial` assistant message (the same preservation the user-cancel path already did), via a shared `_build_partial_message()` helper. Partial tool calls are stored under a private key so they are never forwarded to the next API call. (#3931, closes #3929)
+- **Live token streams reattach after an Android PWA app-switch.** Backgrounding the PWA during an active stream fires the offline banner (not the `visibilitychange` path); `_recoverFromOfflineSoftly()` refreshed the session and learned the stream id but never re-subscribed. It now probes stream status and calls `attachLiveStream()` so a still-running server stream resumes instead of appearing stalled. (#3932, closes #3863)
+
+## [v0.51.350] — 2026-06-10 — Release LN (session-move / project-delete timeout fix)
+
+### Fixed
+
+- **Moving a session into a project, or deleting a project, no longer times out with "Request timed out" while a session is streaming.** Two distinct causes: (1) `/api/session/move` acquired the per-session lock with no deadline, so a slow checkpoint save on the streaming thread (e.g. on WSL/DrvFs) could outlast the browser's 30s abort — it now acquires with a 5s timeout and returns an actionable HTTP 503 instead of hanging; (2) `/api/projects/delete` re-saved every assigned session (O(N) full-history rewrites), which alone could exceed 30s for a project with many large sessions — for an actively-streaming session it now clears the project link on the live in-memory session (persisted by the streaming thread's own next save) instead of issuing a competing write, and guards each per-session update. (#3746)
+
+## [v0.51.349] — 2026-06-10 — Release LM (custom-proxy model ID preservation)
+
+### Fixed
+
+- **Custom providers with a remote `base_url` no longer truncate model IDs that contain a `/`.** A `custom` provider (bare or named `custom:<slug>`) pointed at a vendor-routing proxy (LiteLLM, a Bedrock gateway, etc.) is now passed the model ID exactly as selected when the prefix is an intrinsic routing segment — e.g. `bedrock/opus-4-6` reaches the proxy whole instead of being silently truncated to `opus-4-6`, which caused `403 model "opus-4-6" is not allowed`. A prefix that is genuinely redundant with the model's own first-party namespace is still stripped (`openai/gpt-5.4` → `gpt-5.4`), and the strip for real first-party providers pointed at an OpenAI-compatible proxy (e.g. `provider: openai`) is unchanged. If your proxy registers a model under a first-party-prefixed key (e.g. `anthropic/claude-opus-4.6`), list it under a `custom_providers[]` entry to route the full id through. (#3872)
+
+## [v0.51.348] — 2026-06-10 — Release LL (Phase 0 hotfix: timeout regression + data-loss + leaks)
+
+### Fixed
+
+- **"Request timed out" during approval/clarify turns no longer fires from browser connection-pool exhaustion.** v0.51.340 added `/api/session/stream` as a 6th persistent SSE `EventSource`. Browsers cap HTTP/1.1 at 6 connections per origin, so with all 6 long-lived streams open the next `fetch()` — including the approval/clarify POST itself — queued indefinitely and surfaced as a timeout toast even though the server responded normally. Approval and clarify prompts now use HTTP polling (approval 1.5 s, clarify 3 s) via the existing fallback-poll helpers, freeing 2 connection slots. (#3913, fixes #3807 / #3748 / #3014)
+- **Queued follow-up messages and draft-only sessions are more durable across refresh and tab restore.** Session queues now mirror to both `sessionStorage` and `localStorage`, restore through one shared helper (falling back to the durable copy when `sessionStorage` is missing after a tab/process restore), clear stale queue state from both layers, and keep zero-message sessions when they still own unsent composer draft text or files. (#3906, #3108)
+- **Settings panel no longer auto-reopens while you are on the Chat panel.** `switchSettingsSection()` force-mutated the current panel back to `settings` instead of just remembering the section for the next time settings is opened; visible on iPad/touch. (#3909)
+
+### Performance
+
+- **Kanban API requests no longer leak a file descriptor each.** `api/kanban_bridge.py::_conn()` returned a raw connection used as a `with` block, but sqlite3's context manager only scopes the transaction and never closes the FD. On a long-lived server these accumulated, pinning stale WAL snapshots and starving checkpoints for gateway/CLI workers sharing the board DB. `_conn()` now uses the closing context manager. (#3904)
+
+## [v0.51.347] — 2026-06-09 — Release LK (streaming & render reliability cluster)
+
+### Fixed
+
+- **Mid-stream content no longer flickers (disappears and reappears) during a live turn.** When `renderMessages()` rebuilt the transcript while a session was actively streaming (e.g. a clarify-response echo or a CLI-import refresh), the `inner.innerHTML=''` wipe detached the live assistant turn node that the streaming markdown parser keeps writing into, so the streamed text vanished until the next stream event. The live turn's DOM node is now preserved across the rebuild and re-attached so the parser target stays connected and the text never blanks. (#3877)
+- **Recovered turns with empty visible content no longer render a blank transcript.** A run-journal-recovered assistant anchor (empty content + a `reasoning` payload + recovery marker) extracted no inline thinking text and rendered nothing, so a session made of such rows painted as only date separators. Two fixes: the backend now reuses one empty recovered anchor per stream instead of appending a fresh empty row on every lazy recovery retry (which previously bloated sessions with thousands of content-less rows), and the renderer surfaces the message's reasoning payload as a Thinking card for empty-content turns so the turn is never blank. (#3875)
+- **`stream_end` no longer finalizes a turn prematurely when the server is still active.** When a `stream_end` event arrived while the session was still streaming server-side, the client could settle to a partial state. It now polls the persisted session and retries settlement (bounded) until the server reports the stream complete, and the SSE error path defers to an in-flight recovery instead of starting a competing reconnect. (#3885)
+- **Markdown list markers and indentation are preserved around LaTeX blocks.** Continuation lines, nested indentation, and KaTeX-placeholder lines inside list items no longer break the list into fragments or lose their markers. (#3830)
+
+### Changed
+
+- **Worklog details settings now align with the live-to-final model.** The old "Activity expanded by default" setting is renamed to **Worklog details** (default folded), the legacy "Compact tool activity" preference is deprecated, and the Worklog renderer stays enabled for older installs that had saved `simplified_tool_calling=false`. (#3400, #3820)
+
+## [v0.51.346] — 2026-06-09 — Release LJ (PWA notification controls)
+
+### Added
+
+- **PWA notifications now use the service worker for reliable delivery, with explicit controls in Settings.** Browser notifications prefer `ServiceWorkerRegistration.showNotification()` (falling back to a direct `Notification` when no service worker is registered), which is the only notification path that works in an installed standalone PWA — notably iOS, where `new Notification()` is unavailable. Notification payloads now carry the originating session's deep link, icon, badge, and a stable per-session tag, and clicking a notification focuses an already-open tab for that session (or opens a new window) instead of yanking an unrelated tab away from what you were reading. Settings → Preferences gains **Enable notifications**, **Send test**, and a live permission-status readout. (#3196, #3229)
+
 ## [v0.51.345] — 2026-06-09 — Release LI (model override picker for scheduled jobs)
 
 ### Added

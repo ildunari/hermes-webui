@@ -6066,15 +6066,13 @@ function _toggleTabVisibilityChip(panel){
 }
 
 function switchSettingsSection(name){
-  // If the main content is not showing settings, switch back first
+  // If the main content is not showing settings, just remember the section
+  // without force-switching the panel. The section will be applied when the
+  // user next opens settings via switchPanel(). (#appearance-auto-reopen)
   if (_currentPanel !== 'settings') {
-    _currentPanel = 'settings';
-    var mainEl = document.querySelector('main.main');
-    if (mainEl) {
-      ['settings','skills','memory','tasks','kanban','workspaces','profiles','insights','logs','plugin'].forEach(function(p) {
-        mainEl.classList.toggle('showing-' + p, p === 'settings');
-      });
-    }
+    _currentSettingsSection = name;
+    _settingsSection = name;
+    return;
   }
   let section=(name==='appearance'||name==='preferences'||name==='providers'||name==='plugins'||name==='system'||name==='help')?name:'conversation';
   // Deep-linking to the Plugins pane when the tab is hidden (no plugins
@@ -6205,13 +6203,15 @@ function _applyTtsEnabled(enabled){
 }
 
 function _appearancePayloadFromUi(){
+  const worklogDetailsExpanded=!!($('settingsWorklogDetailsExpandedDefault')||{}).checked;
   return {
     theme: ($('settingsTheme')||{}).value || localStorage.getItem('hermes-theme') || 'dark',
     skin: ($('settingsSkin')||{}).value || localStorage.getItem('hermes-skin') || 'default',
     font_size: ($('settingsFontSize')||{}).value || localStorage.getItem('hermes-font-size') || 'default',
     session_jump_buttons: !!($('settingsSessionJumpButtons')||{}).checked,
     session_endless_scroll: !!($('settingsSessionEndlessScroll')||{}).checked,
-    activity_feed_expanded_default: !!($('settingsActivityFeedExpandedDefault')||{}).checked,
+    worklog_details_expanded_default: worklogDetailsExpanded,
+    activity_feed_expanded_default: worklogDetailsExpanded,
     hidden_tabs: _getHiddenTabs(),
     tab_order: _getTabOrder(),
   };
@@ -6266,8 +6266,15 @@ async function _autosaveAppearanceSettings(payload){
       if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
     }
     window._sessionEndlessScrollEnabled=!!(saved&&saved.session_endless_scroll);
-    if(saved&&Object.prototype.hasOwnProperty.call(saved,'activity_feed_expanded_default')){
-      window._activityFeedExpandedDefault=!!saved.activity_feed_expanded_default;
+    if(saved&&payload&&Object.prototype.hasOwnProperty.call(payload,'worklog_details_expanded_default')&&(
+      Object.prototype.hasOwnProperty.call(saved,'worklog_details_expanded_default') ||
+      Object.prototype.hasOwnProperty.call(saved,'activity_feed_expanded_default')
+    )){
+      window._worklogDetailsExpandedByDefault=!!(
+        Object.prototype.hasOwnProperty.call(saved,'worklog_details_expanded_default')
+          ? saved.worklog_details_expanded_default
+          : saved.activity_feed_expanded_default
+      );
     }
     _setAppearanceAutosaveStatus('saved');
   }catch(e){
@@ -6294,14 +6301,14 @@ function _preferencesPayloadFromUi(){
   if(showUsageCb) payload.show_token_usage=showUsageCb.checked;
   const showQuotaChipCb=$('settingsShowQuotaChip');
   if(showQuotaChipCb) payload.show_quota_chip=showQuotaChipCb.checked;
+  const showConversationOutlineCb=$('settingsShowConversationOutline');
+  if(showConversationOutlineCb) payload.show_conversation_outline=showConversationOutlineCb.checked;
   const hideSuggestionsCb=$('settingsHideSuggestions');
   if(hideSuggestionsCb) payload.hide_empty_state_suggestions=hideSuggestionsCb.checked;
   const showTpsCb=$('settingsShowTps');
   if(showTpsCb) payload.show_tps=showTpsCb.checked;
   const fadeTextCb=$('settingsFadeTextEffect');
   if(fadeTextCb) payload.fade_text_effect=fadeTextCb.checked;
-  const simplifiedToolCb=$('settingsSimplifiedToolCalling');
-  if(simplifiedToolCb) payload.simplified_tool_calling=simplifiedToolCb.checked;
   const terminalAutoExpandCb=$('settingsTerminalAutoExpand');
   if(terminalAutoExpandCb) payload.terminal_auto_expand_on_output=terminalAutoExpandCb.checked;
   const apiRedactCb=$('settingsApiRedact');
@@ -6378,11 +6385,6 @@ function _schedulePreferencesAutosave(){
 async function _autosavePreferencesSettings(payload){
   try{
     const saved=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
-    if(payload&&payload.simplified_tool_calling!==undefined){
-      window._simplifiedToolCalling=(saved&&saved.simplified_tool_calling!==false);
-      if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
-      if(typeof renderMessages==='function') renderMessages();
-    }
     if(payload&&payload.terminal_auto_expand_on_output!==undefined){
       window._terminalAutoExpandOnOutput=!!(saved&&saved.terminal_auto_expand_on_output);
     }
@@ -6396,6 +6398,11 @@ async function _autosavePreferencesSettings(payload){
     if(payload&&payload.hide_empty_state_suggestions!==undefined){
       window._hideEmptyStateSuggestions=!!(saved&&saved.hide_empty_state_suggestions);
       if(typeof applyEmptyStateSuggestionPref==='function') applyEmptyStateSuggestionPref();
+    }
+    if(payload&&payload.show_conversation_outline!==undefined){
+      window._showConversationOutline=!!(saved&&saved.show_conversation_outline);
+      document.documentElement.dataset.conversationOutline=window._showConversationOutline?'enabled':'disabled';
+      if(typeof applyConversationOutlinePreference==='function') applyConversationOutlinePreference();
     }
     _settingsPreferencesAutosaveRetryPayload=null;
     _setPreferencesAutosaveStatus('saved');
@@ -6493,12 +6500,16 @@ async function loadSettingsPanel(){
         _scheduleAppearanceAutosave();
       };
     }
-    const activityExpandedCb=$('settingsActivityFeedExpandedDefault');
-    if(activityExpandedCb){
-      activityExpandedCb.checked=!!settings.activity_feed_expanded_default;
-      window._activityFeedExpandedDefault=activityExpandedCb.checked;
-      activityExpandedCb.onchange=function(){
-        window._activityFeedExpandedDefault=this.checked;
+    const worklogDetailsExpandedCb=$('settingsWorklogDetailsExpandedDefault');
+    if(worklogDetailsExpandedCb){
+      const worklogDetailsExpanded=Object.prototype.hasOwnProperty.call(settings,'worklog_details_expanded_default')
+        ? settings.worklog_details_expanded_default
+        : settings.activity_feed_expanded_default;
+      worklogDetailsExpandedCb.checked=!!worklogDetailsExpanded;
+      window._worklogDetailsExpandedByDefault=worklogDetailsExpandedCb.checked;
+      worklogDetailsExpandedCb.onchange=function(){
+        window._worklogDetailsExpandedByDefault=this.checked;
+        if(typeof _applyWorklogDetailsExpandedDefault==='function') _applyWorklogDetailsExpandedDefault();
         _scheduleAppearanceAutosave();
       };
     }
@@ -6614,6 +6625,19 @@ async function loadSettingsPanel(){
         _schedulePreferencesAutosave();
       },{once:false});
     }
+    const showConversationOutlineCb=$('settingsShowConversationOutline');
+    if(showConversationOutlineCb){
+      showConversationOutlineCb.checked=settings.show_conversation_outline===true;
+      window._showConversationOutline=showConversationOutlineCb.checked;
+      document.documentElement.dataset.conversationOutline=window._showConversationOutline?'enabled':'disabled';
+      if(typeof applyConversationOutlinePreference==='function') applyConversationOutlinePreference();
+      showConversationOutlineCb.addEventListener('change',()=>{
+        _schedulePreferencesAutosave();
+        window._showConversationOutline=showConversationOutlineCb.checked;
+        document.documentElement.dataset.conversationOutline=window._showConversationOutline?'enabled':'disabled';
+        if(typeof applyConversationOutlinePreference==='function') applyConversationOutlinePreference();
+      },{once:false});
+    }
     const showTpsCb=$('settingsShowTps');
     if(showTpsCb){showTpsCb.checked=!!settings.show_tps;showTpsCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const pinnedLimitField=$('settingsPinnedSessionsLimit');
@@ -6625,8 +6649,6 @@ async function loadSettingsPanel(){
     }
     const fadeTextCb=$('settingsFadeTextEffect');
     if(fadeTextCb){fadeTextCb.checked=!!settings.fade_text_effect;window._fadeTextEffect=fadeTextCb.checked;fadeTextCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
-    const simplifiedToolCb=$('settingsSimplifiedToolCalling');
-    if(simplifiedToolCb){simplifiedToolCb.checked=settings.simplified_tool_calling!==false;simplifiedToolCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const terminalAutoExpandCb=$('settingsTerminalAutoExpand');
     if(terminalAutoExpandCb){terminalAutoExpandCb.checked=!!settings.terminal_auto_expand_on_output;window._terminalAutoExpandOnOutput=terminalAutoExpandCb.checked;terminalAutoExpandCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const apiRedactCb=$('settingsApiRedact');
@@ -7725,10 +7747,13 @@ async function deletePasskey(id){
 }
 
 function _applySavedSettingsUi(saved, body, opts){
-  const {sendKey,showTokenUsage,showQuotaChip,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize}=opts;
+  const {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize}=opts;
   window._sendKey=sendKey||'enter';
   window._showTokenUsage=showTokenUsage;
   window._showQuotaChip=showQuotaChip===true;
+  window._showConversationOutline=showConversationOutline===true;
+  document.documentElement.dataset.conversationOutline=window._showConversationOutline?'enabled':'disabled';
+  if(typeof applyConversationOutlinePreference==='function') applyConversationOutlinePreference();
   window._showTps=showTps;
   window._fadeTextEffect=!!fadeTextEffect;
   window._showCliSessions=showCliSessions;
@@ -7737,7 +7762,7 @@ function _applySavedSettingsUi(saved, body, opts){
   window._notificationsEnabled=body.notifications_enabled;
   window._whatsNewSummaryEnabled=!!body.whats_new_summary_enabled;
   window._showThinking=body.show_thinking!==false;
-  window._simplifiedToolCalling=body.simplified_tool_calling!==false;
+  window._simplifiedToolCalling=true;
   window._terminalAutoExpandOnOutput=!!body.terminal_auto_expand_on_output;
   window._sessionJumpButtonsEnabled=!!body.session_jump_buttons;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
@@ -8053,6 +8078,7 @@ async function saveSettings(andClose){
   const sendKey=($('settingsSendKey')||{}).value;
   const showTokenUsage=!!($('settingsShowTokenUsage')||{}).checked;
   const showQuotaChip=!!($('settingsShowQuotaChip')||{}).checked;
+  const showConversationOutline=!!($('settingsShowConversationOutline')||{}).checked;
   const showTps=!!($('settingsShowTps')||{}).checked;
   const fadeTextEffect=!!($('settingsFadeTextEffect')||{}).checked;
   const showCliSessions=!!($('settingsShowCliSessions')||{}).checked;
@@ -8077,9 +8103,9 @@ async function saveSettings(andClose){
   body.language=language;
   body.show_token_usage=showTokenUsage;
   body.show_quota_chip=showQuotaChip===true;
+  body.show_conversation_outline=showConversationOutline===true;
   body.show_tps=showTps;
   body.fade_text_effect=fadeTextEffect;
-  body.simplified_tool_calling=!!($('settingsSimplifiedToolCalling')||{}).checked;
   body.terminal_auto_expand_on_output=!!($('settingsTerminalAutoExpand')||{}).checked;
   body.api_redact_enabled=!!($('settingsApiRedact')||{}).checked;
   body.show_cli_sessions=showCliSessions;
@@ -8113,7 +8139,7 @@ async function saveSettings(andClose){
           if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
         }
       }
-      _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
+      _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
       showToast(t(saved.auth_just_enabled?'settings_saved_pw':'settings_saved_pw_updated'));
       _settingsDirty=false;
       _resetSettingsPanelState();
@@ -8132,7 +8158,7 @@ async function saveSettings(andClose){
         if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
       }
     }
-    _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
+    _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
     showToast(t('settings_saved'));
     _settingsDirty=false;
     _resetSettingsPanelState();
@@ -8518,6 +8544,7 @@ function loadGatewayStatus(){
 const _origSwitchSettings=switchSettingsSection;
 switchSettingsSection=function(name){
   _origSwitchSettings(name);
+  if(name==='preferences') updateNotificationPermissionStatus();
   if(name==='system'){loadMcpServers();loadMcpTools();loadGatewayStatus();}
 };
 
@@ -8627,4 +8654,13 @@ async function _restoreCheckpoint(workspace,checkpoint,message){
   }catch(e){
     showToast(t('checkpoint_restore')+': '+e.message,'error');
   }
+}
+
+
+function updateNotificationPermissionStatus(){
+  const el=$('notificationPermissionStatus');
+  if(!el) return;
+  if(!('Notification' in window)){el.textContent=t('notifications_unsupported');return;}
+  const perm=Notification.permission||'default';
+  el.textContent=t('notifications_permission_status', perm);
 }
