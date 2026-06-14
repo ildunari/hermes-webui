@@ -3645,6 +3645,62 @@ function _scheduleSessionEventsRefresh(reason){
   }, 300);
 }
 
+// ── #4151: focus-aware close for the two GLOBAL sidebar SSE streams ──────────
+// Each WebUI window holds up to three persistent SSE connections (session-events
+// + gateway + the per-session stream). #3992/#3996 close them on the Page
+// Visibility API (`visibilitychange` / `document.hidden`) so a hidden tab frees
+// HTTP/1.1 pool slots. But a PWA *standalone* window does NOT reliably fire
+// `visibilitychange` when it merely loses focus to another window of the same
+// app — `document.hidden` only flips on minimize. So two side-by-side PWA windows
+// both stay `visibilityState==='visible'`, each keeps its sidebar streams open,
+// and 2x3 = 6 = the per-origin HTTP/1.1 connection limit; every later fetch()
+// (the 30s polls) queues behind the saturated pool and times out (#4151).
+// `document.hasFocus()` is the signal `visibilitychange` misses — only one window
+// holds focus at a time.
+//
+// Scope: ONLY the two global sidebar streams (session-events + gateway). The
+// per-session live stream (messages.js `startSessionStream`) deliberately stays
+// visibility-only — it carries live `bg_task_complete` toasts and
+// `server_turn_started` live-view that an unfocused-but-VISIBLE window must still
+// receive (the OS-notification path is gated on `document.hidden`, so the in-app
+// toast is the only completion signal a visible-unfocused window gets). Closing
+// it on blur would regress the multi-window live-view UX.
+function _sidebarSseBackgrounded(){
+  if(typeof document === 'undefined') return false;
+  if(document.hidden) return true;
+  if(typeof document.hasFocus === 'function' && !document.hasFocus()) return true;
+  return false;
+}
+
+let _sidebarSseBlurCloseTimer = 0;
+// Debounce the blur-close so a transient blur (native dialog, quick alt-tab and
+// back) doesn't thrash the streams; a sustained blur frees the pool slots.
+const _SIDEBAR_SSE_BLUR_CLOSE_MS = 1000;
+
+function _installSidebarSseFocusHook(){
+  if(typeof window === 'undefined' || typeof document === 'undefined') return;
+  if(document._hermesSidebarSseFocusHook) return;
+  document._hermesSidebarSseFocusHook = true;
+  window.addEventListener('blur', () => {
+    if(_sidebarSseBlurCloseTimer) return;
+    _sidebarSseBlurCloseTimer = setTimeout(() => {
+      _sidebarSseBlurCloseTimer = 0;
+      // Re-check at fire time — focus may have returned during the debounce.
+      if(_sidebarSseBackgrounded()){
+        _closeSessionEventsSSE();
+        stopGatewaySSE();
+      }
+    }, _SIDEBAR_SSE_BLUR_CLOSE_MS);
+  });
+  window.addEventListener('focus', () => {
+    if(_sidebarSseBlurCloseTimer){ clearTimeout(_sidebarSseBlurCloseTimer); _sidebarSseBlurCloseTimer = 0; }
+    // Reopen (both ensure-idempotent) and catch up on anything missed while blurred.
+    ensureSessionEventsSSE();
+    startGatewaySSE();
+    void refreshSessionList('focus');
+  });
+}
+
 function _closeSessionEventsSSE(){
   if(_sessionEventsSSE){
     _sessionEventsSSE.close();
@@ -3664,8 +3720,9 @@ function ensureSessionEventsSSE(){
     });
     document._hermesSessionEventsVisibilityHook = true;
   }
+  _installSidebarSseFocusHook();
   if(typeof EventSource==='undefined') return;
-  if(typeof document !== 'undefined' && document.hidden) return;
+  if(_sidebarSseBackgrounded()) return;
   if(_sessionEventsSSE) return;
   try{
     // Same-origin relative URL preserves subpath mounts and normal WebUI cookies.
@@ -3788,8 +3845,10 @@ function startGatewaySSE(){
     });
     document._hermesGatewaySSEVisibilityHook = true;
   }
-  // Don't open when tab is hidden — saves connection pool slots
-  if(typeof document !== 'undefined' && document.hidden) return;
+  _installSidebarSseFocusHook();
+  // Don't open when tab is hidden OR the window has lost focus (PWA blur) —
+  // saves connection pool slots (#4151).
+  if(_sidebarSseBackgrounded()) return;
   try{
     _gatewaySSE = new EventSource('api/sessions/gateway/stream');
     _gatewaySSE.addEventListener('sessions_changed', (ev) => {
