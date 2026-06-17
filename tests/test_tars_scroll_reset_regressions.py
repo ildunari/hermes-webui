@@ -106,6 +106,7 @@ def test_preserve_scroll_restores_unpinned_viewport_after_dom_rebuild():
     render = _function_body(UI_JS, "function renderMessages")
     after_render = _function_body(UI_JS, "function _scrollAfterMessageRender")
     follow = _function_body(UI_JS, "function _followMessagesAfterDomReplace")
+    capture = _function_body(UI_JS, "function _captureMessageScrollSnapshot")
     restore = _function_body(UI_JS, "function _restoreMessageScrollSnapshot")
 
     snapshot_idx = render.index("const scrollSnapshot=(preserveScroll||(!_autoScrollFollow&&_messageUserUnpinned))?_captureMessageScrollSnapshot():null")
@@ -116,9 +117,12 @@ def test_preserve_scroll_restores_unpinned_viewport_after_dom_rebuild():
         "renderMessages({preserveScroll:true}) must capture #messages.scrollTop before "
         "replacing transcript DOM, then pass that snapshot to the post-render scroll helper"
     )
-    assert "if(!_messageUserUnpinned && _followMessagesAfterDomReplace()) return;" in after_render
+    assert "if(!readerAwayFromBottom && !_messageUserUnpinned && _followMessagesAfterDomReplace()) return;" in after_render
     assert "_restoreMessageScrollSnapshot(scrollSnapshot);\n    _maybeShowNewMessageScrollCue(scrollSnapshot);" in after_render
     assert "_shouldFollowMessagesOnDomReplace()" in follow
     assert "scrollToBottom();" in follow
+    assert "anchor:(typeof _captureMessageViewportAnchor==='function')?_captureMessageViewportAnchor():null" in capture
+    assert "_restoreMessageViewportAnchor(snapshot.anchor,0)" in restore
+    assert "if(!restoredViaAnchor){" in restore
     assert "el.scrollTop=Math.max(0,Math.min(Number(snapshot.top)||0,maxTop))" in restore
     assert "_programmaticScroll=true" in restore

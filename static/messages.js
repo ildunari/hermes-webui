@@ -792,7 +792,7 @@ const _sessionTitleProvisionalBySid = new Map();
 // their canonical command is registered on the backend (for example
 // /reload-mcp). Keep this intentionally narrow and include underscore variants
 // observed by users so typing either form still routes through executeAgentCommand.
-const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set(['reload-mcp', 'reload_mcp', 'reload-skills', 'reload_skills', 'codex-runtime', 'codex_runtime']);
+const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set(['reload-mcp', 'reload_mcp', 'reload-skills', 'reload_skills', 'codex-runtime', 'codex_runtime', 'credits']);
 
 function _clearStaleBusyStateBeforeSend({compressionRunning=false}={}){
   if(!S||!S.busy||compressionRunning) return false;
@@ -892,7 +892,7 @@ async function send(){
   }
   _sendInProgress = true;
   try{
-  const text=$('msg').value.trim();
+  let text=$('msg').value.trim();
   if(!text&&!S.pendingFiles.length){_sendInProgress=false;_sendInProgressSid=null;return;}
   // Don't send while an inline message edit is active
   if(document.querySelector('.msg-edit-area')){_sendInProgress=false;_sendInProgressSid=null;return;}
@@ -910,13 +910,14 @@ async function send(){
       if(!S.session){await newSession();await renderSessionList();}
       // Busy-control slash commands must be intercepted HERE, before the
       // busyMode routing block, so the user can always type /steer, /interrupt,
-      // or /queue while the agent is running and have them execute immediately.
+      // /queue, /terminal, /goal, or /yolo while the agent is running and have
+      // them execute immediately.
       // Without this intercept they fall through to the queue and execute after
       // the current turn ends — by which point there is no active stream and
       // cmdSteer / cmdInterrupt say "No active task to stop."
       if(text.startsWith('/')){
         const _pc=typeof parseCommand==='function'&&parseCommand(text);
-        if(_pc&&['steer','interrupt','queue','terminal','goal'].includes(_pc.name)){
+        if(_pc&&['steer','interrupt','queue','terminal','goal','yolo'].includes(_pc.name)){
           const _bc=COMMANDS.find(c=>c.name===_pc.name);
           if(_bc){
             $('msg').value='';autoResize();
@@ -969,6 +970,7 @@ async function send(){
     if(typeof showToast==='function') showToast('Read-only imported sessions cannot be modified.',3000);
     return;
   }
+  let _slashDisplayTextOverride=null;
   // Slash command intercept -- local commands handled without agent round-trip.
   // We push the user message BEFORE running the handler for echo-worthy
   // commands so chat order is correct: some handlers (e.g. cmdHelp) push
@@ -1039,6 +1041,26 @@ async function send(){
         renderMessages();
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
+      const _bundleCmd=!_agentCmd&&typeof getBundleCommandMetadata==='function'
+        ? await getBundleCommandMetadata(_parsedCmd.name)
+        : null;
+      if(_bundleCmd){
+        try{
+          const _bundleResolved=typeof resolveBundleCommand==='function'
+            ? await resolveBundleCommand(text,_bundleCmd)
+            : null;
+          const _bundleMessage=String(_bundleResolved&&_bundleResolved.message||'').trim();
+          if(!_bundleMessage) throw new Error('Bundle command runtime returned no invocation text.');
+          _slashDisplayTextOverride=text;
+          text=_bundleMessage;
+        }catch(e){
+          if(!S.session){await newSession();await renderSessionList();}
+          S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+          S.messages.push({role:'assistant',content:`Bundle command error: ${e&&e.message||e}`,_ts:Date.now()/1000});
+          renderMessages();
+          $('msg').value='';autoResize();hideCmdDropdown();return;
+        }
+      }
     }
   }
   if(!S.session){await newSession();await renderSessionList();}
@@ -1087,7 +1109,7 @@ async function send(){
   $('msg').value='';autoResize();
   // Clear persisted composer draft since message was sent.
   if (activeSid && typeof _clearComposerDraft === 'function') _clearComposerDraft(activeSid);
-  const displayText=text||(uploaded.length?`Uploaded: ${uploadedNames.join(', ')}`:'(file upload)');
+  const displayText=_slashDisplayTextOverride||text||(uploaded.length?`Uploaded: ${uploadedNames.join(', ')}`:'(file upload)');
   const userMsg={role:'user',content:displayText,attachments:uploaded.length?uploadedNames:undefined,_ts:Date.now()/1000};
   S.toolCalls=[];  // clear tool calls from previous turn
   clearLiveToolCards();  // clear any leftover live cards from last turn
@@ -1488,6 +1510,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   function _bailOutOfTerminalEventsFromStaleStream(source){
     if(_ownsActiveStreamOrBackground()) return false;
+    // This stale stream no longer owns the session — schedule cleanup of ITS own
+    // anchor registry (identity-guarded, so it can't clobber the newer stream's
+    // registry for the same session) before closing. (Codex leak catch.)
+    _scheduleAnchorRegistryCleanup(120000);
     _closeSource(source);
     return true;
   }
@@ -1638,6 +1664,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _smdEndParser();
     if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
     _clearOwnerInflightState();
+    _flushReasoningToAnchor();
+    _scheduleAnchorRegistryCleanup();
     _clearApprovalForOwner();
     _clearClarifyForOwner('terminal');
     if(_isActiveSession()){
@@ -1844,6 +1872,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
       if(await _restoreSettledSession(source)) return;
       if(_deferStreamErrorIfOffline()||_pageHiddenForStreamError()) return;
+      _flushReasoningToAnchor();
+      _scheduleAnchorRegistryCleanup(120000);
       _handleStreamError(source);
     })();
   }
@@ -1903,6 +1933,69 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   const _STREAM_FADE_STAGGER_MS=16;
   const _STREAM_FADE_DONE_MAX_MS=320;
   const _STREAM_FADE_DONE_DRAIN_MAX_MS=900;
+  const _anchorApi=(typeof window!=='undefined'&&window.HermesAssistantTurnAnchors)
+    ? window.HermesAssistantTurnAnchors
+    : null;
+  const _anchorRegistryMap=(typeof window!=='undefined')
+    ? (window._liveAnchorRegistries=window._liveAnchorRegistries||new Map())
+    : null;
+  const _existingAnchorRegistry=_anchorRegistryMap?_anchorRegistryMap.get(streamId):null;
+  const _anchorRegistry=_existingAnchorRegistry||(_anchorApi&&typeof _anchorApi.createAssistantTurnAnchorRegistry==='function'
+    ? _anchorApi.createAssistantTurnAnchorRegistry({
+      session_id:activeSid,
+      stream_id:streamId,
+      run_id:null,
+    })
+    : null);
+  let _anchorShadowWarned=false;
+  let _anchorReasoningFlushed=false;
+  if(_anchorRegistryMap&&_anchorRegistry) _anchorRegistryMap.set(streamId,_anchorRegistry);
+  function _scheduleAnchorRegistryCleanup(delayMs=600000){
+    if(!_anchorRegistryMap||!_anchorRegistry) return;
+    setTimeout(()=>{
+      if(_anchorRegistryMap.get(streamId)===_anchorRegistry) _anchorRegistryMap.delete(streamId);
+    },delayMs);
+  }
+  // Backstop: schedule an identity-guarded cleanup at creation so this shadow
+  // registry self-expires no matter which teardown path the stream takes
+  // (incl. external ones like sidebar cancelSessionStream() that bypass the
+  // in-closure SSE handlers). Explicit terminal-path calls above just expire it
+  // sooner; this guarantees window._liveAnchorRegistries can't grow unbounded.
+  _scheduleAnchorRegistryCleanup(600000);
+  function _applyToAnchor(sourceEventType, rawEventData, sseEvent){
+    if(!_anchorRegistry||!_anchorApi||typeof _anchorApi.applyAssistantTurnAnchorSourceEvent!=='function') return null;
+    const raw=(rawEventData&&typeof rawEventData==='object')?rawEventData:{};
+    const eventId=(sseEvent&&sseEvent.lastEventId)||raw.event_id||raw.lastEventId||raw.last_event_id||'';
+    const sourceEvent={
+      ...raw,
+      source_event_type:sourceEventType,
+      activitySegmentSeq:_assistantSegmentSeq,
+      activityBurstId:_currentActivityBurstId,
+    };
+    if(eventId) sourceEvent.event_id=eventId;
+    try{
+      return _anchorApi.applyAssistantTurnAnchorSourceEvent(
+        _anchorRegistry,
+        sourceEvent,
+        {session_id:activeSid,stream_id:streamId}
+      );
+    }catch(err){
+      if(!_anchorShadowWarned&&typeof console!=='undefined'&&console.warn){
+        _anchorShadowWarned=true;
+        console.warn('assistant turn anchor live shadow feed failed',err);
+      }
+      return null;
+    }
+  }
+  function _flushReasoningToAnchor(){
+    if(_anchorReasoningFlushed||!reasoningText) return;
+    _anchorReasoningFlushed=true;
+    _applyToAnchor('reasoning',{
+      text:reasoningText,
+      local_id:'live-reasoning',
+      seq:_runJournalReplayAfterSeq(),
+    },null);
+  }
 
   function _mergeSettledToolCallsWithLiveMetadata(rawCalls){
     const liveCalls=Array.isArray(S.toolCalls)?S.toolCalls:[];
@@ -2802,6 +2895,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!visible){
         return;
       }
+      _applyToAnchor('interim_assistant',d,e);
       liveReasoningText='';
       if(alreadyStreamed){
         if(!S.session||S.session.session_id!==activeSid){
@@ -2890,6 +2984,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _completeAutomaticCompressionOnLiveProgress(activeSid);
       const tc=upsertLiveToolCall(d,'start');
       if(!tc) return;
+      _applyToAnchor('tool',{...d,...tc},e);
 
       if(S.session&&S.session.session_id===activeSid&&typeof scheduleRenderSessionArtifacts==='function') scheduleRenderSessionArtifacts();
       if(!S.session||S.session.session_id!==activeSid) return;
@@ -2922,6 +3017,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const tc=upsertLiveToolCall(d,'complete');
       if(!tc) return;
       tc.is_error=!!d.is_error;
+      _applyToAnchor('tool_complete',{...d,...tc,is_error:!!d.is_error},e);
       if(typeof noteWorkspaceMutationsFromToolCall==='function') noteWorkspaceMutationsFromToolCall(tc);
       if(S.session&&S.session.session_id===activeSid&&typeof scheduleRenderSessionArtifacts==='function') scheduleRenderSessionArtifacts();
       if(!S.session||S.session.session_id!==activeSid) return;
@@ -2989,6 +3085,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('approval',e=>{
       const d=JSON.parse(e.data);
+      _applyToAnchor('approval',d,e);
       showApprovalForSession(activeSid, d, 1);
       playAttentionSound(_attentionSoundKey(activeSid,'approval',1));
       sendBrowserNotification('Approval required',d.description||'Tool approval needed',{sid:activeSid});
@@ -2996,6 +3093,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('clarify',e=>{
       const d=JSON.parse(e.data);
+      _applyToAnchor('clarify',d,e);
       showClarifyForSession(activeSid, d);
       playAttentionSound(_attentionSoundKey(activeSid,'clarify',1));
       sendBrowserNotification('Clarification needed',d.question||'Tool clarification needed',{sid:activeSid});
@@ -3083,6 +3181,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const sid=d.session_id||activeSid;
         const continuation_prompt=String(d.continuation_prompt||d.text||'').trim();
         if(!continuation_prompt||sid!==activeSid)return;
+        _applyToAnchor('goal_continue',d,e);
         const _modelState=_chatPayloadModelState();
         _pendingGoalContinuation={
           sid,
@@ -3132,6 +3231,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
       const _doneData=JSON.parse(e.data);
+      const _doneEvent=e;
       const _finishDone=()=>{
         // Bug A fix: cancel any pending rAF and mark stream finalized before
         // the DOM is settled by renderMessages, so no trailing token/reasoning rAF
@@ -3154,6 +3254,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           _smdEndParser();
         }
         const d=_doneData;
+        _flushReasoningToAnchor();
+        _applyToAnchor('done',{
+          status:d.status||'completed',
+          usage:d.usage||null,
+          created_at:d.created_at||null,
+        },_doneEvent);
+        _scheduleAnchorRegistryCleanup();
         const isActiveSession=_isSessionCurrentPane(activeSid);
         const isSessionViewed=_isSessionActivelyViewed(activeSid);
         const completedSession=d.session||{session_id:activeSid};
@@ -3201,6 +3308,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           }
           // Find the last assistant message once for both reasoning persistence and timestamp
           const lastAsst=[...S.messages].reverse().find(m=>m.role==='assistant');
+          if(_anchorRegistry&&lastAsst) lastAsst._anchor_stream_id=streamId;
           // Persist reasoning trace for Worklog Thinking Cards; normal transcript
           // rendering keeps provider reasoning out of the final answer.
           if(reasoningText&&lastAsst&&!lastAsst.reasoning) lastAsst.reasoning=reasoningText;
@@ -3383,6 +3491,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const sid=d.session_id||activeSid;
         const txt=String(d.text||'').trim();
         if(!txt||sid!==activeSid) return;
+        _applyToAnchor('pending_steer_leftover',d,e);
         if(typeof queueSessionMessage==='function'){
           const _modelState=_chatPayloadModelState();
           queueSessionMessage(sid,{
@@ -3404,6 +3513,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       let d={};
       try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
       if(d.session_id&&d.session_id!==activeSid) return;
+      _applyToAnchor('compressing',d,e);
       const state={
         sessionId:activeSid,
         phase:'running',
@@ -3438,6 +3548,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const continuationSid=d.new_session_id||d.continuation_session_id||'';
       const eventMatchesCurrent=!!(currentSid&&(eventSid===currentSid||d.new_session_id===currentSid||d.continuation_session_id===currentSid));
       if(!eventMatchesCurrent) return;
+      _applyToAnchor('compressed',d,e);
       const displaySid=currentSid;
       if(d.usage&&typeof _syncCtxIndicator==='function'){
         S.lastUsage=typeof _mergeUsageForCtxIndicator==='function'
@@ -3502,8 +3613,22 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const eventSid=d.old_session_id||d.session_id||'';
       const continuationSid=(d.session&&d.session.session_id)||d.new_session_id||d.continuation_session_id||'';
       const eventMatchesCurrent=!!(currentSid&&(eventSid===currentSid||continuationSid===currentSid));
+      if(eventMatchesCurrent){
+        _flushReasoningToAnchor();
+        _applyToAnchor('apperror',{
+          type:d.type||'error',
+          status:d.status||d.type||'error',
+          message:d.message||'',
+          hint:d.hint||'',
+          details:d.details||'',
+          session_id:d.session_id||eventSid||activeSid,
+          old_session_id:d.old_session_id||null,
+          new_session_id:d.new_session_id||d.continuation_session_id||null,
+        },e);
+      }
       if(S.session&&eventMatchesCurrent){
         S.activeStreamId=null;
+        _scheduleAnchorRegistryCleanup();
         clearLiveToolCards();if(!assistantText)removeThinking();
         let isRecoveryControlMessage=false;
         try{
@@ -3622,6 +3747,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(await _restoreSettledSession(source)) return;
           if(_deferStreamErrorIfOffline()) return;
           if(_deferStreamErrorIfPageHidden(source)) return;
+          _flushReasoningToAnchor();
+          _scheduleAnchorRegistryCleanup(120000);
           _handleStreamError(source);
         },1500);
         return;
@@ -3629,6 +3756,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(await _restoreSettledSession(source)) return;
       if(_deferStreamErrorIfOffline()) return;
       if(_deferStreamErrorIfPageHidden(source)) return;
+      _flushReasoningToAnchor();
+      _scheduleAnchorRegistryCleanup(120000);
       _handleStreamError(source);
     });
 
@@ -3646,6 +3775,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _clearOwnerInflightState();
       _clearApprovalForOwner();
       _clearClarifyForOwner('cancelled');
+      let _cancelData={};
+      try{ _cancelData=JSON.parse(e.data||'{}')||{}; }catch(_){ _cancelData={}; }
+      _flushReasoningToAnchor();
+      _applyToAnchor('cancel',{
+        status:_cancelData.status||_cancelData.type||'cancelled',
+        message:_cancelData.message||'',
+        session_id:_cancelData.session_id||activeSid,
+      },e);
+      _scheduleAnchorRegistryCleanup();
       if(S.session&&S.session.session_id===activeSid){
         S.activeStreamId=null;
       }
@@ -3701,7 +3839,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     return `${m.role}|${ts}|${body.slice(0,160)}`;
   }
-  const _EPHEMERAL_TURN_FIELDS=['_turnUsage','_turnDuration','_turnTps','_gatewayRouting','_statusCard'];
+  const _EPHEMERAL_TURN_FIELDS=['_turnUsage','_turnDuration','_turnTps','_gatewayRouting','_statusCard','_anchor_stream_id'];
   function _carryForwardEphemeralTurnFields(prevMessages, nextMessages){
     if(!Array.isArray(prevMessages)||!Array.isArray(nextMessages)) return nextMessages;
     if(!prevMessages.length||!nextMessages.length) return nextMessages;
@@ -3746,6 +3884,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _smdEndParser();
       if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
       _clearOwnerInflightState();
+      _flushReasoningToAnchor();
+      _scheduleAnchorRegistryCleanup();
       _closeSource(source);
       _clearApprovalForOwner();
       _clearClarifyForOwner('terminal');
@@ -3855,6 +3995,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             renderMessages({preserveScroll:true});
             renderSessionList();
           }
+          _scheduleAnchorRegistryCleanup(120000);
           return;
         }
       }catch(_){}
@@ -4007,6 +4148,14 @@ function _approvalPromptBelongsToActiveSession(sid) {
   return !!(sid && _promptActiveSessionId() === sid);
 }
 
+function activeSessionHasPendingPromptAttention() {
+  const sid = _promptActiveSessionId();
+  return !!(sid && (
+    _approvalPendingBySession.has(sid) ||
+    _clarifyPendingBySession.has(sid)
+  ));
+}
+
 function _rememberApprovalPending(pending, pendingCount) {
   if (!pending) return null;
   const sid = pending._session_id || _promptActiveSessionId();
@@ -4017,7 +4166,10 @@ function _rememberApprovalPending(pending, pendingCount) {
 }
 
 function _clearApprovalPendingForSession(sid) {
-  if (sid) _approvalPendingBySession.delete(sid);
+  if (sid) {
+    _approvalPendingBySession.delete(sid);
+    if (typeof syncTopbar === 'function') syncTopbar();
+  }
 }
 
 function _hideApprovalCardIfOwner(sid, force=false) {
@@ -4085,6 +4237,7 @@ function showApprovalCard(pending, pendingCount) {
   if (onceBtn && document.activeElement !== $('msg')) {
     setTimeout(() => onceBtn.focus({preventScroll: true}), 50);
   }
+  if (typeof syncTopbar === 'function') syncTopbar();
 }
 
 function _syncApprovalCollapseButton(card) {
@@ -4471,7 +4624,10 @@ function _rememberClarifyPending(pending) {
 }
 
 function _clearClarifyPendingForSession(sid) {
-  if (sid) _clarifyPendingBySession.delete(sid);
+  if (sid) {
+    _clarifyPendingBySession.delete(sid);
+    if (typeof syncTopbar === 'function') syncTopbar();
+  }
 }
 
 function _hideClarifyCardIfOwner(sid, force=false, reason="dismissed") {
@@ -4493,8 +4649,15 @@ function showClarifyForSession(sid, pending) {
 }
 
 function _renderPendingPromptsForActiveSession() {
+  const sid = _promptActiveSessionId();
   _renderPendingApprovalForActiveSession();
   _renderPendingClarifyForActiveSession();
+  if (
+    sid &&
+    typeof activeSessionHasPendingPromptAttention === 'function' &&
+    activeSessionHasPendingPromptAttention()
+  ) return;
+  if (typeof syncTopbar === 'function') syncTopbar();
 }
 
 function _ensureClarifyCardDom() {
@@ -4847,6 +5010,7 @@ function showClarifyCard(pending) {
   if (input && !sameClarify && document.activeElement !== $('msg')) {
     input.focus({preventScroll: true});
   }
+  if (typeof syncTopbar === 'function') syncTopbar();
 }
 
 async function respondClarify(response) {
@@ -5070,11 +5234,17 @@ function _showPwaNotification(title,body,options={}){
 function requestNotificationPermission(){
   if(!('Notification' in window)){
     if(typeof showToast==='function') showToast(t('notifications_unsupported'),3000,'error');
+    if(typeof updateNotificationPermissionStatus==='function') updateNotificationPermissionStatus();
     return Promise.resolve('unsupported');
   }
-  if(Notification.permission==='granted') return Promise.resolve('granted');
+  if(Notification.permission==='granted'){
+    if(typeof updateNotificationPermissionStatus==='function') updateNotificationPermissionStatus();
+    if(typeof showToast==='function') showToast(t('notifications_enabled_toast'),3000);
+    return Promise.resolve('granted');
+  }
   if(Notification.permission==='denied'){
     if(typeof showToast==='function') showToast(t('notifications_denied'),3500,'error');
+    if(typeof updateNotificationPermissionStatus==='function') updateNotificationPermissionStatus();
     return Promise.resolve('denied');
   }
   return Notification.requestPermission().then(p=>{
