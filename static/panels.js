@@ -538,11 +538,19 @@ async function loadCrons(animate) {
       return;
     }
     box.innerHTML = '';
+    // Partition active vs paused so paused jobs don't drown the list (#4026).
+    // _cronList stays the single source of truth — only the render is split,
+    // which keeps openCronDetail, _cronNewJobIds, and detail refresh untouched.
+    const _activeJobs = [];
+    const _pausedJobs = [];
     for (const job of _cronList) {
+      const status = _cronStatusMeta(job);
+      (status.state === 'paused' ? _pausedJobs : _activeJobs).push({ job, status });
+    }
+    const _appendCronItem = (parent, { job, status }) => {
       const item = document.createElement('div');
       item.className = 'cron-item';
       item.id = 'cron-' + job.id;
-      const status = _cronStatusMeta(job);
       const isNewRun = _cronNewJobIds.has(String(job.id));
       const isAgentMode = !job.no_agent;
       const profileLabel = _cronProfileLabel(job.profile);
@@ -557,7 +565,29 @@ async function loadCrons(animate) {
         </div>`;
       item.onclick = () => openCronDetail(job.id, item);
       if (_currentCronDetail && _currentCronDetail.id === job.id) item.classList.add('active');
-      box.appendChild(item);
+      parent.appendChild(item);
+    };
+    for (const entry of _activeJobs) _appendCronItem(box, entry);
+    if (_pausedJobs.length) {
+      let collapsed = true;
+      try { collapsed = localStorage.getItem('cron-paused-collapsed') !== '0'; } catch (_e) {}
+      const details = document.createElement('details');
+      details.className = 'cron-paused-section';
+      if (!collapsed) details.open = true;
+      const pausedLabel = t('cron_status_paused') || 'paused';
+      const headerLabel = pausedLabel.charAt(0).toUpperCase() + pausedLabel.slice(1);
+      const summary = document.createElement('summary');
+      summary.className = 'cron-paused-summary';
+      summary.textContent = `${headerLabel} (${_pausedJobs.length})`;
+      details.appendChild(summary);
+      details.addEventListener('toggle', () => {
+        try { localStorage.setItem('cron-paused-collapsed', details.open ? '0' : '1'); } catch (_e) {}
+      });
+      const inner = document.createElement('div');
+      inner.className = 'cron-paused-inner';
+      details.appendChild(inner);
+      for (const entry of _pausedJobs) _appendCronItem(inner, entry);
+      box.appendChild(details);
     }
     // Re-render current detail with fresh data if we have one and we're not in a form
     if (_currentCronDetail && _cronMode !== 'create' && _cronMode !== 'edit') {
@@ -3597,9 +3627,96 @@ function _renderLlmWikiStatus(d) {
       </div>
       <div class="wiki-status-footer">
         <span>${esc(toggleNote)}</span>
-        <a href="${esc(docsUrl)}" target="_blank" rel="noopener noreferrer">Docs</a>
+        <div style="display:flex;align-items:center;gap:8px;">
+          ${isReady || isEmpty ? `<button class="wiki-browse-btn" onclick="_openWikiBrowser()">${esc(t('wiki_browse'))}</button>` : ''}
+          <a href="${esc(docsUrl)}" target="_blank" rel="noopener noreferrer">Docs</a>
+        </div>
       </div>
     </div>`;
+}
+
+async function _openWikiBrowser() {
+  const existing = document.getElementById('wikiBrowserOverlay');
+  if (existing) { existing.style.display = 'flex'; return; }
+
+  const overlay = document.createElement('div');
+  overlay.id = 'wikiBrowserOverlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:9999;';
+
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.style.display = 'none'; });
+  document.addEventListener('keydown', function escHandler(e) {
+    if (e.key === 'Escape') { overlay.style.display = 'none'; document.removeEventListener('keydown', escHandler); }
+  });
+
+  const panel = document.createElement('div');
+  panel.style.cssText = 'background:var(--bg);border:1px solid var(--border);border-radius:8px;width:min(720px,95vw);max-height:80vh;display:flex;flex-direction:column;overflow:hidden;';
+
+  panel.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border);">
+      <strong style="font-size:14px;">${esc(t('wiki_browse'))}</strong>
+      <button onclick="document.getElementById('wikiBrowserOverlay').style.display='none'" style="background:none;border:none;cursor:pointer;font-size:18px;color:var(--muted);">&#x2715;</button>
+    </div>
+    <div style="padding:10px 16px;border-bottom:1px solid var(--border);">
+      <input id="wikiBrowserSearch" type="text" placeholder="${esc(t('wiki_search_placeholder'))}" style="width:100%;padding:6px 10px;background:var(--input-bg,var(--bg));border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;box-sizing:border-box;" />
+    </div>
+    <div id="wikiBrowserList" style="flex:1;overflow-y:auto;padding:8px 0;min-height:80px;"></div>
+    <div id="wikiBrowserContent" style="display:none;flex:1;overflow-y:auto;padding:16px;border-top:1px solid var(--border);"></div>`;
+
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+
+  const listEl = document.getElementById('wikiBrowserList');
+  const contentEl = document.getElementById('wikiBrowserContent');
+  const searchEl = document.getElementById('wikiBrowserSearch');
+  let _pages = [];
+
+  function _renderWikiPageList(filter) {
+    const q = (filter || '').toLowerCase();
+    const visible = q ? _pages.filter(p => p.name.toLowerCase().includes(q)) : _pages;
+    if (!visible.length) {
+      listEl.innerHTML = `<div style="padding:12px 16px;color:var(--muted);font-size:13px;">${esc(t('wiki_no_pages'))}</div>`;
+      return;
+    }
+    listEl.innerHTML = visible.map(p =>
+      `<div class="wiki-browser-item" data-path="${esc(p.path)}" style="padding:7px 16px;cursor:pointer;font-size:13px;border-radius:4px;margin:0 6px;" onmouseover="this.style.background='var(--hover,rgba(255,255,255,0.07))'" onmouseout="this.style.background=''" onclick="window._wikiBrowserOpenPage(this.dataset.path)">${esc(p.name)}</div>`
+    ).join('');
+  }
+
+  window._wikiBrowserOpenPage = async function(path) {
+    contentEl.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:13px;">Loading...</div>';
+    contentEl.style.display = 'block';
+    listEl.style.display = 'none';
+    try {
+      const data = await api('/api/wiki/page?path=' + encodeURIComponent(path));
+      if (typeof renderMarkdownPreviewContent === 'function') {
+        contentEl.innerHTML = '<button onclick="window._wikiBrowserBack()" style="margin-bottom:10px;background:none;border:1px solid var(--border);border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px;color:var(--text);">&#8592; Back</button><div id="wikiBrowserMd"></div>';
+        renderMarkdownPreviewContent({content: data.content, el: document.getElementById('wikiBrowserMd')});
+      } else {
+        contentEl.innerHTML = '<button onclick="window._wikiBrowserBack()" style="margin-bottom:10px;background:none;border:1px solid var(--border);border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px;color:var(--text);">&#8592; Back</button><pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;margin:0;">' + esc(data.content) + '</pre>';
+      }
+    } catch(e) {
+      contentEl.innerHTML = '<button onclick="window._wikiBrowserBack()" style="margin-bottom:10px;background:none;border:1px solid var(--border);border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px;color:var(--text);">&#8592; Back</button><div style="color:var(--error,#f55);">' + esc(e.message || String(e)) + '</div>';
+    }
+  };
+
+  window._wikiBrowserBack = function() {
+    contentEl.style.display = 'none';
+    listEl.style.display = '';
+  };
+
+  searchEl.addEventListener('input', () => _renderWikiPageList(searchEl.value));
+
+  try {
+    const data = await api('/api/wiki/browse');
+    _pages = Array.isArray(data && data.pages) ? data.pages : [];
+    if (!_pages.length) {
+      listEl.innerHTML = `<div style="padding:12px 16px;color:var(--muted);font-size:13px;">${esc(t('wiki_no_pages'))}</div>`;
+    } else {
+      _renderWikiPageList('');
+    }
+  } catch(e) {
+    listEl.innerHTML = `<div style="padding:12px 16px;color:var(--error,#f55);font-size:13px;">${esc(e.message || String(e))}</div>`;
+  }
 }
 
 /**
@@ -8213,12 +8330,22 @@ async function checkUpdatesNow(){
       const agentPart=formatUpdatePart('Agent',data.agent);
       if(webuiPart) parts.push(webuiPart);
       if(agentPart) parts.push(agentPart);
+      // Track non-git targets separately so a mixed deployment (one git
+      // checkout + one no-git install) never hides the "can't check" state
+      // behind an up-to-date summary (#4356).
+      const noGitParts=[];
+      if(data.webui&&data.webui.no_git) noGitParts.push('WebUI');
+      if(data.agent&&data.agent.no_git&&!data.agent.ignored) noGitParts.push('Agent');
       if(parts.length){
-        if(status){status.textContent=t('settings_updates_available').replace('{count}',parts.join(', '));status.style.color='var(--accent)';}
+        let txt=t('settings_updates_available').replace('{count}',parts.join(', '));
+        if(noGitParts.length) txt+=' · '+t('settings_update_no_git');
+        if(status){status.textContent=txt;status.style.color='var(--accent)';}
         // Also trigger the update banner
         if(typeof _showUpdateBanner==='function') _showUpdateBanner(data);
       } else if(errorParts.length){
         if(status){status.textContent=t('settings_update_check_failed')+': '+errorParts.join(', ');status.style.color='var(--error)';}
+      } else if(noGitParts.length){
+        if(status){status.textContent=t('settings_update_no_git');status.style.color='var(--muted)';}
       } else {
         if(status){status.textContent=t('settings_up_to_date');status.style.color='var(--success)';}
         if(typeof _showUpdateBanner==='function') _showUpdateBanner(data);
@@ -9078,37 +9205,64 @@ function loadMcpTools(){
     filterMcpTools();
   }).catch(()=>{list.innerHTML=`<div class="mcp-tool-error-state" style="color:#ef4444;font-size:12px;padding:6px 0">${esc(t('mcp_tools_load_failed'))}</div>`});
 }
+let _gatewayActionInFlight=false;
+function _gatewayActionButton(action){
+  const labels={start:t('gateway_start'),stop:t('gateway_stop'),restart:t('gateway_restart')};
+  return `<button class="sm-btn gateway-action-btn" data-gateway-action="${esc(action)}" onclick="_gatewayAction('${esc(action)}')" ${_gatewayActionInFlight?'disabled':''} style="padding:5px 10px;font-size:12px">${esc(labels[action]||action)}</button>`;
+}
+function _gatewayActionControls(r){
+  const actions=(r&&r.running)?['stop','restart']:['start'];
+  return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">${actions.map(_gatewayActionButton).join('')}</div>`;
+}
+function _renderGatewayStatus(r){
+  const card=$('gatewayStatusCard');
+  if(!card||!r) return;
+  if(!r.configured){
+    card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#f59e0b;display:inline-block"></span>${esc(t('gateway_not_configured'))}</div>${_gatewayActionControls(r)}`;
+    return;
+  }
+  if(!r.running){
+    const reason = _gatewayStatusReason(r);
+    const statusLabel = reason === 'gateway_stale_running_state'
+      ? t('gateway_metadata_stale')
+      : reason === 'remote_gateway_unreachable'
+        ? t('gateway_endpoint_unreachable')
+        : t('gateway_not_running');
+    card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#ef4444;display:inline-block"></span>${esc(statusLabel)}</div>${_gatewayActionControls(r)}`;
+    return;
+  }
+  const platformIcons={telegram:'💬',discord:'🎮',slack:'📝',web:'🌐',api:'🔌'};
+  let badges='';
+  if(r.platforms&&r.platforms.length){
+    badges=r.platforms.map(p=>{
+      const icon=platformIcons[p.name]||'📡';
+      return `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:var(--code-bg);border:1px solid var(--border2);border-radius:12px;font-size:12px;font-weight:500">${icon} ${esc(p.label)}</span>`;
+    }).join(' ');
+  }
+  const lastActive=r.last_active?`<span style="font-size:11px;color:var(--muted)">${esc(t('gateway_last_active'))}: ${esc(new Date(r.last_active).toLocaleString())}</span>`:'';
+  const sessionInfo=r.session_count?`<span style="font-size:11px;color:var(--muted)">${r.session_count} ${esc(r.session_count!==1?t('gateway_sessions'):t('gateway_session'))}</span>`:'';
+  card.innerHTML=`<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block"></span><span style="font-size:13px;font-weight:500;color:#22c55e">${esc(t('gateway_running'))}</span></div>${badges?`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${badges}</div>`:''}<div style="display:flex;gap:12px">${sessionInfo}${lastActive}</div>${_gatewayActionControls(r)}`;
+}
 function loadGatewayStatus(){
   const card=$('gatewayStatusCard');
   if(!card) return;
-  api('/api/gateway/status').then(r=>{
-    if(!r) return;
-    if(!r.configured){
-      card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#f59e0b;display:inline-block"></span>${esc(t('gateway_not_configured'))}</div>`;
-      return;
-    }
-    if(!r.running){
-      const reason = _gatewayStatusReason(r);
-      const statusLabel = reason === 'gateway_stale_running_state'
-        ? t('gateway_metadata_stale')
-        : reason === 'remote_gateway_unreachable'
-          ? t('gateway_endpoint_unreachable')
-          : t('gateway_not_running');
-      card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#ef4444;display:inline-block"></span>${esc(statusLabel)}</div>`;
-      return;
-    }
-    const platformIcons={telegram:'💬',discord:'🎮',slack:'📝',web:'🌐',api:'🔌'};
-    let badges='';
-    if(r.platforms&&r.platforms.length){
-      badges=r.platforms.map(p=>{
-        const icon=platformIcons[p.name]||'📡';
-        return `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:var(--code-bg);border:1px solid var(--border2);border-radius:12px;font-size:12px;font-weight:500">${icon} ${esc(p.label)}</span>`;
-      }).join(' ');
-    }
-    const lastActive=r.last_active?`<span style="font-size:11px;color:var(--muted)">${esc(t('gateway_last_active'))}${esc(new Date(r.last_active).toLocaleString())}</span>`:'';
-    const sessionInfo=r.session_count?`<span style="font-size:11px;color:var(--muted)">${esc(t('gateway_session_count',r.session_count))}</span>`:'';
-    card.innerHTML=`<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block"></span><span style="font-size:13px;font-weight:500;color:#22c55e">${esc(t('gateway_running_label'))}</span></div>${badges?`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${badges}</div>`:''}<div style="display:flex;gap:12px">${sessionInfo}${lastActive}</div>`;
-  }).catch(()=>{card.innerHTML=`<div style="color:#ef4444;font-size:12px">${esc(t('gateway_load_failed'))}</div>`});
+  return api('/api/gateway/status').then(r=>_renderGatewayStatus(r)).catch(()=>{card.innerHTML=`<div style="color:#ef4444;font-size:12px">${esc(t('gateway_status_load_failed'))}</div>`});
+}
+async function _gatewayAction(action){
+  if(_gatewayActionInFlight) return;
+  _gatewayActionInFlight=true;
+  const buttons=[...document.querySelectorAll('.gateway-action-btn')];
+  buttons.forEach(btn=>{btn.disabled=true;});
+  try{
+    const result=await api(`/api/gateway/${encodeURIComponent(action)}`,{method:'POST',body:JSON.stringify({}),timeoutMs:70000,timeoutToast:false});
+    if(typeof showToast==='function') showToast(result&&result.message?result.message:t(`gateway_${action}_success`),3000,'success');
+  }catch(e){
+    const msg=e&&e.message?e.message:String(e||'');
+    if(typeof showToast==='function') showToast(`${t(`gateway_${action}_failed`)}${msg?': '+msg:''}`,5000,'error');
+  }finally{
+    _gatewayActionInFlight=false;
+    await loadGatewayStatus();
+  }
 }
 // Load MCP servers when system settings tab opens
 const _origSwitchSettings=switchSettingsSection;

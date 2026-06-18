@@ -143,7 +143,7 @@
 <body>
 <header class="app-titlebar" role="banner">
   <button class="app-titlebar-hamburger has-tooltip has-tooltip--bottom" id="btnHamburger" onclick="toggleMobileSidebar()" type="button" data-tooltip="Menu" aria-label="Menu">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
   </button>
   <div class="app-titlebar-inner">
     <span class="app-titlebar-icon" aria-hidden="true">
@@ -435,6 +435,11 @@
     <div class="messages-shell">
       <button id="jumpToSessionStartBtn" class="session-jump-btn session-jump-btn--start" aria-label="Jump to beginning of session" data-i18n-aria-label="session_jump_start_label" data-i18n-title="session_jump_start_label" onclick="jumpToSessionStart()" style="display:none"><span aria-hidden="true">↑</span><span data-i18n="session_jump_start">Start</span></button>
       <button id="scrollToBottomBtn" class="scroll-to-bottom-btn" style="display:none" onclick="scrollToBottom()" aria-label="Scroll to bottom" data-i18n-aria-label="session_jump_end_label" data-i18n-title="session_jump_end_label"><span aria-hidden="true">↓</span><span class="session-jump-btn__text" data-i18n="session_jump_end">End</span></button>
+      <button id="outlineToggleBtn" type="button" hidden
+        onclick="toggleOutlinePanel()"
+        title="Conversation outline"
+        aria-label="Toggle conversation outline"
+        aria-controls="outlinePanelWrapper">&#9776;</button>
     <div class="messages" id="messages">
       <div class="empty-state" id="emptyState">
         <div class="empty-logo"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="80" height="80" aria-label="Hermes caduceus">
@@ -588,6 +593,7 @@
       <div class="queue-pill-outer">
         <button id="queuePill" class="queue-pill" aria-label="Show queued messages" type="button"></button>
       </div>
+      <div id="composerSelectionChips" class="composer-selection-chips" hidden aria-live="polite"></div>
       <div class="composer-box" id="composerBox">
         <div class="cmd-dropdown" id="cmdDropdown"></div>
         <div class="drop-hint" id="dropHint">
@@ -1668,12 +1674,6 @@
     </div>
   </div>
 </div>
-<!-- Conversation Outline Panel (#2124): floating jump-to-question panel -->
-<button id="outlineToggleBtn" type="button" hidden
-  onclick="toggleOutlinePanel()"
-  title="Conversation outline"
-  aria-label="Toggle conversation outline"
-  aria-controls="outlinePanelWrapper">&#9776;</button>
 <div id="outlinePanelWrapper" hidden
   role="navigation" aria-label="Conversation outline">
   <div class="outline-header">

@@ -668,6 +668,11 @@ async function newSession(flash, options={}){
   }
   _setNewSessionPending(true);
   _newSessionInFlight=(async()=>{
+    // Starting a brand-new chat must not carry named context blocks selected in
+    // the previous conversation (#2543). loadSession() clears these on a sidebar
+    // switch, but the New Chat path replaces S.session here without going through
+    // loadSession(), so clear them explicitly before the session is replaced.
+    if(typeof window._clearPendingSelections==='function') window._clearPendingSelections();
     updateQueueBadge();
     S.toolCalls=[];
     _messagesTruncated=false;
@@ -895,6 +900,7 @@ async function loadSession(sid){
   // restored when the user switches back (#1060). Save to server now so the
   // draft survives page refresh and syncs across clients.
   if (currentSid && currentSid !== sid) {
+    if(typeof window._clearPendingSelections==='function') window._clearPendingSelections();
     await _saveComposerDraftNow(currentSid, ($('msg') || {}).value || '', S.pendingFiles ? [...S.pendingFiles] : []);
     // The awaited draft save above yields the event loop. If another
     // loadSession() started for a different session while we were waiting

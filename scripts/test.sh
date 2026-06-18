@@ -207,8 +207,8 @@ else
     echo "Missing modules: $missing" >&2
   fi
   ensure_pip "$PYTHON_BIN"
-  "$PYTHON_BIN" -m pip install --upgrade pip
-  "$PYTHON_BIN" -m pip install -r "$REQ_FILE"
+  "$PYTHON_BIN" -m pip install --no-user --upgrade pip
+  "$PYTHON_BIN" -m pip install --no-user -r "$REQ_FILE"
 fi
 
 if [[ $# -eq 0 ]]; then

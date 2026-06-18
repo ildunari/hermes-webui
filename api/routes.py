@@ -949,6 +949,206 @@ def _load_gateway_session_identity_map() -> dict[str, dict]:
     return mapping.copy()
 
 
+def _gateway_status_payload() -> dict:
+    import datetime
+
+    identity_map = _load_gateway_session_identity_map()
+    sessions_path = _gateway_session_metadata_path()
+
+    # Detect whether the gateway process is alive, independent of connected
+    # messaging platforms. An empty identity_map means zero connected
+    # platforms, not necessarily a stopped gateway.
+    health = build_agent_health_payload()
+    alive = health.get("alive")
+    details = health.get("details") if isinstance(health.get("details"), dict) else {}
+    health_reason = details.get("reason")
+    health_state = details.get("state")
+    health_gateway_state = details.get("gateway_state")
+    if alive is True:
+        running = True
+        configured = True
+    elif alive is False:
+        running = False
+        configured = True
+    else:
+        gateway_running_metadata = (
+            health_reason == "gateway_stale_running_state"
+            or health_gateway_state == "running"
+        )
+        configured = True if gateway_running_metadata else bool(identity_map)
+        running = bool(identity_map)
+
+    platforms_set: set[str] = set()
+    for meta in identity_map.values():
+        raw = meta.get("raw_source") or meta.get("platform") or ""
+        norm = _normalize_messaging_source(raw)
+        if norm:
+            platforms_set.add(norm)
+    platform_labels = {
+        "telegram": "Telegram",
+        "discord": "Discord",
+        "slack": "Slack",
+        "email": "Email",
+        "web": "Web",
+        "api": "API",
+    }
+    platforms = sorted(
+        [{"name": p, "label": platform_labels.get(p, p.title())} for p in platforms_set],
+        key=lambda x: x["label"],
+    )
+    last_active = ""
+    if running and sessions_path.exists():
+        try:
+            mtime = sessions_path.stat().st_mtime
+            last_active = datetime.datetime.fromtimestamp(mtime).isoformat()
+        except Exception:
+            pass
+    return {
+        "running": running,
+        "configured": configured,
+        "platforms": platforms,
+        "last_active": last_active,
+        "session_count": len(identity_map),
+        "health": {
+            "state": health_state,
+            "reason": health_reason,
+            "gateway_state": health_gateway_state,
+        },
+    }
+
+
+_GATEWAY_LIFECYCLE_TIMEOUT_SECONDS = 60
+
+# Server-side single-flight guard for gateway lifecycle actions. The client
+# disables its button while a request is in flight, but a scripted authed
+# client could still fire overlapping start/stop/restart calls, spawning
+# concurrent `hermes gateway` subprocesses. Serialize them here (mirrors the
+# self-update _apply_lock pattern): a non-blocking acquire returns 409 on
+# contention rather than launching a second overlapping subprocess.
+_GATEWAY_ACTION_LOCK = threading.Lock()
+
+
+def _run_gateway_lifecycle_command(action: str) -> subprocess.CompletedProcess:
+    if action not in {"start", "stop", "restart"}:
+        raise ValueError("unsupported gateway action")
+
+    from api import config as api_config
+    from api.profiles import get_active_profile_name
+
+    agent_dir = getattr(api_config, "_AGENT_DIR", None)
+    if not agent_dir:
+        raise FileNotFoundError("Hermes agent checkout not found")
+    agent_dir = Path(agent_dir).expanduser().resolve()
+    main_py = agent_dir / "hermes_cli" / "main.py"
+    if not main_py.exists():
+        raise FileNotFoundError("Hermes agent CLI entrypoint not found")
+
+    cmd = [str(getattr(api_config, "PYTHON_EXE", sys.executable)), str(main_py)]
+    profile_name = ""
+    try:
+        profile_name = str(get_active_profile_name() or "").strip()
+    except Exception as exc:
+        logger.debug("Could not resolve active profile for gateway lifecycle: %s", exc)
+    if profile_name and profile_name != "default":
+        cmd.extend(["--profile", profile_name])
+    cmd.extend(["gateway", action])
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("BROWSER", "echo")
+    return subprocess.run(
+        cmd,
+        cwd=str(agent_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=_GATEWAY_LIFECYCLE_TIMEOUT_SECONDS,
+    )
+
+
+def _handle_gateway_lifecycle(handler, action: str, body: dict):
+    del body  # Reserved for future per-gateway naming without changing the route contract.
+    # Reject overlapping lifecycle actions instead of spawning concurrent
+    # `hermes gateway` subprocesses (a non-blocking acquire — the action holds
+    # the lock for at most _GATEWAY_LIFECYCLE_TIMEOUT_SECONDS).
+    if action not in {"start", "stop", "restart"}:
+        return bad(handler, "unsupported gateway action", 400)
+    if not _GATEWAY_ACTION_LOCK.acquire(blocking=False):
+        return j(
+            handler,
+            {
+                "ok": False,
+                "error": "Another gateway action is already in progress; try again shortly.",
+                "action": action,
+            },
+            status=409,
+        )
+    try:
+        result = _run_gateway_lifecycle_command(action)
+    except ValueError as exc:
+        return bad(handler, str(exc), 400)
+    except FileNotFoundError as exc:
+        return j(handler, {"ok": False, "error": _sanitize_error(exc), "action": action}, status=500)
+    except subprocess.TimeoutExpired as exc:
+        logger.warning(
+            "Gateway %s command timed out after %ss; stdout=%r stderr=%r",
+            action,
+            _GATEWAY_LIFECYCLE_TIMEOUT_SECONDS,
+            exc.stdout,
+            exc.stderr,
+        )
+        return j(
+            handler,
+            {
+                "ok": False,
+                "error": f"Gateway {action} timed out after {_GATEWAY_LIFECYCLE_TIMEOUT_SECONDS} seconds",
+                "action": action,
+            },
+            status=504,
+        )
+    except Exception as exc:
+        logger.exception("Gateway %s command failed before completion", action)
+        return j(handler, {"ok": False, "error": _sanitize_error(exc), "action": action}, status=500)
+    finally:
+        _GATEWAY_ACTION_LOCK.release()
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        logger.warning(
+            "Gateway %s command failed with exit code %s; stdout=%r stderr=%r",
+            action,
+            result.returncode,
+            stdout,
+            stderr,
+        )
+        return j(
+            handler,
+            {
+                "ok": False,
+                "error": f"Gateway {action} failed with exit code {result.returncode}",
+                "action": action,
+                "returncode": result.returncode,
+            },
+            status=500,
+        )
+
+    return j(
+        handler,
+        {
+            "ok": True,
+            "action": action,
+            # Do NOT return captured stdout/stderr — the `hermes gateway` CLI
+            # prints service/PID/status details the browser shouldn't receive
+            # (mirrors the failure path, which already suppresses them). The
+            # frontend localizes its own success copy; the refreshed status
+            # payload carries the user-facing state.
+            "message": f"Gateway {action} completed.",
+            "status": _gateway_status_payload(),
+        },
+    )
+
+
 def _mark_cron_running(job_id: str):
     with _RUNNING_CRON_LOCK:
         _RUNNING_CRON_JOBS[job_id] = time.time()
@@ -2393,7 +2593,7 @@ def _get_or_materialize_session(sid: str):
 
     # Preserve source metadata fields
     def _apply_source_meta(s):
-        s.is_cli_session = True
+        s.is_cli_session = is_cli_session_row(cli_meta)
         s.source_tag = cli_meta.get("source_tag")
         s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
         s.session_source = cli_meta.get("session_source")
@@ -5402,6 +5602,9 @@ def _llm_wiki_config_path() -> str | None:
 # Cap WIKI walks to prevent self-DoS if WIKI_PATH points at /, /etc, /home, etc.
 # Real LLM wikis have under a few thousand files; 10k is generous and catches misconfig.
 _LLM_WIKI_MAX_FILES = 10000
+# Cap a single served wiki page at 2 MiB so a huge/binary file can't be slurped
+# wholesale into memory + a JSON response (DoS / memory-blowup guard).
+_LLM_WIKI_MAX_PAGE_BYTES = 2 * 1024 * 1024
 # Refuse to walk these system roots even if explicitly configured.
 _LLM_WIKI_FORBIDDEN_ROOTS = frozenset(
     str(Path(p).expanduser().resolve()) for p in ("/", "/etc", "/usr", "/var", "/opt", "/sys", "/proc")
@@ -5460,16 +5663,31 @@ def _llm_wiki_count_files(root: Path) -> int:
 
 def _llm_wiki_page_files(wiki_path: Path) -> list[Path]:
     pages: list[Path] = []
-    # Defense in depth: refuse forbidden system roots.
+    # Defense in depth: refuse forbidden system roots, and resolve the wiki root
+    # ONCE as the single trust base for all containment checks below.
     try:
-        if str(wiki_path.resolve()) in _LLM_WIKI_FORBIDDEN_ROOTS:
+        wiki_real = wiki_path.resolve()
+        if str(wiki_real) in _LLM_WIKI_FORBIDDEN_ROOTS:
             return pages
     except Exception:
         return pages
+
+    def _is_clean_relpath(rel: Path) -> bool:
+        # No dot-prefixed segment (dotfile/dotdir) anywhere in the path.
+        return not any(part.startswith(".") for part in rel.parts)
+
     iterated = 0
     for dirname in _LLM_WIKI_PAGE_DIRS:
         section = wiki_path / dirname
         if not section.exists() or not section.is_dir():
+            continue
+        # The section itself must resolve UNDER the real wiki root — guards a
+        # symlinked section (e.g. concepts -> /tmp/outside) from exposing files
+        # outside the wiki tree entirely.
+        try:
+            section_real = section.resolve()
+            section_real.relative_to(wiki_real)
+        except (OSError, ValueError):
             continue
         for item in section.rglob("*.md"):
             iterated += 1
@@ -5477,9 +5695,21 @@ def _llm_wiki_page_files(wiki_path: Path) -> list[Path]:
                 return pages  # bounded
             try:
                 rel = item.relative_to(section)
-                if item.is_file() and not any(part.startswith(".") for part in rel.parts):
-                    pages.append(item)
-            except Exception:
+                if not item.is_file() or not _is_clean_relpath(rel):
+                    continue
+                # Resolve the real target and require it to live under BOTH the
+                # real wiki root and the real section, with no dot-prefixed
+                # segment on the resolved-relative path. This closes symlink
+                # escapes whose link name looks like a clean *.md page but whose
+                # target is an arbitrary / hidden / out-of-tree file (the read
+                # endpoint would otherwise serve it).
+                item_real = item.resolve()
+                item_real.relative_to(section_real)
+                rel_real = item_real.relative_to(wiki_real)
+                if not _is_clean_relpath(rel_real):
+                    continue
+                pages.append(item)
+            except (OSError, ValueError):
                 continue
     return pages
 
@@ -6836,6 +7066,91 @@ def handle_get(handler, parsed) -> bool:
         return True
     if parsed.path == "/api/wiki/status":
         return _handle_llm_wiki_status(handler, parsed)
+    if parsed.path == "/api/wiki/browse":
+        wiki_root, _, _ = _llm_wiki_resolve_path()
+        if not wiki_root or not os.path.isdir(wiki_root):
+            return bad(handler, "Wiki not configured or directory not found", status=404)
+        page_paths = _llm_wiki_page_files(wiki_root)
+        pages = []
+        for fp in sorted(page_paths, key=lambda p: str(p).lower()):
+            try:
+                rel = fp.relative_to(wiki_root)
+            except ValueError:
+                continue
+            try:
+                st = fp.stat()
+            except OSError:
+                continue
+            pages.append({"name": fp.name, "path": str(rel).replace("\\", "/"), "size": st.st_size, "mtime": int(st.st_mtime)})
+        return j(handler, {"pages": pages})
+    if parsed.path == "/api/wiki/page":
+        wiki_root, _, _ = _llm_wiki_resolve_path()
+        page_path = parse_qs(parsed.query or "").get("path", [""])[0]
+        if not wiki_root or not page_path:
+            return bad(handler, "Wiki not configured or path not provided", status=400)
+        # Reject a real `..` path SEGMENT (or absolute path), not the bare
+        # substring — a legitimate listed filename like `v1..v2.md` contains
+        # ".." without being traversal. Containment + the resolved-allowlist
+        # membership check below are the actual security boundary.
+        _page_parts = page_path.replace("\\", "/").split("/")
+        if os.path.isabs(page_path) or any(part == ".." for part in _page_parts):
+            return bad(handler, "Invalid path", status=400)
+        full_path = Path(os.path.join(wiki_root, page_path))
+        if not _skill_path_within(Path(wiki_root), full_path):
+            return bad(handler, "Invalid path", status=400)
+        # Only serve files the browse/list path would surface (same allowlist:
+        # *.md under the wiki page-dirs, no dotfiles, forbidden-roots guard).
+        # Without this the read endpoint could return ANY file inside the wiki
+        # root (e.g. .env / .git/config / non-.md), since containment alone
+        # doesn't constrain which files are readable (Opus review finding).
+        # Capture each allowlisted page's STABLE IDENTITY (st_dev, st_ino) so the
+        # post-open fstat below can detect a file/parent-dir swapped in after the
+        # allowlist check (TOCTOU write-race, Codex finding) — a pathname re-open
+        # alone can't, since O_NOFOLLOW only guards the final component, not a
+        # swapped parent directory.
+        allowed_identity: dict[Path, tuple] = {}
+        try:
+            for _p in _llm_wiki_page_files(Path(wiki_root)):
+                try:
+                    rp = _p.resolve()
+                    st0 = rp.stat()
+                    allowed_identity[rp] = (st0.st_dev, st0.st_ino)
+                except OSError:
+                    continue
+        except Exception:
+            allowed_identity = {}
+        try:
+            resolved_target = full_path.resolve()
+        except OSError:
+            return bad(handler, "Page not found", status=404)
+        if resolved_target not in allowed_identity:
+            return bad(handler, "Page not found", status=404)
+        # Read the ALREADY-RESOLVED, allowlisted real path with O_NOFOLLOW so a
+        # symlink swapped in for the final component between the allowlist check
+        # and the read is refused rather than followed. Then fstat the open fd
+        # and require its (st_dev, st_ino) to match the identity captured during
+        # allowlisting — this closes a parent-directory swap that O_NOFOLLOW
+        # would otherwise follow. Any mismatch / vanished / swapped page returns
+        # a clean 404, never a 500.
+        try:
+            fd = os.open(str(resolved_target), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                st_open = os.fstat(fd)
+                if (st_open.st_dev, st_open.st_ino) != allowed_identity[resolved_target]:
+                    return bad(handler, "Page not found", status=404)
+                raw = os.read(fd, _LLM_WIKI_MAX_PAGE_BYTES + 1)
+            finally:
+                os.close(fd)
+            if len(raw) > _LLM_WIKI_MAX_PAGE_BYTES:
+                raw = raw[:_LLM_WIKI_MAX_PAGE_BYTES]
+            content = raw.decode("utf-8", errors="replace")
+        except (FileNotFoundError, IsADirectoryError):
+            return bad(handler, "Page not found", status=404)
+        except OSError:
+            # ELOOP (symlink swapped in under O_NOFOLLOW) or any other read
+            # failure → clean 404, never a 500.
+            return bad(handler, "Could not read page", status=404)
+        return j(handler, {"content": content, "path": page_path})
     if parsed.path == "/api/logs":
         return _handle_logs(handler, parsed)
 
@@ -7862,97 +8177,7 @@ def handle_get(handler, parsed) -> bool:
 
     # ── Gateway Status (GET) ──
     if parsed.path == "/api/gateway/status":
-        import datetime
-        identity_map = _load_gateway_session_identity_map()
-        sessions_path = _gateway_session_metadata_path()
-
-        # Detect whether the gateway process is alive, independent of
-        # connected messaging platforms.  An empty identity_map just
-        # means zero platforms connected, not that the gateway is down.
-        #
-        # agent_health.build_agent_health_payload() is the authoritative
-        # signal: it reads gateway.status runtime metadata and returns a
-        # tri-state `alive` field (True/False/None).  This avoids the
-        # false-negative where the gateway is running but has zero active
-        # messaging sessions (empty identity_map).
-        #
-        # `alive` tri-state semantics:
-        #   True  → gateway process is alive
-        #   False → gateway metadata exists but process is down
-        #   None  → no gateway metadata/status available; this WebUI
-        #           setup is probably not configured with a gateway
-        health = build_agent_health_payload()
-        alive = health.get("alive")
-        details = health.get("details") if isinstance(health.get("details"), dict) else {}
-        health_reason = details.get("reason")
-        health_state = details.get("state")
-        health_gateway_state = details.get("gateway_state")
-        if alive is True:
-            running = True
-            configured = True
-        elif alive is False:
-            running = False
-            configured = True
-        else:  # alive is None
-            # `alive is None` conflates two very different states:
-            #   (a) no gateway metadata at all → genuinely not configured
-            #   (b) gateway metadata EXISTS but is stale/inconclusive.
-            # A stale-but-RUNNING gateway (freshly started, hasn't ticked
-            # `updated_at` yet, or cross-container) still proves the gateway is
-            # *configured* — the banner must not report "Gateway not configured"
-            # just because no conversation has happened yet and identity_map is
-            # empty (#3194).
-            #
-            # A stale-STOPPED gateway is deliberately NOT treated as configured:
-            # agent_health emits `gateway_stale_stopped_state` precisely so a
-            # stopped service the user isn't running reads like "no root gateway
-            # configured" rather than nagging (#1944). So stale-stopped falls
-            # through to the identity_map signal like the genuinely-unconfigured
-            # case.
-            gateway_running_metadata = (
-                health_reason == "gateway_stale_running_state"
-                or health_gateway_state == "running"
-            )
-            configured = True if gateway_running_metadata else bool(identity_map)
-            running = bool(identity_map)
-
-        platforms_set: set[str] = set()
-        for meta in identity_map.values():
-            raw = meta.get("raw_source") or meta.get("platform") or ""
-            norm = _normalize_messaging_source(raw)
-            if norm:
-                platforms_set.add(norm)
-        _PLATFORM_LABELS = {
-            "telegram": "Telegram",
-            "discord": "Discord",
-            "slack": "Slack",
-            "email": "Email",
-            "web": "Web",
-            "api": "API",
-        }
-        platforms = sorted(
-            [{"name": p, "label": _PLATFORM_LABELS.get(p, p.title())} for p in platforms_set],
-            key=lambda x: x["label"],
-        )
-        last_active = ""
-        if running and sessions_path.exists():
-            try:
-                mtime = sessions_path.stat().st_mtime
-                last_active = datetime.datetime.fromtimestamp(mtime).isoformat()
-            except Exception:
-                pass
-        return j(handler, {
-            "running": running,
-            "configured": configured,
-            "platforms": platforms,
-            "last_active": last_active,
-            "session_count": len(identity_map),
-            "health": {
-                "state": health_state,
-                "reason": health_reason,
-                "gateway_state": health_gateway_state,
-            },
-        })
+        return j(handler, _gateway_status_payload())
 
     # ── MCP Servers (GET) ──
     if parsed.path == "/api/mcp/servers":
@@ -9362,6 +9587,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/memory/write":
         return _handle_memory_write(handler, body)
 
+    if parsed.path in {"/api/gateway/start", "/api/gateway/stop", "/api/gateway/restart"}:
+        return _handle_gateway_lifecycle(handler, parsed.path.rsplit("/", 1)[-1], body)
+
     # ── Profile API (POST) ──
     if parsed.path == "/api/profile/switch":
         name = body.get("name", "").strip()
@@ -9708,7 +9936,7 @@ def handle_post(handler, parsed) -> bool:
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
                 )
-                s.is_cli_session = True
+                s.is_cli_session = is_cli_session_row(cli_meta)
                 s.source_tag = cli_meta.get("source_tag")
                 s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
                 s.session_source = cli_meta.get("session_source")
@@ -9733,7 +9961,7 @@ def handle_post(handler, parsed) -> bool:
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
                 )
-                s.is_cli_session = True
+                s.is_cli_session = is_cli_session_row(cli_meta)
                 s.source_tag = cli_meta.get("source_tag")
                 s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
                 s.session_source = cli_meta.get("session_source")

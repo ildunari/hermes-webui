@@ -3877,6 +3877,22 @@ def _all_profiles_cli_contexts() -> tuple[list[tuple[Path, Path, str | None]], t
     return contexts, tuple(cache_entries)
 
 
+def _state_projection_sidecar_metadata(sid: str) -> dict:
+    """Return UI-owned metadata for a state.db-projected sidebar row."""
+    metadata = {"title": None, "archived": False}
+    try:
+        webui_meta = Session.load_metadata_only(sid)
+    except Exception:
+        return metadata
+    if not webui_meta:
+        return metadata
+    title = getattr(webui_meta, 'title', None)
+    if title:
+        metadata["title"] = title
+    metadata["archived"] = bool(getattr(webui_meta, 'archived', False))
+    return metadata
+
+
 def _load_cli_sessions_uncached(
     hermes_home: Path,
     db_path: Path,
@@ -3944,15 +3960,14 @@ def _load_cli_sessions_uncached(
                 except Exception:
                     pass  # degrade gracefully
         # If a WebUI JSON file exists for this session (e.g. previously
-        # imported or renamed in the sidebar), prefer its title over the
-        # state.db title.  This fixes rename-not-persisting for CLI sessions
-        # after compression chain extension (#1486).
-        try:
-            _webui_meta = Session.load_metadata_only(sid)
-            if _webui_meta and getattr(_webui_meta, 'title', None):
-                _title = _webui_meta.title
-        except Exception:
-            pass
+        # imported or renamed in the sidebar), prefer its UI-owned metadata over
+        # the state.db projection. This keeps archived cron/tool/API runs hidden
+        # even when all_sessions() omits the hidden sidecar and the state row is
+        # re-injected from Hermes state.db (#4397).
+        _sidecar_meta = _state_projection_sidecar_metadata(sid)
+        if _sidecar_meta.get('title'):
+            _title = _sidecar_meta['title']
+        _archived = bool(_sidecar_meta.get('archived'))
         _display_title = _title or f'{_source.title()} Session'
         cli_sessions.append({
             'session_id': sid,
@@ -3963,7 +3978,7 @@ def _load_cli_sessions_uncached(
             'created_at': row['started_at'],
             'updated_at': raw_ts,
             'pinned': False,
-            'archived': False,
+            'archived': _archived,
             'project_id': _cron_pid() if is_cron_session(sid, _source) else None,
             'profile': profile,
             'source_tag': _source,
@@ -4033,12 +4048,10 @@ def _load_cli_sessions_uncached(
                                         break
                         except Exception:
                             pass
-                try:
-                    _webui_meta = Session.load_metadata_only(sid)
-                    if _webui_meta and getattr(_webui_meta, 'title', None):
-                        _title = _webui_meta.title
-                except Exception:
-                    pass
+                _sidecar_meta = _state_projection_sidecar_metadata(sid)
+                if _sidecar_meta.get('title'):
+                    _title = _sidecar_meta['title']
+                _archived = bool(_sidecar_meta.get('archived'))
                 _display_title = _title or 'Cron Session'
                 cli_sessions.append({
                     'session_id': sid,
@@ -4049,7 +4062,7 @@ def _load_cli_sessions_uncached(
                     'created_at': row['started_at'],
                     'updated_at': raw_ts,
                     'pinned': False,
-                    'archived': False,
+                    'archived': _archived,
                     'project_id': _cron_pid(),
                     'profile': profile_value,
                     'source_tag': 'cron',
@@ -4572,6 +4585,89 @@ def state_db_delta_after_context(sidecar_context: list, state_messages: list) ->
     return state_messages[best_len:]
 
 
+def _insert_state_message_chronologically(messages: list, msg: dict) -> bool:
+    """Insert a state.db-only row before newer sidecar rows when safe.
+
+    Returns False when the only chronological slot would resurrect an old state
+    row before the sidecar/context begins. This keeps no-watermark compression
+    display paths from reintroducing rows that were already compacted out.
+    """
+    timestamp = _message_timestamp_as_float(msg)
+    if timestamp is None:
+        messages.append(msg)
+        return True
+    idx = 0
+    while idx < len(messages):
+        existing = messages[idx]
+        existing_timestamp = _message_timestamp_as_float(existing)
+        should_insert = existing_timestamp is not None and (
+            existing_timestamp > timestamp
+            or (
+                existing_timestamp == timestamp
+                and msg.get("role") == "user"
+                and existing.get("role") == "assistant"
+            )
+        )
+        if not should_insert:
+            idx += 1
+            continue
+        if idx == 0 and existing_timestamp is not None and existing_timestamp > timestamp:
+            # With no surviving sidecar/context row before this slot, a real
+            # interruption rescue is indistinguishable from a compacted-out old
+            # prompt; prefer avoiding no-watermark resurrection in that shape.
+            return False
+        # Advance the insertion point past two kinds of slots that must not be
+        # split, applied to a fixpoint so they compose in any order at an
+        # equal-timestamp collision:
+        #   (a) an assistant(tool_calls) -> tool result block — inserting inside
+        #       it would split the tool call from its result (provider 400 /
+        #       corrupt tool context);
+        #   (b) a slot whose left neighbour shares this message's role at the
+        #       same timestamp — inserting there would re-order an already-matched
+        #       same-role turn (e.g. user, <inserted user>, assistant). The agent
+        #       core merges adjacent users before send, so (b) is benign in
+        #       practice, but advancing keeps the merged transcript correctly
+        #       ordered and alternation-clean regardless.
+        # Looping to a fixpoint guarantees the same-role guard can't strand the
+        # insert back inside a tool-pair (and vice versa).
+        while True:
+            advanced = False
+            # (a) Skip past a complete assistant(tool_calls) -> tool result
+            # block. Advance over ALL contiguous tool rows that belong to the
+            # preceding assistant's tool_calls, not just the first — a multi-tool
+            # turn has several adjacent tool results, and inserting between any of
+            # them splits the block (assistant, tool, <insert>, tool).
+            if (
+                idx < len(messages)
+                and messages[idx].get("role") == "tool"
+                and idx > 0
+                and messages[idx - 1].get("role") == "assistant"
+                and messages[idx - 1].get("tool_calls")
+            ):
+                while idx < len(messages) and messages[idx].get("role") == "tool":
+                    idx += 1
+                    advanced = True
+            # (b) Skip past an equal-timestamp run whose left neighbour shares
+            # this message's role — inserting there would re-order an
+            # already-matched same-role turn (user, <inserted user>, assistant).
+            # The agent core merges adjacent users before send, so this is benign
+            # in practice, but advancing keeps the merged transcript ordered.
+            while (
+                idx < len(messages)
+                and idx > 0
+                and messages[idx - 1].get("role") == msg.get("role")
+                and _message_timestamp_as_float(messages[idx]) == timestamp
+            ):
+                idx += 1
+                advanced = True
+            if not advanced:
+                break
+        messages.insert(idx, msg)
+        return True
+    messages.append(msg)
+    return True
+
+
 def merge_session_messages_append_only(
     sidecar_messages: list,
     state_messages: list,
@@ -4765,6 +4861,13 @@ def merge_session_messages_append_only(
                 else:
                     continue
             else:
+                if msg.get("role") == "user" and _session_message_content_key(msg) not in seen_content_keys:
+                    if _insert_state_message_chronologically(merged_messages, msg):
+                        seen_message_keys.add(key)
+                        seen_dedup_keys.add(dedup_key)
+                        seen_content_keys.add(_session_message_content_key(msg))
+                        seen_visible_keys.add(visible_key)
+                    continue
                 continue
         seen_message_keys.add(key)
         seen_dedup_keys.add(dedup_key)

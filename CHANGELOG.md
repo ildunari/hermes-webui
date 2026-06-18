@@ -3,6 +3,103 @@
 
 ## [Unreleased]
 
+## [v0.51.489] — 2026-06-18 — Release QY (outline button no longer collides with the scroll control)
+
+### Fixed
+
+- **The conversation-outline toggle button no longer overlaps the scroll-to-bottom control (#2124).** The outline FAB was `position:fixed` at a high z-index and could stack on top of the scroll-to-bottom button in the bottom-right corner. It's now anchored inside the messages shell (`position:absolute`, lower z-index) so the two controls sit cleanly without colliding. Thanks @Habib1001-m.
+
+## [v0.51.491] — 2026-06-18 — Release RA (rollback restore writes contained to the workspace)
+
+### Security
+
+- **Rollback checkpoint restore writes can no longer be redirected outside the selected workspace by a symlink planted inside it (#4405).** The restore path previously used pathname-based `shutil.copy2()` writes, which would follow a symlink whose target escapes the workspace. Restore writes now go through the existing workspace-anchored file helpers, so a restored file always lands inside the workspace tree regardless of in-tree symlinks. Thanks @hinotoi-agent.
+
+## [v0.51.490] — 2026-06-18 — Release QZ (large plain-text pastes become .md attachments)
+
+### Added
+
+- **Large plain-text pastes in the composer now become `.md` attachments instead of flooding the input (#4372).** Pasting text over 4000 characters or 100 lines now attaches it as a timestamped `pasted-text-*.md` file in the upload tray rather than dumping it inline. Image-paste (with or without accompanying text) is unchanged, and a paste that would exceed the upload size limit falls through to a normal inline paste so nothing is lost. Thanks @santastabber.
+
+## [v0.51.488] — 2026-06-18 — Release QW (rescue state.db user prompts that fall before a newer sidecar tail)
+
+### Fixed
+
+- **A user prompt stored only in Hermes `state.db` is no longer dropped when it falls chronologically before a newer sidecar message tail (#4216).** `merge_session_messages_append_only` previously appended state.db-only user prompts after the sidecar tail (or skipped them), so a prompt that belongs earlier in the conversation could be lost or mis-ordered on load. The merge now inserts such a state.db user message at its correct chronological position (with a role-aware tie-break for equal timestamps), preserving the real conversation order. Thanks @dso2ng.
+
+## [v0.51.487] — 2026-06-18 — Release QX (multi-container Docker: make staged hermes-agent source writable)
+
+### Fixed
+
+- **Multi-container Docker deploys no longer die at startup with `could not create 'hermes_agent.egg-info': Permission denied` (#4395).** `docker_init.bash` stages the read-only `hermes-agent-src` mount into `/tmp/hermes-agent-build` to avoid EROFS, but `rsync -a` / `cp -a` preserve the source's mode bits — a source mounted mode 555 left the staged copy 555 too, so setuptools couldn't create `egg-info` next to the package. The staged tree is now `chmod -R u+w`'d after the copy (with a clear error if that fails), so the build dir is genuinely writable. Thanks @enihcam.
+
+## [v0.51.486] — 2026-06-18 — Release QV (archived cron runs stay hidden on state.db re-projection)
+
+### Fixed
+
+- **Archived cron runs no longer reappear in the Sessions panel after a refresh (#4397).** A follow-up to #4385/#4388: that fix stopped stale cron *sidecars* from being treated as CLI rows, but a remaining path let `get_cli_sessions()` re-project the same cron run straight from Hermes `state.db` with `archived: false` (after `all_sessions()` omitted the hidden sidecar). The state.db projection now reads the UI-owned sidecar metadata (title **and** archived flag) via a shared helper and carries the archived flag onto the projected row, so an archived cron/tool/API run stays hidden no matter which path surfaces it. Thanks @TomBanksAU.
+
+## [v0.51.485] — 2026-06-18 — Release QU (mobile: bigger hamburger tap target + browser edge-swipe)
+
+### Improved
+
+- **Mobile menu is easier to tap and the edge-swipe-to-open-sidebar gesture now works in the browser, not just the installed PWA (#4394).** The title-bar hamburger button grows from 32×32 to a 44×44 tap target (the iOS minimum) with a slightly larger icon, and the left-edge swipe-to-open-sidebar gesture is widened and now active in a normal mobile browser (previously PWA-standalone only). The gesture stays left-edge-gated, touch-only, requires clear horizontal intent, and ignores interactive elements, so it won't fire on a scroll or a tap. Thanks @kaishi00.
+
+## [v0.51.484] — 2026-06-18 — Release QT (collapsible paused cron section)
+
+### Added
+
+- **Paused cron jobs now collapse into their own section in the sidebar (#4026).** When you have paused/disabled scheduled jobs, they no longer clutter the active list — they're grouped under a collapsible "Paused (N)" section. The collapsed/expanded state is remembered (localStorage), and it reuses the existing translated "paused" label so it's localized in every language out of the box. Thanks @Sanjays2402.
+
+## [v0.51.483] — 2026-06-18 — Release QS (virtual-scroll height + measurement scroll-jump fixes)
+
+### Fixed
+
+- **Smoother scrolling in the experimental "Virtualize long transcripts" mode — fewer jumps around tool-call rows and during measurement (#4346, via #4367 + #4368).** Two fixes to the (still default-off, opt-in) transcript virtualization: (1) per-role height estimates for not-yet-measured rows (user 120 / assistant 160 / tool_call 400 / default 140) so large tool-call rows aren't under-counted before they're measured, which previously threw off the initial scroll position; and (2) anchor-based scroll compensation during measurement — the view captures an anchor row + scrollTop, renders, then re-pins scrollTop by the anchor's measured delta, plus a short scroll-active guard that defers measurement refresh while you're actively scrolling. Both are additive and only run when "Virtualize long transcripts (experimental)" is enabled. Thanks @rodboev.
+
+## [v0.51.482] — 2026-06-17 — Release QR (archived cron sessions stay hidden)
+
+### Fixed
+
+- **Archived cron sessions no longer reappear in the Sessions tab after the list refreshes (#4385).** A stale sidecar with `is_cli_session: true` could make an archived cron/tool/API session resurface on refresh. The session loader now treats explicit cron/tool/API source metadata as non-CLI even when the sidecar claims otherwise, and preserves cron identity when the archive/materialization fallback creates a session, so archived cron rows stay hidden. Thanks @TomBanksAU.
+
+## [v0.51.481] — 2026-06-17 — Release QP (gateway start/stop/restart controls in Settings)
+
+### Added
+
+- **Settings → System now has start / stop / restart controls for the messaging gateway (#3628).** Manage the Hermes gateway (Telegram, Discord, Slack, etc.) from the WebUI without dropping to a terminal. The controls call the existing platform-aware `hermes gateway {start,stop,restart}` CLI (systemd on Linux, launchd on macOS), refresh the gateway status card, and surface bounded errors. The endpoint is auth + CSRF gated, validates the active profile name, runs a list-argv subprocess (no shell), and is serialized server-side so overlapping actions return 409 rather than spawning concurrent gateway processes. Thanks @rodboev.
+
+## [v0.51.480] — 2026-06-17 — Release QO (inline PDF preview renders all pages)
+
+### Fixed
+
+- **The inline PDF preview now renders all pages in a scrollable view instead of just page 1 (#4353).** Previously only the first page of a PDF attachment/export was rendered inline, so multi-page documents looked clipped/broken. The preview now renders every page (capped at 20 for memory) stacked vertically in a scrollable body, shows the page count in the header, and adds a "Showing the first N of M pages — download for the full document" notice when a PDF exceeds the cap. Per-page render failures are isolated (a malformed page is skipped rather than halting the whole preview), and each canvas is attached only after a successful render. Thanks @gourangasatapathyvit.
+
+## [v0.51.479] — 2026-06-17 — Release QN (named context blocks in the composer)
+
+### Added
+
+- **Selected chat text can now be collected as named context blocks before sending (#2543/#3306).** When you select text in a conversation and use "Reply with selection," instead of immediately dumping it into the composer, it's added as a small named chip ("Context 1", "Context 2", …) in a row above the message box. You can rename a chip (double-click) or remove it (×), stack several from different parts of the conversation, and on send they're flushed into the message as labeled markdown-quoted blocks (`**Name:**` + quoted text). Switching away from a session clears any pending blocks so they don't leak between conversations. Thanks @rodboev.
+
+## [v0.51.478] — 2026-06-17 — Release QM (read-only LLM Wiki browser in Insights)
+
+### Added
+
+- **The Insights panel now has a read-only LLM Wiki browser (#2941).** When the Hermes agent has an LLM Wiki configured (`WIKI_PATH` / `skills.config.wiki.path`), the Insights panel surfaces a knowledge-base observability section — enabled state, entry/page/raw-file counts, last-updated, and last writer — plus a browsable read-only view of the wiki pages. When no wiki directory is configured it shows a clear "Unavailable — set `WIKI_PATH`…" empty state instead of failing. The browser is strictly read-only and auth-gated, and the page-loading path is hardened against directory traversal (realpath + symlink-safe resolution). Thanks @rodboev.
+
+## [v0.51.477] — 2026-06-17 — Release QL (gateway runs-API routing now opt-in)
+
+### Fixed
+
+- **Gateway chat no longer silently loses mid-conversation context (#4362).** When the WebUI was connected to a Hermes gateway that advertised approval/runs support, it routed *every* browser chat turn through the gateway's `/v1/runs` API, which creates an isolated Api_Server session per turn — so the agent lost the conversation's context between messages. Routing through the runs API is now gated behind an explicit opt-in (`HERMES_WEBUI_GATEWAY_USE_RUNS_API=1` env var, or `webui_gateway_use_runs_api: true` in config), defaulting to off. Normal gateway chat now stays on `/v1/chat/completions`, which preserves the session via `X-Hermes-Session-Id`. Operators who want the in-gateway-chat approval-events flow can re-enable it with the flag. Thanks @rodboev.
+
+## [v0.51.476] — 2026-06-17 — Release QK (cross-provider model-pick + non-git update-status fixes)
+
+### Fixed
+
+- **Selecting a model from a non-default provider no longer silently reverts to the default model (#4363).** When the model dropdown rebuilds (panel switch, provider refresh, or a live-model fetch that times out and serves a fallback catalog), a cross-provider selection such as `@my-local:gemma4:12b` could vanish from the refreshed catalog — and the browser would quietly snap the `<select>` back to its first `<option>` (the default model). The dropdown now re-injects the chosen model as a custom option when it's missing from the rebuilt catalog, so your selection is preserved instead of silently changing under you. Thanks @edoumo.
+- **Docker and pip installs now show "Can't check for updates" instead of the misleading "Up to date" (#4356).** When the WebUI or agent is installed without a `.git` directory (e.g. via Docker image or `pip install`), the update check previously reported "Up to date" because there was nothing to compare against. It now detects the absence of `.git` and surfaces "Can't check for updates" in the Settings panel. In mixed deployments where one component has a git checkout and the other does not, the valid git-side update info is still shown alongside the can't-check indicator. Thanks @rodboev.
+
 ## [v0.51.475] — 2026-06-17 — Release QJ (ElevenLabs TTS engine)
 
 ### Added
@@ -870,6 +967,12 @@
 - **Legacy thinking placeholders no longer pile up as stale three-dot rows.** Empty pre-stream thinking spinners are now removed when the thinking phase finalizes instead of being mistaken for durable Thinking content. The live-to-final redesign (#3401) made the `thinking-card-row` wrapper class unconditional, which broke `finalizeThinkingCard()`'s dots-only detection (it treated the wrapper class itself as a "has content" signal); the check is now narrowed to the actual `.thinking-card` element so dots-only spinners are removed on finalize while real Worklog Thinking Cards are preserved. (#3869, #3876)
 
 ## [v0.51.340] — 2026-06-09 — Release LD (background-task agent wakeup in WebUI)
+
+_Authored by @Isla-Liu — the `bg_task_complete` server-side agent-wakeup stack
+landed in this release as the linear trio (#2968, @Isla-Liu), (#2971, @Isla-Liu),
+(#2979, @Isla-Liu) (absorbed via the release vehicle #3867). Credit backfilled
+2026-06-18 — these closed-but-shipped PRs were previously missed by the
+contributor tally; see the credit-attribution fix in the same change._
 
 ### Added
 
