@@ -3828,7 +3828,11 @@ def _sqlite_content_fingerprint(db_path: Path):
                     # pure DELETE-without-insert, but the file-stat fallback in
                     # _sqlite_file_stat_cache_key still moves on a delete commit,
                     # and a delete never makes a MISSING row appear (the flake we
-                    # fix is an ADDED row not showing up).
+                    # fix is an ADDED row not showing up). It also misses a plain
+                    # `UPDATE sessions SET title/message_count` with no message
+                    # insert (state_sync.py sync) — those fall back to the stat
+                    # stamp + 5s TTL, i.e. the prior behavior (a title-only rename
+                    # can lag <=5s); no regression vs the old stat-only key.
                     row = conn.execute(
                         f"SELECT MAX(rowid) FROM {table}"
                     ).fetchone()
