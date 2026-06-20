@@ -1538,6 +1538,13 @@ document.addEventListener('keydown',async e=>{
     // stream running on its own session; the user just gets a fresh blank one.
     await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
   }
+  // Cmd/Ctrl+, opens/closes Settings (VS Code convention).
+  // Fire globally — like VS Code, don't skip text inputs.
+  if((e.metaKey||e.ctrlKey)&&!e.shiftKey&&!e.altKey&&e.key===','){
+    e.preventDefault();
+    if(typeof toggleSettings==='function') toggleSettings();
+    return;
+  }
   if(e.key==='Escape'){
     // Close onboarding overlay if open (skip/dismiss the wizard)
     const onboardingOverlay=$('onboardingOverlay');

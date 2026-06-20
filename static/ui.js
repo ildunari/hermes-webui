@@ -5,7 +5,7 @@
 // legacy reverse-scan over S.messages — that keeps new clients working
 // against old servers (Phase 1 may not yet be deployed everywhere).
 // See api/todo_state.py for the wire contract.
-const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',activeProfileIsDefault:true,showHiddenWorkspaceFiles:false,todos:[],todoStateMeta:null};
+const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',activeProfileIsDefault:true,showHiddenWorkspaceFiles:false,todos:[],todoStateMeta:null,_pendingSessionToolsets:null};
 
 function assistantDisplayName(){
   if(S.activeProfile&&S.activeProfile!=='default') return S.activeProfile.charAt(0).toUpperCase()+S.activeProfile.slice(1);
@@ -453,6 +453,7 @@ function _cancelMessageVirtualizedRender(){
 }
 function _messageIsRenderable(m){
   if(!m||!m.role||m.role==='tool') return false;
+  if(m._source === 'process_wakeup') return false;
   if(_isContextCompactionMessage(m)||_isPreservedCompressionTaskListMessage(m)) return false;
   if(_isRecoveryControlMessage(m)) return false;
   const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
@@ -752,6 +753,10 @@ function _compensateScrollForMeasurementDelta(renderFn){
   const scrollTopBefore=container.scrollTop;
   renderFn();
   if(!anchorBefore) return;
+  if(scrollTopBefore<1){
+    const spacer=container.querySelector('[data-virtual-spacer="before"]');
+    if(!spacer||parseFloat(spacer.style.height||'0')<=0) return;
+  }
   const row=container.querySelector(`[data-msg-idx="${anchorBefore.rawIdx}"]`);
   if(!row) return;
   const containerRect=container.getBoundingClientRect();
@@ -954,7 +959,7 @@ function _questionJumpButtonHtml(questionRawIdx, assistantRawIdx){
   const label=t('jump_to_question')||'Response';
   const title=t('jump_to_question_label')||'Jump to the start of this response';
   const aIdx=(typeof assistantRawIdx==='number'&&assistantRawIdx>=0)?assistantRawIdx:-1;
-  return `<button class="msg-question-jump-btn" type="button" title="${esc(title)}" aria-label="${esc(title)}" onclick="jumpToTurnQuestion(${questionRawIdx},${aIdx})"><span aria-hidden="true">↑</span><span>${esc(label)}</span></button>`;
+  return `<button class="msg-question-jump-btn session-jump-btn session-jump-btn--inline" type="button" title="${esc(title)}" aria-label="${esc(title)}" onclick="jumpToTurnQuestion(${questionRawIdx},${aIdx})"><span aria-hidden="true">↑</span><span>${esc(label)}</span></button>`;
 }
 
 function _highlightQuestionRow(row){
@@ -1806,14 +1811,23 @@ function _refreshOpenModelDropdown(){
     if(typeof _positionModelDropdown==='function') _positionModelDropdown();
   }
 }
-function _applyModelToDropdown(modelId, sel, preferredProviderId){
+function _applyModelToDropdown(modelId, sel, preferredProviderId, opts){
   if(!modelId||!sel) return null;
+  const currentState=(sel.id==='modelSelect'&&typeof _modelStateForSelect==='function')
+    ? _modelStateForSelect(sel, sel.value)
+    : null;
   const resolved=_findModelInDropdown(modelId,sel,preferredProviderId);
   if(resolved){
     sel.value=resolved;
     if(sel.id==='modelSelect'){
+      const resolvedState=typeof _modelStateForSelect==='function'
+        ? _modelStateForSelect(sel, resolved)
+        : {model:resolved,model_provider:preferredProviderId||null};
+      const pickerChanged= !!(opts&&opts.forceRefresh) || !currentState
+        || String(currentState.model||'')!==String(resolvedState.model||'')
+        || String(currentState.model_provider||'')!==String(resolvedState.model_provider||'');
       if(typeof syncModelChip==='function') syncModelChip();
-      _refreshOpenModelDropdown();
+      if(pickerChanged) _refreshOpenModelDropdown();
     }
     return resolved;
   }
@@ -2046,14 +2060,21 @@ function _addLiveModelsToSelect(provider, models, sel){
     _dynamicModelLabels[mid]=m.label||m.id;
     added++;
   }
-  const currentProvider=(S.session&&S.session.model_provider)||null;
-  if(added>0 && currentVal) _applyModelToDropdown(currentVal, sel, currentProvider);
+  const currentState=(currentVal&&typeof _modelStateForSelect==='function')
+    ? _modelStateForSelect(sel, currentVal)
+    : {model:currentVal||'', model_provider:(S.session&&S.session.model_provider)||null};
+  const currentProvider=currentState&&currentState.model_provider||null;
+  if(added>0 && currentVal) _applyModelToDropdown(currentVal, sel, currentProvider, {forceRefresh:true});
   // After live models are added, re-apply the session's model in case it was
   // absent from the static list and syncTopbar() fired before the live fetch
   // completed (#1169). This ensures the session model wins over any premature
   // fallback that may have set sel.value to the first available option.
   if(S.session && S.session.model && sel.id==='modelSelect'){
-    const reapplied=_applyModelToDropdown(S.session.model, sel, S.session.model_provider||null);
+    const sessionProvider=S.session.model_provider||null;
+    const sessionAlreadyRefreshed=added>0 && currentVal
+      && String((currentState&&currentState.model)||'')===String(S.session.model||'')
+      && String((currentState&&currentState.model_provider)||'')===String(sessionProvider||'');
+    const reapplied=_applyModelToDropdown(S.session.model, sel, sessionProvider, {forceRefresh:added>0&&!sessionAlreadyRefreshed});
     if(reapplied && typeof syncModelChip==='function') syncModelChip();
   }
   return added;
@@ -2296,6 +2317,13 @@ function renderModelDropdown(){
     }
     return _groupMeta.get(groupKey);
   };
+  const _vendorPrefix=(rawId)=>{
+    const stripped=String(rawId||'').replace(/^@([^:]+:)+/,'');
+    const slash=stripped.indexOf('/');
+    return slash>0?stripped.slice(0,slash):'';
+  };
+  const SUB_GROUP_PROVIDERS=new Set(['openrouter','nous']);
+  const SUB_GROUP_MIN_MODELS=8;
   for(const child of Array.from(sel.children)){
     if(child.tagName==='OPTGROUP'){
       const providerId=child.dataset&&child.dataset.provider?child.dataset.provider:'';
@@ -2515,6 +2543,17 @@ function renderModelDropdown(){
     const _hit=_modelData.find(m=>m&&!m.endpointErrorOnly&&String(m.value||'')===_selVal);
     return _hit?_hit.groupKey:null;
   })();
+  const _makeModelRow=(m,sel,shouldRenderHeading)=>{
+    const row=document.createElement('div');
+    row.className='model-opt'+(m.value===sel.value?' active':'');
+    const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(m.badge.label||'Configured')}</span>`:'';
+    const _plainGroup=m.group?String(m.group).replace(/\s*\(\d+\s+of\s+\d+\)\s*$/,''):'';
+    const _underOwnHeading=shouldRenderHeading&&!!(m.groupKey&&_groupWrappers[m.groupKey]);
+    const providerChip=(_plainGroup&&!_underOwnHeading)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
+    row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
+    row.onclick=()=>selectModelFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
+    return row;
+  };
   const _filterModels=(term)=>{
     term=term.trim().toLowerCase();
     const hasSearch=!!term;
@@ -2668,30 +2707,55 @@ function renderModelDropdown(){
           if(closed) _forceOpenGroups.add(groupKey); else _forceOpenGroups.delete(groupKey);
           heading.classList.toggle('open',closed);
         });
-      }
-      for(const m of groupRows){
-        const row=document.createElement('div');
-        row.className='model-opt'+(m.value===sel.value?' active':'');
-        const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(m.badge.label||'Configured')}</span>`:'';
-        // The group heading carries the overflow count ("Provider (15 of 30)"); the
-        // per-row provider chip must show the PLAIN provider label only — otherwise
-        // the count is stamped redundantly on every row and reads as nonsense after
-        // "Show all" expands the group (e.g. row 30 still showing "(15 of 30)"). (#3691)
-        const _plainGroup=m.group?String(m.group).replace(/\s*\(\d+\s+of\s+\d+\)\s*$/,''):'';
-        // Only show the per-row provider chip when the row is NOT already under its
-        // own provider heading — i.e. it's a flat/hoisted row appended straight to
-        // the dropdown (no group wrapper). Repeating the provider name on every row
-        // beneath its own "PROVIDER" heading is pure visual noise. The chip still
-        // orients hoisted/configured rows and search results that render flat.
-        const _underOwnHeading=shouldRenderHeading&&!!(m.groupKey&&_groupWrappers[m.groupKey]);
-        const providerChip=(_plainGroup&&!_underOwnHeading)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
-        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-        row.onclick=()=>selectModelFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
-        if(m.groupKey&&_groupWrappers[m.groupKey]){
-          _groupWrappers[m.groupKey].appendChild(row);
-        }else{
-          dd.appendChild(row);
+        const useSubGroups=(
+          SUB_GROUP_PROVIDERS.has(meta.providerId) &&
+          groupRows.length>=SUB_GROUP_MIN_MODELS
+        );
+        if(useSubGroups){
+          const byPrefix=new Map();
+          for(const m of groupRows){
+            const pfx=_vendorPrefix(m.value)||'other';
+            if(!byPrefix.has(pfx)) byPrefix.set(pfx,[]);
+            byPrefix.get(pfx).push(m);
+          }
+          const sorted=[...byPrefix.entries()].sort((a,b)=>{
+            if(a[0]==='other') return 1;
+            if(b[0]==='other') return -1;
+            return b[1].length-a[1].length;
+          });
+          for(const [pfx,pfxRows] of sorted){
+            if(pfxRows.length>=2){
+              const subKey=`${groupKey}::${pfx}`;
+              if(!(subKey in _groupOpenState)) _groupOpenState[subKey]=true;
+              if(hasSearch) _groupOpenState[subKey]=true;
+              const subHeading=document.createElement('div');
+              subHeading.className='model-group sub collapsible';
+              subHeading.dataset.group=subKey;
+              if(_groupOpenState[subKey]) subHeading.classList.add('open');
+              subHeading.textContent=pfx;
+              const subWrapper=document.createElement('div');
+              subWrapper.className='model-group-body sub';
+              subWrapper.dataset.group=subKey;
+              if(!_groupOpenState[subKey]) subWrapper.style.display='none';
+              subHeading.addEventListener('click',(e)=>{
+                e.stopPropagation();
+                const closed=subWrapper.style.display==='none';
+                subWrapper.style.display=closed?'':'none';
+                _groupOpenState[subKey]=closed;
+                subHeading.classList.toggle('open',closed);
+              });
+              wrapper.appendChild(subHeading);
+              wrapper.appendChild(subWrapper);
+              for(const m of pfxRows) subWrapper.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
+            } else {
+              for(const m of pfxRows) wrapper.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
+            }
+          }
+        } else {
+          for(const m of groupRows) wrapper.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
         }
+      } else {
+        for(const m of groupRows) dd.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
       }
       if(!term&&hiddenCount){
         const showAll=document.createElement('div');
@@ -2733,7 +2797,14 @@ function renderModelDropdown(){
   };
   _si.addEventListener('input',()=>_filterModels(_si.value));
   // Keyboard navigation through filtered model rows (#2791).
-  const _visibleModelRows=()=>Array.from(dd.querySelectorAll('.model-opt,.model-opt-more')).filter(el=>!el.closest('.model-group-body')||el.closest('.model-group-body').style.display!=='none');
+  const _visibleModelRows=()=>Array.from(dd.querySelectorAll('.model-opt,.model-opt-more')).filter(el=>{
+    let node=el.parentElement;
+    while(node&&node!==dd){
+      if(node.classList.contains('model-group-body')&&node.style.display==='none') return false;
+      node=node.parentElement;
+    }
+    return true;
+  });
   const _activeRowIndex=(rows)=>rows.findIndex(r=>r.classList.contains('is-highlighted'));
   const _highlightRow=(rows,idx)=>{
     for(const r of rows) r.classList.remove('is-highlighted');
@@ -3037,10 +3108,16 @@ function _applyToolsetsChip(toolsets) {
   // callers regardless of UI visibility. (#1431)
   wrap.style.display = '';
   const hasCustom = Array.isArray(toolsets) && toolsets.length > 0;
+  const isStaged = hasCustom
+    && typeof S !== 'undefined'
+    && S
+    && !S.session
+    && Array.isArray(S._pendingSessionToolsets);
   if (hasCustom) {
-    label.textContent = toolsets.join(', ');
+    const stagedSuffix = isStaged ? ' (staged)' : '';
+    label.textContent = toolsets.join(', ') + stagedSuffix;
     chip.classList.add('has-custom');
-    chip.title = t('session_toolsets') + ': ' + toolsets.join(', ');
+    chip.title = t('session_toolsets') + ': ' + toolsets.join(', ') + stagedSuffix;
   } else {
     label.textContent = t('session_toolsets_profile_defaults');
     chip.classList.remove('has-custom');
@@ -3050,7 +3127,10 @@ function _applyToolsetsChip(toolsets) {
 
 function _syncToolsetsChip() {
   if (typeof S === 'undefined' || !S || !S.session) {
-    _applyToolsetsChip(null);
+    const stagedToolsets = (typeof S !== 'undefined' && S && Array.isArray(S._pendingSessionToolsets))
+      ? S._pendingSessionToolsets
+      : null;
+    _applyToolsetsChip(stagedToolsets);
     return;
   }
   _applyToolsetsChip(S.session.enabled_toolsets || null);
@@ -3213,7 +3293,6 @@ function toggleToolsetsDropdown() {
   const dd = $('composerToolsetsDropdown');
   const chip = $('composerToolsetsChip');
   if (!dd || !chip) return;
-  if (typeof S === 'undefined' || !S || !S.session) return;
   // Don't open when the chip itself is hidden by responsive CSS (#1431).
   // offsetParent === null catches display:none on the element or any ancestor.
   if (chip.offsetParent === null) return;
@@ -3248,7 +3327,17 @@ function closeToolsetsDropdown() {
 }
 
 function _applySessionToolsets(toolsets) {
-  if (typeof S === 'undefined' || !S || !S.session) return;
+  if (typeof S === 'undefined' || !S) return;
+  if (!S.session) {
+    S._pendingSessionToolsets = toolsets;
+    _applyToolsetsChip(toolsets);
+    if (Array.isArray(toolsets) && toolsets.length) {
+      showToast('🔧 ' + t('session_toolsets_applied') + ': ' + toolsets.join(', '));
+    } else {
+      showToast('🌍 ' + t('session_toolsets_cleared'));
+    }
+    return;
+  }
   const sid = S.session.session_id;
   api('/api/session/toolsets', {
     method: 'POST',
@@ -3602,6 +3691,7 @@ if(typeof window!=='undefined'){
   if(!el) return;
   let _scrollRaf=0;
   el.addEventListener('scroll',()=>{
+    _scheduleMessageVirtualizedRender();
     if(_programmaticScroll) return; // ignore scrolls we triggered ourselves
     _markMessageVirtualScrollActive();
     cancelAnimationFrame(_scrollRaf);
@@ -3638,7 +3728,6 @@ if(typeof window!=='undefined'){
       const showBottomButton=!_scrollPinned && el.scrollHeight-top-el.clientHeight>80;
       _syncScrollToBottomCue(showBottomButton,{newMessage:_newMessageCueVisible});
       if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
-      _scheduleMessageVirtualizedRender();
       // Prefetch older messages before the reader hits the hard top. Prepending
       // then preserving scrollTop is seamless only if there is runway left for
       // the user's continued upward wheel/touch movement.
@@ -4637,7 +4726,7 @@ function renderMd(raw){
     t=t.replace(/\x00C(\d+)\x00/g,(_,i)=>_code_stash[+i]);
     // Stash [label](url) links before autolink so the URL in href= is not re-linked
     const _link_stash=[];
-    t=t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:)[^\s\)]+)\)/g,(_,lb,u)=>{_link_stash.push(_markdownAnchor(lb,u));return `\x00L${_link_stash.length-1}\x00`;});
+    t=t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)[^\s\)]+)\)/g,(_,lb,u)=>{_link_stash.push(_markdownAnchor(lb,u));return `\x00L${_link_stash.length-1}\x00`;});
     t=t.replace(/(https?:\/\/[^\s<>"')\]]+)/g,(url)=>{const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
     t=t.replace(/\x00L(\d+)\x00/g,(_,i)=>_link_stash[+i]);
     t=t.replace(/\x00G(\d+)\x00/g,(_,i)=>_img_stash[+i]);
@@ -4778,7 +4867,7 @@ function renderMd(raw){
   // Stash existing <a> tags first to avoid re-linking already-linked URLs.
   const _a_stash=[];
   s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>)/g,m=>{_a_stash.push(m);return `\x00A${_a_stash.length-1}\x00`;});
-  s=s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:)[^\s\)]+)\)/g,(_,label,url)=>_markdownAnchor(label,url));
+  s=s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)[^\s\)]+)\)/g,(_,label,url)=>_markdownAnchor(label,url));
   s=s.replace(/\x00A(\d+)\x00/g,(_,i)=>_a_stash[+i]);
   // Restore raw <pre> only after markdown rewrites so literal preformatted
   // content stays placeholder-protected, then let the sanitizer normalize tags.
@@ -4864,7 +4953,7 @@ function renderMd(raw){
     if(!compact) return false;
     if(/^(javascript|data|vbscript):/i.test(compact)) return false;
     if(/^https?:\/\//i.test(raw)) return true;
-    if(/^(mailto:|tel:)/i.test(raw)) return true;
+    if(/^(mailto:|tel:|message:)/i.test(raw)) return true;
     if(img && /^api\//i.test(raw)) return true;
     if(!img && (/^api\//i.test(raw) || /^#/.test(raw) || _isInternalSessionHref(raw))) return true;
     return false;
@@ -5325,6 +5414,29 @@ function setBusy(v){
 // normal user bubble in the chat — the chip is removed at drain time.
 const _queueRenderKeys={};  // per-session fingerprint to avoid redundant rebuilds
 const _queueCollapsed={};   // per-session: true when user explicitly collapsed the card
+let _queueRenderEpoch=0;
+function _clearQueueCardDisplay(sid){
+  const card=document.getElementById('queueCard');
+  const chips=document.getElementById('queueChips');
+  if(sid) delete _queueRenderKeys[sid];
+  if(card) card.classList.remove('visible');
+  if(chips){
+    const _chips=chips;
+    const _card=card;
+    const _sid=String(sid||'');
+    const _epoch=_chips.getAttribute('data-queue-render-epoch')||'';
+    setTimeout(()=>{
+      if((_card&&!_card.classList.contains('visible'))||!_card){
+        if((_chips.getAttribute('data-queue-render-sid')||'')===_sid&&(_chips.getAttribute('data-queue-render-epoch')||'')===_epoch){
+          _chips.innerHTML='';
+        }
+      }
+    },360);
+  }
+  const _msgsEl=document.getElementById('messages');
+  if(_msgsEl) _msgsEl.classList.remove('queue-open');
+  _updateQueuePill(sid,0);
+}
 
 function _renderQueueChips(sid){
   const card=document.getElementById('queueCard');
@@ -5336,6 +5448,8 @@ function _renderQueueChips(sid){
   // Skip re-render if user is actively editing inside the queue panel
   if(inner.contains(document.activeElement)&&document.activeElement!==inner) return;
   _queueRenderKeys[sid]=key;
+  inner.setAttribute('data-queue-render-sid',sid);
+  inner.setAttribute('data-queue-render-epoch',String(++_queueRenderEpoch));
   inner.innerHTML='';
   if(!q.length){
     card.classList.remove('visible');
@@ -5574,14 +5688,7 @@ function updateQueueBadge(sessionId){
     // Only wipe global DOM if this is the currently active session
     const isActive=S.session&&sid===S.session.session_id;
     if(isActive){
-      const card=document.getElementById('queueCard');
-      const chips=document.getElementById('queueChips');
-      if(card) card.classList.remove('visible');
-      // Defer clear until after slide-out transition so content doesn't vanish mid-animation
-      if(chips){const _chips=chips;const _card=card;setTimeout(()=>{if(!_card||!_card.classList.contains('visible'))_chips.innerHTML='';},360);}
-      const _msgsEl=document.getElementById('messages');
-      if(_msgsEl) _msgsEl.classList.remove('queue-open');
-      _updateQueuePill(sid,0);
+      _clearQueueCardDisplay(sid);
     }
   }
 }
@@ -6640,6 +6747,7 @@ const AGENT_HEALTH_INTERVAL_MS=30000;
 const AGENT_HEALTH_DISMISSED_KEY='agent-health-dismissed';
 let _agentHealthTimer=null;
 let _agentHealthLastState='unknown';
+let _lastGatewayRestartTime=0;
 function _agentHealthDismissed(){
   try{return localStorage.getItem(AGENT_HEALTH_DISMISSED_KEY)==='1';}
   catch(_){return false;}
@@ -6670,8 +6778,35 @@ function dismissAgentHealthAlert(){
   _setAgentHealthDismissed(true);
   _hideAgentHealthAlert();
 }
+async function restartGatewayService(){
+  const btn = $('btnRestartGateway');
+  const dismissBtn = $('agentHealthDismiss');
+  if(!btn) return;
+  btn.disabled = true;
+  if(dismissBtn) dismissBtn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = 'Restarting...';
+  try {
+    const res = await api('/api/health/restart', {method: 'POST'});
+    if(res && res.ok){
+      showToast('Gateway service restarted successfully');
+      _hideAgentHealthAlert();
+      _lastGatewayRestartTime = Date.now();
+      setTimeout(pollAgentHealth, 15000);
+    } else {
+      showToast(res && res.error || 'Failed to restart gateway service');
+    }
+  } catch(e) {
+    showToast('Failed to restart gateway service: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    if(dismissBtn) dismissBtn.disabled = false;
+    btn.textContent = originalText;
+  }
+}
 async function pollAgentHealth(){
   if(document.visibilityState !== 'visible') return;
+  if(Date.now() - _lastGatewayRestartTime < 15000) return;
   try{
     const payload=await api('/api/health/agent',{timeoutToast:false});
     if(payload.alive === true){
@@ -7113,7 +7248,7 @@ async function forceUpdate(btn){
   if(!target) return;
   const confirmed=await showConfirmDialog({
     title:'Force update '+target+'?',
-    message:'This will discard all local changes in the '+target+' repo and reset to the latest remote version. This cannot be undone.',
+    message:'This will discard all local changes and delete untracked files in the '+target+' repo, then reset to the latest remote version. This cannot be undone.',
     confirmLabel:'Force update',
     danger:true,
     focusCancel:true,
@@ -7285,6 +7420,7 @@ function getPendingSessionMessage(session, messagesOverride=null){
     attachments:attachments.length?attachments:undefined,
     _ts:session?.pending_started_at||Date.now()/1000,
     _pending:true,
+    _source:session?.pending_user_source||undefined,
   };
 }
 async function checkInflightOnBoot(sid) {
@@ -10678,7 +10814,7 @@ function renderMessages(options){
     // regression vs master; same content-loss-on-switch class as #3668). The
     // `:not([data-live-thinking="1"])` / live-card guards below keep the active
     // turn's own live nodes from being double-built.
-    inner.querySelectorAll('.tool-worklog-group:not([data-compression-card]),.tool-call-group:not([data-compression-card]),.tool-card-row:not([data-compression-card]),.agent-activity-thinking:not([data-live-thinking="1"]):not([data-event-type="thinking"]),.wl-reason[data-worklog-anchor-reason="1"],.wl-reason[data-worklog-reason-source="reasoning"]').forEach(el=>el.remove());
+    inner.querySelectorAll('.tool-worklog-group:not([data-compression-card]),.tool-call-group:not([data-compression-card]),.tool-card-row:not([data-compression-card]):not([data-event-type="tool"]),.agent-activity-thinking:not([data-live-thinking="1"]):not([data-event-type="thinking"]),.wl-reason[data-worklog-anchor-reason="1"],.wl-reason[data-worklog-reason-source="reasoning"]').forEach(el=>el.remove());
     const byActivity = new Map();
     const assistantIdxs=[...assistantSegments.keys()].sort((a,b)=>a-b);
     const _assistantAnchorForActivity=(aIdx,segmentSeq,burstId)=>{
@@ -10729,13 +10865,16 @@ function renderMessages(options){
       const hasValue=value!==undefined&&value!==null&&String(value)!==''&&String(value)!=='0';
       return hasValue?String(value):'';
     };
+    const knownBurstIds=new Set();
+    for(const s of assistantSegments.values()) if(s){const b=s.getAttribute('data-activity-burst-id');if(b)knownBurstIds.add(b);}
     for(const tc of (S.toolCalls||[])){
       if(!tc) continue;
       const aIdx=tc.assistant_msg_idx!==undefined?parseInt(tc.assistant_msg_idx):-1;
       if(virtualWindow.virtualized&&renderableRawIdxs.has(aIdx)&&!renderedRawIdxs.has(aIdx)) continue;
       const segmentSeq=normalizeToken(tc.activitySegmentSeq);
       const burstId=normalizeToken(tc.activityBurstId);
-      const key=segmentSeq?`segment:${segmentSeq}`:(burstId?`burst:${burstId}`:`assistant:${aIdx}`);
+      const burstResolvable=burstId&&knownBurstIds.has(burstId);
+      const key=segmentSeq?`segment:${segmentSeq}`:(burstResolvable?`burst:${burstId}`:`assistant:${aIdx}`);
       const entry=ensureActivityBucket(key,aIdx,segmentSeq,burstId);
       entry.cards.push(tc);
       entry.includeAnchorReason=true;
@@ -13750,7 +13889,7 @@ async function promptNewFile(targetDir = S.currentDir || '.'){
     if(!ws) return;
     try{
       const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws})});
-      if(r&&r.session){S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
+      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
     }catch(e){setStatus(t('create_failed')+e.message);return;}
   }
   if(!S.session)return;
@@ -13777,7 +13916,7 @@ async function promptNewFolder(targetDir = S.currentDir || '.'){
     if(!ws) return;
     try{
       const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws})});
-      if(r&&r.session){S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
+      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
     }catch(e){setStatus(t('folder_create_failed')+e.message);return;}
   }
   if(!S.session)return;

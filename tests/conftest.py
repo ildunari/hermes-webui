@@ -1073,6 +1073,19 @@ def cleanup_test_sessions():
     was left in an unexpected state by a prior test in the same shard.
     """
     created: list[str] = []
+    # Defense-in-depth: reset the CLI-session visibility setting to its default
+    # BEFORE the test runs too, not only in teardown. Teardown-only reset relies
+    # on every sibling test being wrapped by this fixture AND on its teardown
+    # actually completing; a pre-test reset guarantees each test starts from a
+    # known visibility state regardless of what a prior test left behind. The
+    # primary root-cause fix for the gateway_sync row-absence flake is the
+    # commit-reliable state.db content fingerprint in the cache keys
+    # (api/models.py _sqlite_content_fingerprint) — this pre-reset is belt-and-
+    # suspenders against setting bleed under shard ordering.
+    try:
+        _post(TEST_BASE, "/api/settings", {"show_cli_sessions": False})
+    except Exception:
+        pass
     yield created
 
     for sid in created:
