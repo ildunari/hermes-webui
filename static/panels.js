@@ -154,7 +154,13 @@ function syncAppTitlebar() {
 
   // Dismiss stale popover on session/panel switch
   const _existingPop = document.querySelector('.app-titlebar-title-popover');
-  if (_existingPop) { _existingPop.remove(); titleEl._titlePopover = null; }
+  if (_existingPop) {
+    _existingPop.remove(); titleEl._titlePopover = null;
+    if (titleEl._popoverOutsideHandler) {
+      document.removeEventListener('click', titleEl._popoverOutsideHandler, true);
+      titleEl._popoverOutsideHandler = null;
+    }
+  }
 
   // Mobile touch interactions
   if ('ontouchstart' in window) {
@@ -182,10 +188,11 @@ function syncAppTitlebar() {
         pop.style.left = Math.max(8, rect.left) + 'px';
         pop.style.maxWidth = (window.innerWidth - 16) + 'px';
         titleEl._titlePopover = pop;
-        const _outside = (ev) => {
+        const _outside = titleEl._popoverOutsideHandler = (ev) => {
           if (!pop.contains(ev.target) && ev.target !== titleEl) {
             _dismissTitlePopover();
             document.removeEventListener('click', _outside, true);
+            titleEl._popoverOutsideHandler = null;
           }
         };
         setTimeout(() => document.addEventListener('click', _outside, true), 0);
