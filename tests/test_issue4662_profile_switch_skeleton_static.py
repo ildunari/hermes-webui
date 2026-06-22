@@ -38,17 +38,52 @@ class TestSwitchWiring:
         assert "showWorkspaceTreeSkeleton()" in body
         assert "_workspaceVisibleAtStart" in body
 
-    def test_parallelizes_list_and_workspace_refresh(self):
+    def test_workspace_refresh_after_switch_guard(self):
+        # The workspace tree refresh (loadDir) must run AFTER the stale-switch
+        # generation guard — loadDir paints the tree with only a session-id
+        # check, and empty-session switches reuse the session id, so starting it
+        # before the guard could let an older switch paint over a newer one
+        # (Codex gate #4662). The skeletons shown up front already provide the
+        # immediate cross-surface feedback.
         body = _switch_body()
-        # The non-sessionInProgress branch kicks off both fetches before awaiting.
-        assert "const listLoad = renderSessionList();" in body
-        assert "loadDir('.')" in body
-        assert "await listLoad;" in body
+        guard = "if (_switchGen !== _profileSwitchGeneration) return;"
+        # In the non-sessionInProgress branch, the loadDir('.') call must come
+        # after an occurrence of the guard.
+        dir_idx = body.index("const dirLoad = loadDir('.');")
+        guard_before = body.rfind(guard, 0, dir_idx)
+        assert guard_before != -1, "loadDir('.') must be preceded by the switch-generation guard"
 
     def test_restores_real_content_on_failure(self):
         body = _switch_body()
         catch = body[body.index("} catch (e) {"):]
         assert "renderSessionListFromCache()" in catch, "failed switch must restore real list"
+
+    def test_noop_self_switch_early_returns(self):
+        # Opus gate #4662: a switch to the already-active profile must bail before
+        # showing a skeleton (activateCurrentProfile() doesn't pre-check), else it
+        # flashes skeleton→restore.
+        body = _switch_body()
+        head = body[: body.index("showSessionListSkeleton()")]
+        assert "name === S.activeProfile" in head, "missing no-op self-switch early-return"
+        assert "return;" in head
+
+    def test_dismisses_rename_and_menu_before_skeleton(self):
+        # Opus gate #4662: renderSessionListFromCache() early-returns while
+        # _renamingSid / _sessionActionMenu is set — which would strand the
+        # skeleton. switchToProfile must dismiss both before showing it.
+        body = _switch_body()
+        pre = body[: body.index("showSessionListSkeleton()")]
+        assert "_renamingSid = null" in pre, "must clear inline-rename state before skeleton"
+        assert "closeSessionActionMenu()" in pre, "must close row action menu before skeleton"
+
+    def test_clears_workspace_skeleton_when_no_workspace(self):
+        # Opus gate #4662 (blocker): if the new profile has no bound workspace the
+        # real loadDir is skipped, so the up-front workspace skeleton must be
+        # explicitly cleared or it strands forever.
+        body = _switch_body()
+        assert body.count("clearWorkspaceTreeSkeleton()") >= 2, (
+            "both switch branches must clear a stranded workspace skeleton"
+        )
 
 
 class TestSessionsWiring:
@@ -68,6 +103,14 @@ class TestWorkspaceWiring:
     def test_builder_defined(self):
         assert "const _WS_SKELETON_ROWS" in WORKSPACE
         assert "function showWorkspaceTreeSkeleton(" in WORKSPACE
+
+    def test_skeleton_clear_helper_defined(self):
+        # The strand-clear helper must exist and only empty #fileTree when it
+        # still holds a skeleton (so it can't clobber a real render).
+        assert "function clearWorkspaceTreeSkeleton(" in WORKSPACE
+        idx = WORKSPACE.index("function clearWorkspaceTreeSkeleton(")
+        body = WORKSPACE[idx: idx + 400]
+        assert ".skeleton-tree" in body, "clear helper must check for a skeleton before emptying"
 
 
 class TestSkeletonCss:

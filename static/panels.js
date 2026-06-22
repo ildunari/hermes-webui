@@ -5897,6 +5897,11 @@ window.addEventListener('resize',()=>{
 });
 
 async function switchToProfile(name) {
+  // No-op self-switch guard: bail before showing any loading skeleton if we're
+  // already on this profile, so paths like activateCurrentProfile() (which
+  // doesn't pre-check) can't flash a skeleton→restore for a click that changes
+  // nothing. (#4662 Opus gate)
+  if (name && name === S.activeProfile) return;
   S._pendingSessionToolsets=null;
   // Profile switches are per-client cookie/TLS scoped, so a running stream in
   // the current session can safely continue while this tab moves to another
@@ -5923,6 +5928,14 @@ async function switchToProfile(name) {
   // instant the switch begins so the user never stares at the wrong profile's
   // data, and gets consistent loading feedback across the whole surface — not
   // just the spinning chip. The real renders below overwrite these.
+  //
+  // First dismiss any open inline-rename or row action menu: renderSessionList
+  // FromCache() early-returns (no DOM swap) while _renamingSid or
+  // _sessionActionMenu is set, which would otherwise strand the skeleton AND
+  // defeat the failure-path restore (#4662 Opus gate). A profile switch is a
+  // context change where dismissing those transient affordances is correct.
+  if (typeof _renamingSid !== 'undefined' && _renamingSid) _renamingSid = null;
+  if (typeof closeSessionActionMenu === 'function') closeSessionActionMenu();
   if (typeof showSessionListSkeleton === 'function') showSessionListSkeleton();
   const _workspaceVisibleAtStart = typeof _workspacePanelMode !== 'undefined' && _workspacePanelMode !== 'closed';
   if (_workspaceVisibleAtStart && typeof showWorkspaceTreeSkeleton === 'function') showWorkspaceTreeSkeleton();
@@ -6049,22 +6062,37 @@ async function switchToProfile(name) {
       // new profile-scoped session.
       syncTopbar();
       await renderSessionList();
+      // Safety net: if the new session has no workspace, newSession() won't have
+      // painted the file tree — clear the up-front skeleton so it can't strand
+      // (#4662 Opus gate). No-op when a real tree already rendered.
+      if ((!S.session || !S.session.workspace) && typeof clearWorkspaceTreeSkeleton === 'function') {
+        clearWorkspaceTreeSkeleton();
+      }
       showToast(t('profile_switched_new_conversation', name));
     } else {
-      // No messages yet — refresh the list and workspace tree in place. These
-      // two fetches (/api/sessions and /api/list) are independent, so kick them
-      // off together rather than serially: the slow session-list fetch should
-      // not also delay the workspace tree resolving. The _switchGen guard below
-      // still discards everything if a newer switch superseded us. (#4662)
+      // No messages yet — refresh the list and topbar in place, then the
+      // workspace tree. The loading skeletons shown up front (top of this
+      // function) already give immediate cross-surface feedback, so we keep the
+      // workspace refresh AFTER the stale-switch guard: loadDir() paints the
+      // file tree as soon as its fetch resolves with only a session-id check,
+      // and empty-session switches reuse the same session id — so starting it
+      // before the guard could let an older switch's /api/list paint over a
+      // newer one (Codex gate #4662). renderSessionList() is the slow fetch and
+      // has its own internal generation guard, so awaiting it first is fine.
       const workspaceVisible = typeof _workspacePanelMode !== 'undefined' && _workspacePanelMode !== 'closed';
-      const listLoad = renderSessionList();
-      const dirLoad = (S.session && S.session.workspace) ? loadDir('.') : null;
-      await listLoad;
+      await renderSessionList();
       if (_switchGen !== _profileSwitchGeneration) return;
       syncTopbar();
       // Refresh workspace file tree so the right panel shows the new
       // profile's workspace, not the previous one (#1214).
-      if (dirLoad && workspaceVisible) await dirLoad;
+      if (S.session && S.session.workspace) {
+        const dirLoad = loadDir('.');
+        if (workspaceVisible) await dirLoad;
+      } else if (typeof clearWorkspaceTreeSkeleton === 'function') {
+        // New profile has no bound workspace — clear the up-front skeleton so it
+        // doesn't strand (#4662 Opus gate).
+        clearWorkspaceTreeSkeleton();
+      }
       showToast(t('profile_switched', name));
     }
 

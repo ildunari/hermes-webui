@@ -475,6 +475,18 @@ function showWorkspaceTreeSkeleton(){
   tree.style.display = '';
 }
 
+// Clear a stranded workspace-tree skeleton (#4662 Opus gate). showWorkspaceTreeSkeleton()
+// is shown up front on a profile switch, but the real loadDir('.') that would
+// replace it is skipped when the new profile has no bound workspace — leaving a
+// shimmering skeleton forever. Call this on the no-workspace path so the tree
+// empties instead. Only touches #fileTree when it still holds a skeleton, so
+// it can't clobber a real render.
+function clearWorkspaceTreeSkeleton(){
+  const tree = $('fileTree');
+  if(!tree) return;
+  if(tree.querySelector('.skeleton-tree')) tree.innerHTML = '';
+}
+
 async function loadDir(path, opts={}){
   const preservePreview=!!(opts&&opts.preservePreview);
   const refreshExpanded=!!(opts&&opts.refreshExpanded);
