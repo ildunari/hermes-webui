@@ -428,6 +428,65 @@ async function openArtifactPath(path){
   openFile(rel);
 }
 
+// ── Workspace file-tree loading skeleton (#4662 Phase 1) ────────────────────
+// During a profile switch the right-hand workspace panel would otherwise keep
+// showing the previous profile's file tree until /api/list resolves. Show a
+// clean tree-shaped skeleton in its place (panel stays open — hiding it is
+// jarring). Varied bar widths + a small indent pattern so it reads as a real
+// directory listing rather than a mechanical repeat.
+const _WS_SKELETON_ROWS = [
+  {w: 38, indent: 0, dir: true},
+  {w: 72, indent: 0},
+  {w: 44, indent: 1},
+  {w: 63, indent: 1},
+  {w: 80, indent: 0},
+  {w: 51, indent: 1},
+  {w: 67, indent: 0},
+  {w: 39, indent: 1},
+];
+
+function showWorkspaceTreeSkeleton(){
+  const tree = $('fileTree');
+  if(!tree) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'skeleton-tree';
+  wrap.setAttribute('aria-hidden', 'true');
+  for(const spec of _WS_SKELETON_ROWS){
+    const row = document.createElement('div');
+    row.className = 'skeleton-tree-row';
+    if(spec.indent) row.style.paddingLeft = (2 + spec.indent * 16) + 'px';
+    const glyph = document.createElement('div');
+    glyph.className = 'skeleton-glyph';
+    const name = document.createElement('div');
+    name.className = 'skeleton-bar skeleton-name';
+    name.style.width = spec.w + '%';
+    row.appendChild(glyph);
+    row.appendChild(name);
+    // Files (not dirs) show a size on the right; mirror that on leaf rows.
+    if(!spec.dir){
+      const size = document.createElement('div');
+      size.className = 'skeleton-bar skeleton-size';
+      row.appendChild(size);
+    }
+    wrap.appendChild(row);
+  }
+  tree.innerHTML = '';
+  tree.appendChild(wrap);
+  tree.style.display = '';
+}
+
+// Clear a stranded workspace-tree skeleton (#4662 Opus gate). showWorkspaceTreeSkeleton()
+// is shown up front on a profile switch, but the real loadDir('.') that would
+// replace it is skipped when the new profile has no bound workspace — leaving a
+// shimmering skeleton forever. Call this on the no-workspace path so the tree
+// empties instead. Only touches #fileTree when it still holds a skeleton, so
+// it can't clobber a real render.
+function clearWorkspaceTreeSkeleton(){
+  const tree = $('fileTree');
+  if(!tree) return;
+  if(tree.querySelector('.skeleton-tree')) tree.innerHTML = '';
+}
+
 async function loadDir(path, opts={}){
   const preservePreview=!!(opts&&opts.preservePreview);
   const refreshExpanded=!!(opts&&opts.refreshExpanded);
