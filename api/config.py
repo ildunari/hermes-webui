@@ -3772,6 +3772,7 @@ _available_models_cache: dict | None = None
 _available_models_cache_ts: float = 0.0
 _available_models_cache_source_fingerprint: dict | None = None
 _AVAILABLE_MODELS_CACHE_TTL: float = 86400.0  # 24 hours
+_SESSION_VISIT_MODELS_FRESHNESS_SECONDS: float = 300.0
 _available_models_cache_lock = threading.RLock()  # must be RLock: cold path refactoring moved slow work inside this lock, requiring re-entry
 _cache_build_cv = threading.Condition(_available_models_cache_lock)  # shares underlying RLock so notify_all() is safe inside with _available_models_cache_lock
 _cache_build_in_progress = False  # True while a cold path is actively building
@@ -5268,7 +5269,7 @@ def _read_visible_codex_cache_model_ids() -> list[str]:
     return ordered
 
 
-def get_available_models(*, prefer_cache: bool = False) -> dict:
+def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = False) -> dict:
     """
     Return available models grouped by provider.
 
@@ -5292,6 +5293,10 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
     server-initiated wakeup turn (Option Z) takes so a cold catalog can never
     block the wakeup chat/start on a flaky network. A normal human request
     leaves this False and keeps the full live-discovery behaviour.
+
+    ``force_refresh=True`` is an internal escape hatch for bounded freshness
+    checks that need a real live rebuild while preserving the default cache
+    contract for every existing caller.
     """
     global _cache_build_in_progress, _available_models_cache, _available_models_cache_ts, _available_models_cache_source_fingerprint, _cache_build_cv
     # Config mtime check — must come before any config reads.
@@ -6718,10 +6723,12 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
     # so only one thread rebuilds while others wait.
     disk_groups = None
     stale_disk_groups = None
-    if _available_models_cache is None:
+    if _available_models_cache is None and not force_refresh:
         disk_groups = _load_models_cache_from_disk()
         if disk_groups is None:
             stale_disk_groups = _load_stale_models_cache_from_disk()
+    elif force_refresh:
+        stale_disk_groups = _load_stale_models_cache_from_disk()
 
     with _available_models_cache_lock:
         # If another thread is already building, wait for its result instead
@@ -6746,16 +6753,16 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
 
         # Serve from memory cache if fresh
         now = time.monotonic()
-        cached = _get_fresh_memory_models_cache(now)
-        if cached is not None:
-            return cached
+        if not force_refresh:
+            cached = _get_fresh_memory_models_cache(now)
+            if cached is not None:
+                return cached
 
         # Cold path: disk cache hit — use it (fast, no lock contention)
-        if disk_groups is not None:
+        if disk_groups is not None and not force_refresh:
             _available_models_cache = disk_groups
             _available_models_cache_ts = now
             _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
-            _save_models_cache_to_disk(disk_groups)
             return copy.deepcopy(disk_groups)
 
         # ── prefer_cache: NEVER run the live provider rebuild ────────────────
@@ -6830,9 +6837,12 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                 _available_models_cache = result
                 _available_models_cache_ts = time.monotonic()
                 _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
-                _cache_build_in_progress = False
-                _cache_build_cv.notify_all()
-            _save_models_cache_to_disk(result)
+            try:
+                _save_models_cache_to_disk(result)
+            finally:
+                with _cache_build_cv:
+                    _cache_build_in_progress = False
+                    _cache_build_cv.notify_all()
             return copy.deepcopy(result)
 
         # ── Bounded rebuild (defense-in-depth) ───────────────────────────────
@@ -6873,12 +6883,14 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                 _available_models_cache_source_fingerprint = (
                     _models_cache_source_fingerprint()
                 )
-                _cache_build_in_progress = False
-                _cache_build_cv.notify_all()
             try:
                 _save_models_cache_to_disk(result)
             except Exception:
                 logger.debug("models cache disk save failed", exc_info=True)
+            finally:
+                with _cache_build_cv:
+                    _cache_build_in_progress = False
+                    _cache_build_cv.notify_all()
 
         def _clear_build_in_progress():
             global _cache_build_in_progress
@@ -6971,6 +6983,46 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
         if stale_disk_groups is not None:
             return copy.deepcopy(stale_disk_groups)
         return copy.deepcopy(_static_models_catalog_without_live_probes())
+
+
+def _models_cache_file_age_seconds(cache_path: Path, now: float) -> float | None:
+    try:
+        return max(0.0, now - cache_path.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def get_available_models_for_session_visit() -> dict:
+    """Return /api/models with a short session-visit freshness horizon."""
+    global _available_models_cache, _available_models_cache_ts, _available_models_cache_source_fingerprint
+    cache_path = _get_models_cache_path()
+    cache_age = _models_cache_file_age_seconds(cache_path, time.time())
+    disk_cached = None
+    if cache_age is not None and cache_age < _SESSION_VISIT_MODELS_FRESHNESS_SECONDS:
+        now_mono = time.monotonic()
+        with _available_models_cache_lock:
+            cached = _get_fresh_memory_models_cache(now_mono)
+            if cached is not None:
+                return cached
+        disk_cached = _load_models_cache_from_disk()
+        if disk_cached is not None:
+            with _available_models_cache_lock:
+                cached = _get_fresh_memory_models_cache(time.monotonic())
+                if cached is not None:
+                    return cached
+                _available_models_cache = copy.deepcopy(disk_cached)
+                _available_models_cache_ts = time.monotonic()
+                _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+            return copy.deepcopy(disk_cached)
+
+    stale_cached = disk_cached or _load_stale_models_cache_from_disk()
+    try:
+        return get_available_models(force_refresh=True)
+    except Exception:
+        logger.debug("session-visit models refresh failed", exc_info=True)
+        if stale_cached is not None:
+            return copy.deepcopy(stale_cached)
+        return get_available_models(prefer_cache=True)
 
 
 # ── Static file path ─────────────────────────────────────────────────────────

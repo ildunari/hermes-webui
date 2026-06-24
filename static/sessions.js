@@ -1245,9 +1245,16 @@ async function loadSession(sid){
   }
   S.session=data.session;
   // Loading a real existing session abandons any pre-session toolset override
-  // staged on the empty composer — clear it so it can't leak into a later New
-  // Chat started from this session (#4490 follow-up).
+  // staged on the empty composer before any deferred refresh work runs.
   S._pendingSessionToolsets=null;
+  if(typeof populateModelDropdown==='function'){
+    const modelRefreshSid=sid;
+    const modelRefreshPromise=Promise.resolve().then(()=>{
+      if(_loadingSessionId!==modelRefreshSid) return;
+      return populateModelDropdown({freshness:'session_visit'});
+    }).catch(()=>{});
+    if(typeof window!=='undefined') window._modelDropdownReady=modelRefreshPromise;
+  }
   if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
   S.session._modelResolutionDeferred=true;
   S.lastUsage={...(data.session.last_usage||{})};

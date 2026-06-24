@@ -2008,6 +2008,8 @@ function _persistSessionModelCorrection(model, provider, opts){
   });
   return opts&&opts.propagateErrors ? request : request.catch(()=>{});
 }
+let _modelDropdownRequestSeq=0;
+
 function _applySessionModelFallback(sel){
   if(!sel) return null;
   const configuredDefault=String(window._defaultModel||'').trim();
@@ -2030,10 +2032,16 @@ function _applySessionModelFallback(sel){
 async function populateModelDropdown(opts={}){
   const sel=$('modelSelect');
   if(!sel) return;
+  if(typeof _modelDropdownRequestSeq!=='number') _modelDropdownRequestSeq=0;
+  const requestSeq=++_modelDropdownRequestSeq;
   try{
-    const _modelsRes=await fetch(new URL('api/models',document.baseURI||location.href).href,{credentials:'include'});
+    const modelsUrl=new URL('api/models',document.baseURI||location.href);
+    if(opts&&opts.freshness) modelsUrl.searchParams.set('freshness',opts.freshness);
+    const _modelsRes=await fetch(modelsUrl.href,{credentials:'include'});
+    if(requestSeq!==_modelDropdownRequestSeq) return;
     if(_redirectIfUnauth(_modelsRes)) return;
     const data=await _modelsRes.json();
+    if(requestSeq!==_modelDropdownRequestSeq) return;
     // Store active provider globally so the send path can warn on mismatch
     window._activeProvider=data.active_provider||null;
     // Store default model so newSession() can apply it (#872).
@@ -2128,8 +2136,9 @@ async function populateModelDropdown(opts={}){
     }
     // Kick off a background live-model fetch for the active provider.
     // This runs after the static list is already shown (no blocking flicker).
-    if(data.active_provider) _fetchLiveModels(data.active_provider, sel);
+    if(data.active_provider) _fetchLiveModels(data.active_provider, sel, requestSeq);
   }catch(e){
+    if(requestSeq!==_modelDropdownRequestSeq) return;
     // API unavailable -- keep the hardcoded HTML options as fallback
     console.warn('Failed to load models from server:',e.message);
     if(typeof syncModelChip==='function') syncModelChip();
@@ -2219,10 +2228,12 @@ function _addLiveModelsToSelect(provider, models, sel){
   return added;
 }
 
-async function _fetchLiveModels(provider, sel){
+async function _fetchLiveModels(provider, sel, requestSeq=null){
   if(!provider||!sel) return;
+  if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
   // Already fetched — apply cached models to this select element (#872)
   if(_liveModelCache[provider]){
+    if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
     const added=_addLiveModelsToSelect(provider,_liveModelCache[provider],sel);
     if(added>0 && typeof syncModelChip==='function') syncModelChip();
     return;
@@ -2232,10 +2243,13 @@ async function _fetchLiveModels(provider, sel){
     const url=new URL('api/models/live',document.baseURI||location.href);
     url.searchParams.set('provider',provider);
     const _liveRes=await fetch(url.href,{credentials:'include'});
+    if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
     if(_redirectIfUnauth(_liveRes)) return;
     const data=await _liveRes.json();
+    if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
     if(!data.models||!data.models.length) return;
     _liveModelCache[provider]=data.models;
+    if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
     const added=_addLiveModelsToSelect(provider,data.models,sel);
     if(added>0){
       if(typeof syncModelChip==='function') syncModelChip();

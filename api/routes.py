@@ -2331,6 +2331,7 @@ from api.config import (
     _resolve_cli_toolsets,
     _INDEX_HTML_PATH,
     get_available_models,
+    get_available_models_for_session_visit,
     _provider_is_known_or_configured,
     IMAGE_EXTS,
     MD_EXTS,
@@ -9216,6 +9217,11 @@ def handle_get(handler, parsed) -> bool:
         # the detached rebuild worker (and the legacy synchronous rebuild),
         # which the request-thread wrapper could not reach. See
         # api.config.get_available_models cold path + profile_scope_for_detached_worker.
+        freshness = parse_qs(parsed.query or "").get("freshness", [""])[0].strip().lower()
+        if freshness == "session_visit":
+            return j(handler, get_available_models_for_session_visit())
+        if freshness:
+            return bad(handler, f"unknown models freshness: {freshness}", status=400)
         return j(handler, get_available_models())
 
     if parsed.path == "/api/models/live":
