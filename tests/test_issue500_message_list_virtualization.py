@@ -501,6 +501,9 @@ function _restoreMessageViewportAnchor(anchor, delta){
 function requestAnimationFrame(fn){ fn(); }
 
 eval(extractFunc('_messageVisibleIndexForRawIdx'));
+eval(extractFunc('_messageSessionIndexBase'));
+eval(extractFunc('_messageSessionIndexForRawIdx'));
+eval(extractFunc('_messageRawIdxForSessionIndex'));
 eval(extractFunc('_messageVirtualScrollTopForVisibleIdx'));
 eval(extractFunc('_remountMessageViewportAnchor'));
 eval(extractFunc('_restoreMessageScrollSnapshotSameFrame'));
@@ -875,6 +878,7 @@ const container = {
   set scrollTop(v){ scrollTopWasMutated = true; scrollTopValue = v; },
   getBoundingClientRect(){ return {top: 0}; },
   querySelector(){ return null; },
+  classList: { add(){}, remove(){} },
 };
 function $(id){ return id === 'messages' ? container : null; }
 function _captureMessageViewportAnchor(){ return null; }
@@ -905,6 +909,7 @@ const container = {
   get scrollTop(){ return scrollTopValue; },
   set scrollTop(v){ scrollHistory.push(v); scrollTopValue = v; },
   getBoundingClientRect(){ return {top: 50, bottom: 650}; },
+  classList: { add(){}, remove(){} },
   querySelector(selector){
     if(selector === '[data-msg-idx="42"]'){
       // After render, the row moved from relative offset 100 to 150 (50px shift)
@@ -921,7 +926,13 @@ function _captureMessageViewportAnchor(){
   return {rawIdx: 42, topOffset: 100};
 }
 let _programmaticScroll = false;
+let _programmaticScrollSetAt = 0;
+let _programmaticScrollResetTimer = 0;
 let _lastScrollTop = 0;
+const performance = { now(){ return 1000; } };
+function clearTimeout(){}
+function setTimeout(cb, ms){ cb(); return 1; }
+function _deferClearProgrammaticScroll(ms){clearTimeout(_programmaticScrollResetTimer);_programmaticScrollResetTimer=setTimeout(()=>{_programmaticScroll=false;},ms||80);}
 let renderCalls = [];
 function _scheduleMessageVirtualizedRender(){ renderCalls.push(true); }
 function requestAnimationFrame(cb){ cb(); }
@@ -951,6 +962,7 @@ const container = {
   get scrollTop(){ return scrollTopValue; },
   set scrollTop(v){ scrollHistory.push(v); scrollTopValue = v; },
   getBoundingClientRect(){ return {top: 50, bottom: 650}; },
+  classList: { add(){}, remove(){} },
   querySelector(selector){
     if(selector === '[data-msg-idx="42"]'){
       // Row moved by only 1px, within tolerance
@@ -966,7 +978,13 @@ function _captureMessageViewportAnchor(){
   return {rawIdx: 42, topOffset: 200};
 }
 let _programmaticScroll = false;
+let _programmaticScrollSetAt = 0;
+let _programmaticScrollResetTimer = 0;
 let _lastScrollTop = 0;
+const performance = { now(){ return 1000; } };
+function clearTimeout(){}
+function setTimeout(cb, ms){ cb(); return 1; }
+function _deferClearProgrammaticScroll(ms){clearTimeout(_programmaticScrollResetTimer);_programmaticScrollResetTimer=setTimeout(()=>{_programmaticScroll=false;},ms||80);}
 let renderCalls = [];
 function _scheduleMessageVirtualizedRender(){ renderCalls.push(true); }
 function requestAnimationFrame(cb){ cb(); }
@@ -990,8 +1008,12 @@ def test_compensate_scroll_for_measurement_delta_sets_programmatic_scroll_flag()
     source = _extract_func_script(js) + """
 let scrollTopValue = 200;
 let _programmaticScroll = false;
+let _programmaticScrollSetAt = 0;
+let _programmaticScrollResetTimer = 0;
 let _lastScrollTop = 0;
 let scrollSetCount = 0;
+const performance = { now(){ return 1000; } };
+function clearTimeout(){}
 const container = {
   get scrollTop(){ return scrollTopValue; },
   set scrollTop(v){
@@ -999,6 +1021,7 @@ const container = {
     scrollTopValue = v;
   },
   getBoundingClientRect(){ return {top: 50, bottom: 650}; },
+  classList: { add(){}, remove(){} },
   querySelector(selector){
     if(selector === '[data-msg-idx="42"]'){
       return {
@@ -1014,18 +1037,9 @@ function _captureMessageViewportAnchor(){
 }
 let renderCalls = [];
 function _scheduleMessageVirtualizedRender(){ renderCalls.push(true); }
-let timeoutCbBeingCalled = false;
-function requestAnimationFrame(cb){
-  // This is called with a callback that will eventually clear _programmaticScroll
-  cb();
-}
-function setTimeout(cb, delay){
-  // This is called from within the rAF callback (after scrollTop is set)
-  // The callback should clear _programmaticScroll
-  timeoutCbBeingCalled = true;
-  cb();
-  timeoutCbBeingCalled = false;
-}
+function _deferClearProgrammaticScroll(ms){clearTimeout(_programmaticScrollResetTimer);_programmaticScrollResetTimer=setTimeout(()=>{_programmaticScroll=false;},ms||80);}
+function requestAnimationFrame(cb){ cb(); }
+function setTimeout(cb, delay){ cb(); return 1; }
 eval(extractFunc('_compensateScrollForMeasurementDelta'));
 _compensateScrollForMeasurementDelta(()=>{ _scheduleMessageVirtualizedRender(true); });
 console.log(JSON.stringify({

@@ -4,6 +4,7 @@ Includes Sprint 10 cancel support via CANCEL_FLAGS.
 """
 import base64
 import contextlib
+import contextvars
 import json
 import logging
 import mimetypes
@@ -73,6 +74,25 @@ def _session_payload_with_full_messages(session, *, tool_calls=None):
     return raw
 
 
+def _compact_for_echo_compare(value: str) -> str:
+    """Normalize visible stream text for duplicate echo detection."""
+    return re.sub(r'\s+', '', str(value or ''))
+
+
+def _strip_compact_echo_suffix(value: str, suffix: str, *, search_window: int = 4096) -> tuple[str, bool]:
+    """Remove ``suffix`` from ``value`` when they match after whitespace folding."""
+    raw = str(value or '')
+    candidate = _compact_for_echo_compare(suffix)
+    if not raw or not candidate:
+        return raw, False
+    tail = raw[-max(len(str(suffix or '')) * 3, search_window):]
+    offset = len(raw) - len(tail)
+    for idx in range(len(tail) + 1):
+        if _compact_for_echo_compare(tail[idx:]) == candidate:
+            return raw[: offset + idx].rstrip(), True
+    return raw, False
+
+
 # Global lock for os.environ writes. Per-session locks (_agent_lock) prevent
 # concurrent runs of the SAME session, but two DIFFERENT sessions can still
 # interleave their os.environ writes. This global lock serializes the env
@@ -84,6 +104,78 @@ def _session_payload_with_full_messages(session, *, tool_calls=None):
 _ENV_LOCK = threading.Lock()
 
 _KEYLESS_CUSTOM_API_KEY = "dummy-key"
+
+_STREAMING_CRON_PROFILE_HOME: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "webui_streaming_cron_profile_home",
+    default=None,
+)
+_STREAMING_CRONJOB_WRAPPER_INSTALLED = False
+
+
+def _install_streaming_cronjob_profile_wrapper() -> None:
+    """Wrap the agent cronjob tool so calls run under the streaming profile.
+
+    The in-chat agent run already binds per-turn contextvars for other
+    session-scoped state. Cron jobs are special because ``cron.jobs`` snapshots
+    path constants at import time, so the model-facing ``cronjob`` tool must
+    enter the existing WebUI cron profile context at the tool-call boundary.
+    That context uses the cron-specific lock and restores the module caches as
+    soon as the single cron tool call returns, avoiding long-lived global path
+    mutation for the whole agent turn.
+    """
+    global _STREAMING_CRONJOB_WRAPPER_INSTALLED
+    if _STREAMING_CRONJOB_WRAPPER_INSTALLED:
+        return
+    try:
+        from tools.registry import registry
+    except Exception:
+        logger.debug("streaming cronjob wrapper: tools registry unavailable", exc_info=True)
+        return
+
+    entry = registry.get_entry("cronjob")
+    if entry is None:
+        try:
+            import tools.cronjob_tools  # noqa: F401
+        except Exception:
+            logger.debug("streaming cronjob wrapper: cronjob tool import failed", exc_info=True)
+        entry = registry.get_entry("cronjob")
+    if entry is None:
+        logger.debug("streaming cronjob wrapper: cronjob tool not registered")
+        return
+    original_handler = entry.handler
+    if getattr(original_handler, "_webui_streaming_profile_wrapper", False):
+        _STREAMING_CRONJOB_WRAPPER_INSTALLED = True
+        return
+
+    # This relies on the agent tool executor's ``propagate_context_to_thread``
+    # using an unfiltered ``contextvars.copy_context()`` so this WebUI-owned
+    # contextvar reaches the sync cronjob handler even when the tool call runs
+    # on the agent's ThreadPoolExecutor worker.
+    def _profile_scoped_cronjob_handler(args, **kwargs):
+        profile_home = _STREAMING_CRON_PROFILE_HOME.get()
+        if not profile_home:
+            return original_handler(args, **kwargs)
+        from api.profiles import cron_profile_context_for_home
+        with cron_profile_context_for_home(Path(profile_home)):
+            return original_handler(args, **kwargs)
+
+    _profile_scoped_cronjob_handler.__dict__["_webui_streaming_profile_wrapper"] = True
+    _profile_scoped_cronjob_handler.__dict__["_webui_original_handler"] = original_handler
+    registry.register(
+        name=entry.name,
+        toolset=entry.toolset,
+        schema=entry.schema,
+        handler=_profile_scoped_cronjob_handler,
+        check_fn=entry.check_fn,
+        requires_env=entry.requires_env,
+        is_async=entry.is_async,
+        description=entry.description,
+        emoji=entry.emoji,
+        max_result_size_chars=entry.max_result_size_chars,
+        dynamic_schema_overrides=entry.dynamic_schema_overrides,
+    )
+    _STREAMING_CRONJOB_WRAPPER_INSTALLED = True
+
 
 _PERSISTENT_MEMORY_FILES = (
     ("memory", ("memories", "MEMORY.md")),
@@ -5981,6 +6073,7 @@ def _run_agent_streaming(
     # Placed ABOVE the _checkpoint_stop cluster so that cluster stays adjacent
     # to the `try:` (preserves the Issue #765 static-locator invariant).
     _turn_session_identity_tokens = None
+    _streaming_cron_profile_home_token = None
     # Initialised here (before any code that may raise) so the outer `finally`
     # block can safely check `if _checkpoint_stop is not None` even when an
     # exception fires before the checkpoint thread is created (Issue #765).
@@ -6027,6 +6120,7 @@ def _run_agent_streaming(
             )
             _profile_home_path = get_hermes_home_for_profile(getattr(s, 'profile', None))
             _profile_home = str(_profile_home_path)
+            _streaming_cron_profile_home_token = _STREAMING_CRON_PROFILE_HOME.set(_profile_home)
             _profile_runtime_env = get_profile_runtime_env(_profile_home_path)
             _safe_profile_runtime_env = filter_runtime_env_for_gateway_parity(_profile_runtime_env)
         except ImportError:
@@ -6084,6 +6178,7 @@ def _run_agent_streaming(
         # first-time module initialisation (which can be slow) does not
         # block other concurrent sessions waiting on _ENV_LOCK (#2024).
         _prewarm_skill_tool_modules()
+        _install_streaming_cronjob_profile_wrapper()
         # Still set process-level env as fallback for tools that bypass thread-local
         # Acquire lock only for the env mutation, then release before the agent runs.
         # The finally block re-acquires to restore — keeping critical sections short
@@ -6108,9 +6203,12 @@ def _run_agent_streaming(
             os.environ['HERMES_SESSION_CHAT_ID'] = str(session_id)
             if _profile_home:
                 os.environ['HERMES_HOME'] = _profile_home
-                # Patch module-level caches to match the active profile.
+                # Patch skill module caches to match the active profile.
                 # _set_hermes_home() does this for process-wide switches
-                # but per-request switches skip it (#1700).
+                # but per-request switches skip it (#1700). The in-chat
+                # cronjob tool is wrapped separately at its tool-call boundary
+                # with cron_profile_context_for_home (#4580) so cron.jobs path
+                # caches are not mutated for the entire agent turn.
                 # Modules were prewarmed by _prewarm_skill_tool_modules()
                 # above, so we only do lightweight sys.modules lookups and
                 # attribute assignments here — no first-time import under
@@ -6253,8 +6351,22 @@ def _run_agent_streaming(
             # Throttle: emit metering events at most every 100 ms so the per-message
             # TPS label feels live during fast token streams without flooding SSE.
             _metering_last_emit = [time.monotonic() - 1]  # fire immediately on first token
+            _reasoning_last_put = [0.0]
+            _reasoning_buffer = ['']
             _metering_output_deltas = [0]
             _metering_reasoning_deltas = [0]
+
+            def _flush_reasoning_buffer():
+                # #4729: emit any coalesced-but-not-yet-flushed reasoning text immediately.
+                # The ~10 Hz throttle in on_reasoning leaves a sub-100ms tail in the buffer;
+                # the agent never calls reasoning_callback(None), and reasoning can transition
+                # to tool calls / visible output, so we must flush at every boundary that
+                # closes or reorders the live reasoning stream — otherwise the tail is
+                # silently lost from the live Thinking view (the frontend appends deltas).
+                if _reasoning_buffer[0]:
+                    put('reasoning', {'text': _reasoning_buffer[0]})
+                    _reasoning_buffer[0] = ''
+
 
             def _emit_metering():
                 now = time.monotonic()
@@ -6268,9 +6380,6 @@ def _run_agent_streaming(
                 stats.setdefault('estimated', False)
                 put('metering', stats)
 
-            def _compact_for_echo_compare(value: str) -> str:
-                return re.sub(r'\s+', ' ', str(value or '')).strip()
-
             def _is_visible_output_echo(text: str) -> bool:
                 candidate = _compact_for_echo_compare(text)
                 if not candidate:
@@ -6280,10 +6389,45 @@ def _run_agent_streaming(
                 )
                 return bool(visible_tail and visible_tail.endswith(candidate))
 
+            def _strip_reasoning_output_echo(text: str) -> bool:
+                nonlocal _reasoning_segments
+                removed = False
+                if stream_id in STREAM_REASONING_TEXT:
+                    next_text, did_remove = _strip_compact_echo_suffix(
+                        STREAM_REASONING_TEXT.get(stream_id, ''),
+                        text,
+                    )
+                    if did_remove:
+                        STREAM_REASONING_TEXT[stream_id] = next_text
+                        removed = True
+                next_buffer, did_remove_buffer = _strip_compact_echo_suffix(_reasoning_buffer[0], text)
+                if did_remove_buffer:
+                    _reasoning_buffer[0] = next_buffer
+                    removed = True
+                for idx in (_current_reasoning_idx, _current_reasoning_idx - 1):
+                    if idx not in _reasoning_segments:
+                        continue
+                    next_segment, did_remove_segment = _strip_compact_echo_suffix(
+                        _reasoning_segments.get(idx, ''),
+                        text,
+                    )
+                    if not did_remove_segment:
+                        continue
+                    if next_segment:
+                        _reasoning_segments[idx] = next_segment
+                    else:
+                        _reasoning_segments.pop(idx, None)
+                    removed = True
+                    break
+                return removed
+
             def on_token(text):
                 nonlocal _token_sent
                 if text is None:
                     return  # end-of-stream sentinel
+                # #4729: visible output is starting — flush any buffered reasoning tail
+                # first so the live Thinking stream is complete before/at the transition.
+                _flush_reasoning_buffer()
                 _token_sent = True
                 # Accumulate partial text so cancel_stream() can persist it (#893)
                 if stream_id in STREAM_PARTIAL_TEXT:
@@ -6299,6 +6443,9 @@ def _run_agent_streaming(
             def on_reasoning(text):
                 nonlocal _reasoning_segments, _current_reasoning_idx, _tool_boundary_advanced
                 if text is None:
+                    # Flush any remaining coalesced reasoning buffer so the last
+                    # partial window is not lost when the reasoning phase ends.
+                    _flush_reasoning_buffer()
                     return
                 _tool_boundary_advanced = False
                 reasoning_delta = str(text)
@@ -6317,7 +6464,19 @@ def _run_agent_streaming(
                 # concatenation is correct there.
                 if stream_id in STREAM_REASONING_TEXT:
                     STREAM_REASONING_TEXT[stream_id] += reasoning_delta
-                put('reasoning', {'text': reasoning_delta})
+                # Accumulate into a coalescing buffer so every delta reaches the
+                # browser — reasoning deltas are incremental, not idempotent.
+                _reasoning_buffer[0] += reasoning_delta
+                # Throttle reasoning SSE events to ~10 Hz to avoid overwhelming the
+                # frontend renderer. Each event triggers _parseStreamState() which
+                # scans the full accumulated text — 10k+ reasoning tokens/second
+                # builds up and locks the JS main thread. The user still sees live
+                # Thinking updates, just at a sustainable rate.
+                now = time.monotonic()
+                if now - _reasoning_last_put[0] >= 0.1:
+                    _reasoning_last_put[0] = now
+                    put('reasoning', {'text': _reasoning_buffer[0]})
+                    _reasoning_buffer[0] = ''
                 # Track reasoning deltas in the meter so live TPS reflects all AI output.
                 _metering_reasoning_deltas[0] += 1
                 meter().record_reasoning(stream_id, _metering_reasoning_deltas[0])
@@ -6335,11 +6494,15 @@ def _run_agent_streaming(
                 visible = str(text).strip()
                 if not visible:
                     return
+                reasoning_echo = _strip_reasoning_output_echo(visible)
                 already_streamed = bool(cb_kwargs.get('already_streamed', False)) or _is_visible_output_echo(visible)
-                put('interim_assistant', {
+                payload = {
                     'text': visible,
                     'already_streamed': already_streamed,
-                })
+                }
+                if reasoning_echo:
+                    payload['reasoning_echo'] = True
+                put('interim_assistant', payload)
 
             # Pre-initialise the activity counter here so on_tool (which
             # closes over it) never captures an unbound name even if this
@@ -6389,6 +6552,9 @@ def _run_agent_streaming(
 
             def on_tool(*cb_args, **cb_kwargs):
                 nonlocal _reasoning_segments, _current_reasoning_idx, _tool_boundary_advanced
+                # #4729: a tool boundary closes/reorders the live reasoning stream — flush
+                # any buffered reasoning tail first so it isn't stranded behind the tool event.
+                _flush_reasoning_buffer()
                 event_type = None
                 name = None
                 preview = None
@@ -7234,6 +7400,11 @@ def _run_agent_streaming(
                 task_id=session_id,
                 persist_user_message=msg_text,
             )
+            # #4729: the run is done — flush any reasoning tail still in the coalescing
+            # buffer (the agent never calls reasoning_callback(None), and a turn can end on
+            # reasoning with no trailing token/tool boundary to trigger a flush) so the last
+            # sub-100ms window reaches the live Thinking view before the terminal done event.
+            _flush_reasoning_buffer()
             if cancel_event.is_set():
                 if _checkpoint_stop is not None:
                     _checkpoint_stop.set()
@@ -8497,6 +8668,16 @@ def _run_agent_streaming(
                 # so it doesn't block the stream.
                 _maybe_schedule_title_refresh(s, put, agent)
         finally:
+            # #4729: guaranteed-exit flush of any reasoning tail still buffered. On the
+            # normal path the on_token/on_tool/post-run flushes already emptied it (no-op
+            # here); on an exception or retry path that bypassed those, this emits the tail
+            # before the outer handler sends apperror — so the live Thinking view never
+            # loses its last coalesced chunk. Runs before stream teardown; STREAM_REASONING_TEXT
+            # already mirrors the full text for persistence regardless.
+            try:
+                _flush_reasoning_buffer()
+            except Exception:
+                pass
             # Stop the live metering ticker
             _metering_stop.set()
             # Unregister the gateway approval callback and unblock any threads
@@ -8770,6 +8951,8 @@ def _run_agent_streaming(
             update_active_run(stream_id, phase="finalizing")
             _last_resort_sync_from_core(s, stream_id, _agent_lock)
         _clear_thread_env()  # TD1: always clear thread-local context
+        if _streaming_cron_profile_home_token is not None:
+            _STREAMING_CRON_PROFILE_HOME.reset(_streaming_cron_profile_home_token)
         # xsession wakeup misroute root fix (Option 1): restore the per-turn
         # session-identity context-locals (reset-token semantics). MUST run on
         # every exit path so a reused thread-pool worker leaks no identity and
@@ -8851,9 +9034,10 @@ def _handle_chat_steer(handler, body: dict) -> bool:
     interrupted.
 
     If no agent is cached, the agent is too old to support steer, or no
-    stream is active, return {"accepted": False, "fallback": "<reason>"}
-    so the frontend can fall back to interrupt or queue mode. The
-    fallback path is the existing behaviour from PR #1062.
+    stream is active, return {"accepted": False, "fallback": "<reason>"}.
+    The frontend must surface that failure without cancelling the active run;
+    Steer is active-run guidance, not implicit permission to Queue, Interrupt,
+    or Stop-and-send.
 
     Returns 200 with {"accepted": bool, "fallback": str|None,
     "stream_id": str|None}.
@@ -8887,7 +9071,8 @@ def _handle_chat_steer(handler, body: dict) -> bool:
         except Exception:
             logger.debug("Failed to close steer identity-mismatched cached agent for session %s", sid, exc_info=True)
     if not cached:
-        # No active agent for this session — caller falls back to interrupt
+        # No active agent for this session — caller surfaces a steer failure
+        # without cancelling the active run.
         return j(handler, {"accepted": False, "fallback": "no_cached_agent",
                            "stream_id": None})
     agent = cached[0]

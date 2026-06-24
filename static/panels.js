@@ -4,7 +4,7 @@ let _kanbanBoard = null;
 let _kanbanLatestEventId = 0;
 let _kanbanPollTimer = null;
 let _kanbanCurrentTaskId = null;
-let _kanbanLanesByProfile = false;
+let _kanbanLanesByProfile = true;
 // Multi-board state. _kanbanCurrentBoard is the slug of the active board
 // the UI is currently viewing. null means "use whatever the server reports
 // as active" (i.e. don't pin a specific board in API calls). The UI
@@ -41,6 +41,8 @@ const APP_TITLEBAR_KEYS = {
   memory: 'tab_memory', workspaces: 'tab_workspaces',
   profiles: 'tab_profiles', todos: 'tab_todos', insights: 'tab_insights', logs: 'tab_logs', settings: 'tab_settings',
 };
+const MAIN_VIEW_PANELS = ['settings','skills','memory','tasks','kanban','workspaces','profiles','insights','logs','plugin'];
+const MAIN_VIEW_SIDEBAR_PANEL_FALLBACKS = { plugin: 'settings' };
 
 /**
  * Update the top app titlebar to reflect the current page or selected conversation.
@@ -235,6 +237,34 @@ function _resyncChatSidebarAfterPanelSwitch() {
   else run();
 }
 
+function _closeMobileSidebarAfterPanelSelection(){
+  if(typeof closeMobileSidebar!=='function')return;
+  if(typeof _isDesktopWidth==='function'&&_isDesktopWidth())return;
+  closeMobileSidebar();
+}
+
+function _panelFromCurrentMainView(){
+  const mainEl=document.querySelector('main.main');
+  if(!mainEl)return _currentPanel||'chat';
+  for(const panel of MAIN_VIEW_PANELS){
+    if(mainEl.classList.contains('showing-'+panel))return MAIN_VIEW_SIDEBAR_PANEL_FALLBACKS[panel]||panel;
+  }
+  if(_currentPanel&&$('panel'+_currentPanel.charAt(0).toUpperCase()+_currentPanel.slice(1)))return _currentPanel;
+  return 'chat';
+}
+
+function _syncMobileSidebarPanelFromMainView(){
+  const panel=_panelFromCurrentMainView();
+  if(!panel)return _currentPanel||'chat';
+  const panelEl=$('panel'+panel.charAt(0).toUpperCase()+panel.slice(1));
+  if(!panelEl)return _currentPanel||'chat';
+  _currentPanel=panel;
+  document.querySelectorAll('[data-panel]').forEach(t=>t.classList.toggle('active',t.dataset.panel===panel));
+  document.querySelectorAll('.panel-view').forEach(p=>p.classList.remove('active'));
+  panelEl.classList.add('active');
+  return panel;
+}
+
 async function switchPanel(name, opts = {}) {
   const nextPanel = name || 'chat';
   const prevPanel = _currentPanel;
@@ -278,7 +308,7 @@ async function switchPanel(name, opts = {}) {
   // showing-<name> class on <main>; no class means chat (the default).
   const mainEl = document.querySelector('main.main');
   if (mainEl) {
-    ['settings','skills','memory','tasks','kanban','workspaces','profiles','insights','logs','plugin'].forEach(p => {
+    MAIN_VIEW_PANELS.forEach(p => {
       mainEl.classList.toggle('showing-' + p, nextPanel === p);
     });
   }
@@ -300,9 +330,10 @@ async function switchPanel(name, opts = {}) {
   }
   if (opts.fromRailClick && typeof _isDesktopWidth === 'function' && !_isDesktopWidth()) {
     const sidebar = document.querySelector('.sidebar');
-    const overlay = document.getElementById('mobileOverlay');
-    if (sidebar) sidebar.classList.add('mobile-open');
-    if (overlay) overlay.classList.add('visible');
+    if (sidebar) {
+      sidebar.classList.remove('mobile-session-page');
+      sidebar.classList.add('mobile-panel-drawer', 'mobile-open');
+    }
   }
   _resyncChatSidebarAfterPanelSwitch();
   if (nextPanel === 'chat' && typeof syncTopbar === 'function') syncTopbar();
@@ -905,6 +936,7 @@ function openCronDetail(id, el){
   _stopCronWatch();
   _renderCronDetail(job);
   _checkCronWatchOnDetail(id);
+  _closeMobileSidebarAfterPanelSelection();
 }
 
 function _clearCronDetail(){
@@ -1518,13 +1550,45 @@ function _kanbanCurrentFilters(){
 }
 
 function _kanbanApplyConfigDefaults(config){
-  if (!config || _kanbanConfigApplied) return;
+  if (!config) return;
+  _kanbanLanesByProfile = config.lane_by_profile === true;
+  syncKanbanViewToggle();
+  if (_kanbanConfigApplied) return;
   if ($('kanbanTenantFilter') && config.default_tenant) $('kanbanTenantFilter').dataset.defaultValue = config.default_tenant;
   if ($('kanbanIncludeArchived') && config.include_archived_by_default === true) $('kanbanIncludeArchived').checked = true;
-  if (config.lane_by_profile === true) _kanbanLanesByProfile = true;
   _kanbanConfigApplied = true;
 }
 let _kanbanConfigApplied = false;
+
+function syncKanbanViewToggle(){
+  const btn = $('btnKanbanViewToggle');
+  if (!btn) return;
+  const consolidated = !_kanbanLanesByProfile;
+  const label = t('kanban_view_consolidated');
+  btn.setAttribute('aria-pressed', consolidated ? 'true' : 'false');
+  btn.setAttribute('aria-label', label);
+  btn.setAttribute('data-i18n-title', 'kanban_view_consolidated');
+  btn.setAttribute('data-i18n-aria-label', 'kanban_view_consolidated');
+  if (typeof _setButtonTooltip === 'function') _setButtonTooltip(btn, label);
+  else btn.setAttribute('data-tooltip', label);
+}
+
+async function toggleKanbanViewMode(){
+  const btn = $('btnKanbanViewToggle');
+  const nextLaneByProfile = !_kanbanLanesByProfile;
+  if (btn) btn.disabled = true;
+  try {
+    const saved = await api('/api/kanban/config', {method: 'PATCH', body: JSON.stringify({lane_by_profile: nextLaneByProfile})});
+    _kanbanLanesByProfile = saved.lane_by_profile === true;
+    syncKanbanViewToggle();
+    _kanbanRenderBoard();
+    showToast(t(_kanbanLanesByProfile ? 'kanban_view_lanes_saved' : 'kanban_view_consolidated_saved'));
+  } catch(e) {
+    showToast(t('kanban_view_update_failed') + (e.message || e), 4000, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
 
 function _kanbanSetSelectOptions(el, values, allLabelKey){
   if (!el) return;
@@ -3006,6 +3070,7 @@ async function loadKanbanTask(taskId){
       preview.style.display = '';
       preview.innerHTML = _kanbanRenderTaskDetail(data);
     }
+    _closeMobileSidebarAfterPanelSelection();
     showToast(`${t('kanban_task')}: ${title}`);
   } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
 }
@@ -4258,6 +4323,7 @@ async function openSkill(name, el) {
     }
     _currentSkillDetail = { name, content: data.content || '', linked_files: data.linked_files || {} };
     _renderSkillDetail(name, data.content || '', data.linked_files || {});
+    _closeMobileSidebarAfterPanelSelection();
   } catch(e) { setStatus(t('skill_load_failed') + e.message); }
 }
 
@@ -4707,6 +4773,7 @@ async function openMemorySection(section, el) {
     await loadNotesSources(false);
   }
   _renderMemoryDetail(section);
+  _closeMobileSidebarAfterPanelSelection();
 }
 
 function editCurrentMemory() {
@@ -4914,15 +4981,27 @@ function _positionComposerWsDropdown(){
 
 function _positionProfileDropdown(){
   const dd=$('profileDropdown');
-  const chip=$('profileChip');
-  const footer=document.querySelector('.composer-footer');
-  if(!dd||!chip||!footer)return;
-  const chipRect=chip.getBoundingClientRect();
-  const footerRect=footer.getBoundingClientRect();
-  let left=chipRect.left-footerRect.left;
-  const maxLeft=Math.max(0, footer.clientWidth-dd.offsetWidth);
-  left=Math.max(0, Math.min(left, maxLeft));
-  dd.style.left=`${left}px`;
+  const trigger=_profileDropdownTrigger||$('profileChip');
+  if(!dd||!trigger)return;
+  const rect=trigger.getBoundingClientRect();
+  const gap=4;
+  const ddW=dd.offsetWidth||260;
+  // Decide direction: below for titlebar, above for composer
+  const openBelow=trigger===document.getElementById('titlebarProfileBtn');
+  // Horizontal: center on trigger, clamp to viewport
+  let left=rect.left+(rect.width/2)-(ddW/2);
+  left=Math.max(8, Math.min(left, window.innerWidth-ddW-8));
+  dd.style.left=left+'px';
+  // Vertical
+  if(openBelow){
+    dd.style.bottom=''; // clear any stale bottom from a prior composer-chip open
+    dd.style.top=(rect.bottom+gap)+'px';
+    dd.classList.add('open-below');
+  }else{
+    dd.style.top=''; dd.style.bottom=''; // clear fixed top/bottom
+    dd.style.bottom=(window.innerHeight-rect.top+gap)+'px';
+    dd.classList.remove('open-below');
+  }
 }
 
 function renderWorkspaceDropdownInto(dd, workspaces, currentWs){
@@ -5241,6 +5320,7 @@ function openWorkspaceDetail(path, el){
   if (target) target.classList.add('active');
   _workspacePreFormDetail = null;
   _renderWorkspaceDetail(ws);
+  _closeMobileSidebarAfterPanelSelection();
 }
 
 function _clearWorkspaceDetail(){
@@ -5488,6 +5568,7 @@ async function switchToWorkspace(path,name){
     }catch(e){if(typeof setStatus==='function')setStatus(t('switch_failed')+e.message);return;}
     if(!S.session)return;
   }
+  // Workspace mutation during a live turn would desync the active stream context.
   if(S.busy){
     showToast(t('workspace_busy_switch'));
     return;
@@ -5523,6 +5604,7 @@ async function switchToWorkspace(path,name){
 // ── Profile panel + dropdown ──
 let _profilesCache = null;
 let _profileSwitchGeneration = 0;
+let _profileDropdownTrigger = null;  // tracks which element triggered the dropdown
 
 async function _profileSwitchPanelLoad(){
   if (_currentPanel === 'skills') await loadSkills();
@@ -5560,6 +5642,8 @@ function _refreshProfileSwitchBackground(gen){
     _renderComposerControlChips();
     _renderComposerSituationalControlChips();
     if(typeof _applyComposerFooterVisibilitySettings==='function') _applyComposerFooterVisibilitySettings();
+    window._showTitlebarProfile=!!(s&&s.show_titlebar_profile);
+    if(typeof _applyTitlebarProfileVisibility==='function') _applyTitlebarProfileVisibility();
   }).catch(function(){});
 }
 
@@ -5730,6 +5814,7 @@ function openProfileDetail(name, el){
   if (target) target.classList.add('active');
   _profilePreFormDetail = null;
   _renderProfileDetail(p, _profilesCache.active);
+  _closeMobileSidebarAfterPanelSelection();
 }
 
 function _clearProfileDetail(){
@@ -5798,14 +5883,19 @@ function renderProfileDropdown(data) {
     mgmt.onclick = () => { closeProfileDropdown(); mobileSwitchPanel('profiles'); };
     dd.appendChild(mgmt);
   }
+  // Sync titlebar label to the resolved active profile
+  const tbl = $('titlebarProfileLabel');
+  if (tbl) tbl.textContent = active;
 }
 
-function toggleProfileDropdown() {
+function toggleProfileDropdown(e) {
   const dd = $('profileDropdown');
   if (!dd) return;
   if (dd.classList.contains('open')) { closeProfileDropdown(); return; }
   closeWsDropdown(); // close workspace dropdown if open
   if(typeof closeModelDropdown==='function') closeModelDropdown();
+  // Track which element triggered the dropdown for positioning
+  _profileDropdownTrigger = (e && e.currentTarget) || $('profileChip');
   api('/api/profiles').then(data => {
     // In single profile mode, don't show profile dropdown at all
     if (data.single_profile_mode) {
@@ -5815,8 +5905,11 @@ function toggleProfileDropdown() {
     renderProfileDropdown(data);
     dd.classList.add('open');
     _positionProfileDropdown();
+    // Mark the triggering button as active
     const chip=$('profileChip');
-    if(chip) chip.classList.add('active');
+    if(chip && _profileDropdownTrigger===chip) chip.classList.add('active');
+    const tbtn=$('titlebarProfileBtn');
+    if(tbtn && _profileDropdownTrigger===tbtn) tbtn.classList.add('active');
   }).catch(e => { showToast(t('profiles_load_failed')); });
 }
 
@@ -5825,9 +5918,11 @@ function closeProfileDropdown() {
   if (dd) dd.classList.remove('open');
   const chip=$('profileChip');
   if(chip) chip.classList.remove('active');
+  const tbtn=$('titlebarProfileBtn');
+  if(tbtn) tbtn.classList.remove('active');
 }
 document.addEventListener('click', e => {
-  if (!e.target.closest('#profileChipWrap') && !e.target.closest('#profileDropdown')) closeProfileDropdown();
+  if (!e.target.closest('#profileChipWrap') && !e.target.closest('#titlebarProfileBtn') && !e.target.closest('#profileDropdown')) closeProfileDropdown();
 });
 window.addEventListener('resize',()=>{
   const dd=$('profileDropdown');
@@ -5835,6 +5930,30 @@ window.addEventListener('resize',()=>{
 });
 
 async function switchToProfile(name) {
+  // ── #4671 profile-switch loading-skeleton — FOUR-GUARD CONTRACT ───────────────
+  // The skeleton must never be clobbered by the OLD profile's content and must never
+  // strand. Four interacting pieces of state cooperate; an edit touching one without
+  // the others can silently reopen a clobber/strand window, so keep them in sync:
+  //   1. _profileSwitchListEmbargo (sessions.js) — set BEFORE the skeleton, drops EVERY
+  //      session-list payload (success + fetch-failure) during the switch window; lifted
+  //      immediately before the switch-owned renderSessionList(), on failure-restore, and
+  //      in the _switchGen-guarded finally. Closes the "render that STARTS mid-switch,
+  //      before the new-profile cookie is set, fetched the old profile" window.
+  //   2. _invalidateSessionListRenders() (sessions.js) — bumps _renderSessionListGen +
+  //      clears pending/queued at switch start; discards renders already in flight/queued.
+  //   3. _sessionListSkeletonActive (sessions.js) — renderSessionListFromCache() bails
+  //      while true; cleared ONLY on fresh data (_applySessionListPayload), fetch-error,
+  //      and failure-restore — so a bail can't strand the skeleton.
+  //   4. _wsTreeGen (workspace.js) — bumped UNCONDITIONALLY here (incl. panel-closed, since
+  //      loadDir('.') still runs); loadDir rejects stale /api/list whose gen is superseded.
+  //   Plus _profileSwitchGeneration / _switchGen — guards superseded switches so a slower
+  //   earlier switch can't clobber a newer one's skeleton/embargo.
+  // ──────────────────────────────────────────────────────────────────────────────
+  // No-op self-switch guard: bail before showing any loading skeleton if we're
+  // already on this profile, so paths like activateCurrentProfile() (which
+  // doesn't pre-check) can't flash a skeleton→restore for a click that changes
+  // nothing. (#4662 Opus gate)
+  if (name && name === S.activeProfile) return;
   S._pendingSessionToolsets=null;
   // Profile switches are per-client cookie/TLS scoped, so a running stream in
   // the current session can safely continue while this tab moves to another
@@ -5845,12 +5964,30 @@ async function switchToProfile(name) {
   // feedback while the async switch is in progress.
   const _chip = $('profileChip');
   const _chipLabel = $('profileChipLabel');
+  const _titlebarBtn = $('titlebarProfileBtn');
+  const _titlebarLabel = $('titlebarProfileLabel');
   const _prevProfileName = S.activeProfile || 'default';
   const _switchGen = ++_profileSwitchGeneration;
   if (_chip) { _chip.classList.add('switching'); _chip.disabled = true; }
+  if (_titlebarBtn) { _titlebarBtn.classList.add('switching'); _titlebarBtn.disabled = true; }
   // Optimistic name update — shows the target name right away
   if (_chipLabel) _chipLabel.textContent = name;
+  if (_titlebarLabel) _titlebarLabel.textContent = name;
 
+  // ── Clear stale content + show loading skeletons immediately (#4662) ───────
+  // The conversation list and workspace tree still show the PREVIOUS profile's
+  // content until their fetches resolve (~1s). Replace them with skeletons the
+  // instant the switch begins so the user never stares at the wrong profile's
+  // data, and gets consistent loading feedback across the whole surface — not
+  // just the spinning chip. The real renders below overwrite these.
+  //
+  // First dismiss any open inline-rename or row action menu: renderSessionList
+  // FromCache() early-returns (no DOM swap) while _renamingSid or
+  // _sessionActionMenu is set, which would otherwise strand the skeleton AND
+  // defeat the failure-path restore (#4662 Opus gate). A profile switch is a
+  // context change where dismissing those transient affordances is correct.
+  if (typeof _renamingSid !== 'undefined' && _renamingSid) _renamingSid = null;
+  if (typeof closeSessionActionMenu === 'function') closeSessionActionMenu();
   // Determine whether the current session has any messages.
   // A session with messages is "in progress" and belongs to the current profile —
   // we must not retag it.  We'll start a fresh session for the new profile instead.
@@ -5859,12 +5996,44 @@ async function switchToProfile(name) {
     S.session.active_stream_id ||
     S.session.pending_user_message
   );
+  const _workspaceVisibleAtStart = typeof _workspacePanelMode !== 'undefined' && _workspacePanelMode !== 'closed';
 
+  // #4671 CORE: the skeleton/embargo/generation setup is INSIDE the try so the
+  // _switchGen-guarded finally always lifts the embargo — a throw in this synchronous
+  // setup can't leak the embargo and freeze the sidebar (Codex re-gate 4).
   try {
-    const data = await api('/api/profile/switch', { method: 'POST', body: JSON.stringify({ name }) });
+    // Invalidate any in-flight/queued session-list render BEFORE showing the skeleton,
+    // so a pre-switch /api/sessions response (old profile's rows, issued before the
+    // switch) can't resolve, pass the generation guard, clear the skeleton flag, and
+    // paint stale rows. Must precede showSessionListSkeleton().
+    if (typeof _invalidateSessionListRenders === 'function') _invalidateSessionListRenders();
+    // ...and set the embargo so a render that STARTS during the switch window (after the
+    // skeleton, before the new-profile cookie is set) also can't paint the old profile's
+    // rows. Cleared right before the switch-owned renderSessionList() and on failure.
+    if (typeof _setProfileSwitchListEmbargo === 'function') _setProfileSwitchListEmbargo(true);
+    if (typeof showSessionListSkeleton === 'function') showSessionListSkeleton(name);
+    // invalidate any in-flight workspace-tree load UNCONDITIONALLY at switch start — even
+    // when the panel is closed, loadDir('.') still runs later, and an empty-session switch
+    // reuses the same session_id so loadDir's id guard alone can't reject a stale
+    // previous-workspace /api/list. Bump here (not only inside the panel-gated
+    // showWorkspaceTreeSkeleton) to close the closed-panel race.
+    if (typeof bumpWorkspaceTreeGen === 'function') bumpWorkspaceTreeGen();
+    if (_workspaceVisibleAtStart && typeof showWorkspaceTreeSkeleton === 'function') showWorkspaceTreeSkeleton();
+    // timeoutToast:false — suppress api()'s generic "Request timed out" toast so a
+    // superseded or transient-but-eventually-successful switch can't pop a spurious
+    // red error while the real switch completes and renders. The catch block below is
+    // the single source of truth for switch failure and is gated on _switchGen, so the
+    // error surfaces ONLY when the CURRENT switch genuinely fails (@rodboev review, #4662).
+    const data = await api('/api/profile/switch', { method: 'POST', body: JSON.stringify({ name }), timeoutToast: false });
     if (_switchGen !== _profileSwitchGeneration) return;
     S.activeProfile = data.active || name;
     S.activeProfileIsDefault = !!data.is_default;
+    // #4650 review: a profile switch can change agent.reasoning_effort (and other
+    // reasoning inputs like base_url) WITHOUT changing the default model/provider,
+    // which is all the reasoning-chip cache key tracks. Force exactly one reasoning
+    // refetch for the new profile so the chip reflects the new profile's effort
+    // (the syncTopbar() calls below route through syncReasoningChip()).
+    if (typeof _lastReasoningFetchKey !== 'undefined') _lastReasoningFetchKey = null;
 
     // Reconnect the gateway SSE to the NEW profile's watcher. The backend watcher
     // registry is now profile-keyed (#3629), but this tab's existing EventSource is
@@ -5966,10 +6135,37 @@ async function switchToProfile(name) {
       // Keep topbar chips (workspace/profile) in sync after creating the
       // new profile-scoped session.
       syncTopbar();
+      // #4671: lift the embargo immediately before the switch-owned render — JS is
+      // single-threaded so nothing interleaves between this clear and the call, making
+      // this render the first allowed to paint the new profile's rows.
+      if (typeof _setProfileSwitchListEmbargo === 'function') _setProfileSwitchListEmbargo(false);
       await renderSessionList();
+      // Re-check generation after the awaited list render: a newer switch can be
+      // started while renderSessionList() is in flight, and without this guard
+      // the superseded switch would clear the newer switch's workspace skeleton
+      // and pop a stale toast. Mirrors the no-messages branch guard below.
+      // (@rodboev/greptile review, #4662)
+      if (_switchGen !== _profileSwitchGeneration) return;
+      // Safety net: if the new session has no workspace, newSession() won't have
+      // painted the file tree — clear the up-front skeleton so it can't strand
+      // (#4662 Opus gate). No-op when a real tree already rendered.
+      if ((!S.session || !S.session.workspace) && typeof clearWorkspaceTreeSkeleton === 'function') {
+        clearWorkspaceTreeSkeleton();
+      }
       showToast(t('profile_switched_new_conversation', name));
     } else {
-      // No messages yet — just refresh the list and topbar in place
+      // No messages yet — refresh the list and topbar in place, then the
+      // workspace tree. The loading skeletons shown up front (top of this
+      // function) already give immediate cross-surface feedback, so we keep the
+      // workspace refresh AFTER the stale-switch guard: loadDir() paints the
+      // file tree as soon as its fetch resolves with only a session-id check,
+      // and empty-session switches reuse the same session id — so starting it
+      // before the guard could let an older switch's /api/list paint over a
+      // newer one (Codex gate #4662). renderSessionList() is the slow fetch and
+      // has its own internal generation guard, so awaiting it first is fine.
+      const workspaceVisible = typeof _workspacePanelMode !== 'undefined' && _workspacePanelMode !== 'closed';
+      // #4671: lift the embargo immediately before the switch-owned render (see above).
+      if (typeof _setProfileSwitchListEmbargo === 'function') _setProfileSwitchListEmbargo(false);
       await renderSessionList();
       if (_switchGen !== _profileSwitchGeneration) return;
       syncTopbar();
@@ -5977,7 +6173,11 @@ async function switchToProfile(name) {
       // profile's workspace, not the previous one (#1214).
       if (S.session && S.session.workspace) {
         const dirLoad = loadDir('.');
-        if (typeof _workspacePanelMode !== 'undefined' && _workspacePanelMode !== 'closed') await dirLoad;
+        if (workspaceVisible) await dirLoad;
+      } else if (typeof clearWorkspaceTreeSkeleton === 'function') {
+        // New profile has no bound workspace — clear the up-front skeleton so it
+        // doesn't strand (#4662 Opus gate).
+        clearWorkspaceTreeSkeleton();
       }
       showToast(t('profile_switched', name));
     }
@@ -5988,10 +6188,39 @@ async function switchToProfile(name) {
   } catch (e) {
     // Revert the optimistic name update on error
     if (_switchGen === _profileSwitchGeneration && _chipLabel) _chipLabel.textContent = _prevProfileName;
+    if (_switchGen === _profileSwitchGeneration && _titlebarLabel) _titlebarLabel.textContent = _prevProfileName;
     if (_switchGen === _profileSwitchGeneration) showToast(t('switch_failed') + e.message);
+    // The switch failed, so we're still on the previous profile and its caches
+    // are intact — restore the real list/tree so the loading skeletons we showed
+    // up front don't strand. (#4662)
+    if (_switchGen === _profileSwitchGeneration) {
+      // The switch failed; _allSessions still holds the (still-current) previous
+      // profile, so clear the skeleton flag and re-render to restore the real list
+      // rather than strand the up-front skeleton (#4671). Lift the embargo too so the
+      // restore render (and subsequent normal renders) can paint.
+      if (typeof _setProfileSwitchListEmbargo === 'function') _setProfileSwitchListEmbargo(false);
+      _sessionListSkeletonActive = false;
+      if (typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
+      if (_workspaceVisibleAtStart && S.session && S.session.workspace && typeof loadDir === 'function') {
+        loadDir('.');
+      } else if (_workspaceVisibleAtStart && typeof clearWorkspaceTreeSkeleton === 'function') {
+        // No workspace to restore on the (still-current) previous profile —
+        // clear the up-front workspace skeleton so it doesn't strand on a switch
+        // failure, mirroring the success-path no-workspace handling (#4662).
+        clearWorkspaceTreeSkeleton();
+      }
+    }
   } finally {
     // Always remove loading indicator regardless of success or failure
     if (_switchGen === _profileSwitchGeneration && _chip) { _chip.classList.remove('switching'); _chip.disabled = false; }
+    if (_switchGen === _profileSwitchGeneration && _titlebarBtn) { _titlebarBtn.classList.remove('switching'); _titlebarBtn.disabled = false; }
+    // #4671 safety net: guarantee the session-list embargo is lifted on EVERY exit of the
+    // current switch (success paths clear it before their authoritative render; this covers
+    // early-returns/throws between skeleton-show and those clears so it can't freeze the
+    // sidebar). Guarded by _switchGen so a superseded switch can't lift a newer switch's embargo.
+    if (_switchGen === _profileSwitchGeneration && typeof _setProfileSwitchListEmbargo === 'function') {
+      _setProfileSwitchListEmbargo(false);
+    }
   }
 }
 
@@ -6535,6 +6764,7 @@ function switchSettingsSection(name,opts){
     if(section==='plugins') loadPluginsPanel();
     if(section==='extensions') loadExtensionsPanel();
   }
+  if(opts&&opts.fromSidebarItem)_closeMobileSidebarAfterPanelSelection();
 }
 
 async function _buildSettingsIndex() {
@@ -6805,6 +7035,44 @@ function _applyTtsEnabled(enabled){
   document.body.classList.toggle('tts-enabled', !!enabled);
 }
 
+// Read + sanitize the JSON/YAML structured code-block default-view controls
+// (#484). mode is one of auto|on|off; lines is clamped to an int 1..1000 with a
+// fallback of 10 (the original hardcoded threshold).
+function _structuredCodeViewFromUi(){
+  const modeSel=$('settingsStructuredCodeMode');
+  const mode=modeSel&&['auto','on','off'].includes(modeSel.value)?modeSel.value:'auto';
+  const linesField=$('settingsStructuredCodeAutoLines');
+  const n=parseInt((linesField||{}).value,10);
+  const lines=(Number.isFinite(n)&&n>=1&&n<=1000)?n:10;
+  return {structured_code_default_view:mode,structured_code_auto_tree_lines:lines};
+}
+
+// Apply the structured code-block settings to runtime globals and re-render the
+// transcript so already-rendered JSON/YAML blocks pick up the new default. The
+// per-block Raw/Tree toggle is unaffected.
+function _applyStructuredCodeViewSettings(mode,lines,rerender){
+  window._structuredCodeDefaultView=['auto','on','off'].includes(mode)?mode:'auto';
+  const n=parseInt(lines,10);
+  window._structuredCodeAutoTreeLines=(Number.isFinite(n)&&n>=1&&n<=1000)?n:10;
+  if(rerender){
+    if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
+    if(typeof renderMessages==='function') renderMessages({preserveScroll:true});
+  }
+}
+
+// The Auto-threshold input is only meaningful in 'auto' mode; disable it
+// otherwise so the control reads as inactive without hiding it.
+function _syncStructuredCodeLinesEnabled(){
+  const modeSel=$('settingsStructuredCodeMode');
+  const linesField=$('settingsStructuredCodeAutoLines');
+  // Both controls live in the same settings-field and are present together;
+  // if either is missing there's nothing to sync.
+  if(!modeSel||!linesField) return;
+  const isAuto=modeSel.value==='auto';
+  linesField.disabled=!isAuto;
+  linesField.style.opacity=isAuto?'':'0.5';
+}
+
 function _appearancePayloadFromUi(){
   const worklogDetailsExpanded=!!($('settingsWorklogDetailsExpandedDefault')||{}).checked;
   const chatActivityModeSel=$('settingsChatActivityDisplayMode');
@@ -6817,6 +7085,8 @@ function _appearancePayloadFromUi(){
     session_endless_scroll: !!($('settingsSessionEndlessScroll')||{}).checked,
     auto_scroll_follow: !!($('settingsAutoScrollFollow')||{}).checked,
     render_user_markdown: !!($('settingsRenderUserMarkdown')||{}).checked,
+    ..._structuredCodeViewFromUi(),
+    show_titlebar_profile: !!($('settingsShowTitlebarProfile')||{}).checked,
     worklog_details_expanded_default: worklogDetailsExpanded,
     activity_feed_expanded_default: worklogDetailsExpanded,
     ..._composerControlVisibilityPayload(),
@@ -6904,6 +7174,16 @@ async function _autosaveAppearanceSettings(payload){
     }
     window._sessionEndlessScrollEnabled=!!(saved&&saved.session_endless_scroll);
     window._autoScrollFollow=!saved||saved.auto_scroll_follow!==false;
+    if(saved&&Object.prototype.hasOwnProperty.call(saved,'structured_code_default_view')){
+      // Re-sync from the server-validated/clamped values so the UI and runtime
+      // globals match exactly what was persisted.
+      _applyStructuredCodeViewSettings(saved.structured_code_default_view,saved.structured_code_auto_tree_lines,false);
+      const modeSel=$('settingsStructuredCodeMode');
+      if(modeSel) modeSel.value=window._structuredCodeDefaultView;
+      const linesField=$('settingsStructuredCodeAutoLines');
+      if(linesField) linesField.value=window._structuredCodeAutoTreeLines;
+      _syncStructuredCodeLinesEnabled();
+    }
     if(saved&&payload&&Object.prototype.hasOwnProperty.call(payload,'worklog_details_expanded_default')&&(
       Object.prototype.hasOwnProperty.call(saved,'worklog_details_expanded_default') ||
       Object.prototype.hasOwnProperty.call(saved,'activity_feed_expanded_default')
@@ -7205,6 +7485,43 @@ async function loadSettingsPanel(){
         window._renderUserMarkdown=this.checked;
         if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
         if(typeof renderMessages==='function') renderMessages();
+        _scheduleAppearanceAutosave();
+      };
+    }
+    const structuredCodeModeSel=$('settingsStructuredCodeMode');
+    const structuredCodeLinesField=$('settingsStructuredCodeAutoLines');
+    if(structuredCodeModeSel){
+      const mode=['auto','on','off'].includes(settings.structured_code_default_view)?settings.structured_code_default_view:'auto';
+      structuredCodeModeSel.value=mode;
+      const lines=parseInt(settings.structured_code_auto_tree_lines,10);
+      const safeLines=(Number.isFinite(lines)&&lines>=1&&lines<=1000)?lines:10;
+      if(structuredCodeLinesField) structuredCodeLinesField.value=safeLines;
+      _applyStructuredCodeViewSettings(mode,safeLines,false);
+      _syncStructuredCodeLinesEnabled();
+      structuredCodeModeSel.onchange=function(){
+        const cfg=_structuredCodeViewFromUi();
+        _applyStructuredCodeViewSettings(cfg.structured_code_default_view,cfg.structured_code_auto_tree_lines,true);
+        _syncStructuredCodeLinesEnabled();
+        _scheduleAppearanceAutosave();
+      };
+      if(structuredCodeLinesField){
+        // Commit on change (blur / Enter / spinner) rather than every keystroke,
+        // so a long transcript is not rebuilt per digit typed. Only re-render in
+        // auto mode, where the threshold actually affects the default view.
+        structuredCodeLinesField.addEventListener('change',function(){
+          const cfg=_structuredCodeViewFromUi();
+          structuredCodeLinesField.value=cfg.structured_code_auto_tree_lines;
+          _applyStructuredCodeViewSettings(cfg.structured_code_default_view,cfg.structured_code_auto_tree_lines,cfg.structured_code_default_view==='auto');
+          _scheduleAppearanceAutosave();
+        },{once:false});
+      }
+    }
+    const showTitlebarProfileCb=$('settingsShowTitlebarProfile');
+    if(showTitlebarProfileCb){
+      showTitlebarProfileCb.checked=!!settings.show_titlebar_profile;
+      showTitlebarProfileCb.onchange=function(){
+        window._showTitlebarProfile=this.checked;
+        if(typeof _applyTitlebarProfileVisibility==='function') _applyTitlebarProfileVisibility();
         _scheduleAppearanceAutosave();
       };
     }
@@ -7594,7 +7911,7 @@ async function loadSettingsPanel(){
 }
 
 
-// ── Extensions panel (read-only browser-origin diagnostics) ────────────────
+// ── Extensions panel (browser-origin diagnostics + local enable controls) ──
 
 function _extensionStatusLabel(value){
   return value ? 'Enabled' : 'Disabled';
@@ -7617,15 +7934,63 @@ function _extensionWarningList(warnings){
     return '<div class="extension-url-empty">No warnings.</div>';
   }
   return '<ul class="extension-warning-list">'+warnings.map(item=>{
-    const code=esc((item&&item.code)||'unknown_warning');
+    const rawCode=(item&&item.code)||'unknown_warning';
+    const code=esc(rawCode);
     const source=esc((item&&item.source)||'unknown');
-    return `<li><code>${code}</code><span>${source}</span></li>`;
+    const hint=rawCode==='extension_state_unknown_ids'
+      ? '<span>Some saved disabled-extension overrides no longer match the current manifest; re-added extensions with the same id may stay disabled.</span>'
+      : '';
+    return `<li><code>${code}</code><span>${source}</span>${hint}</li>`;
   }).join('')+'</ul>';
 }
 
 function _extensionCountValue(counts,key,urls){
   if(counts&&Number.isFinite(Number(counts[key]))) return Number(counts[key]);
   return Array.isArray(urls)?urls.length:0;
+}
+
+function _extensionEntryStatusLabel(entry){
+  const status=(entry&&entry.status)||'';
+  if(status==='manifest_disabled') return 'Disabled in manifest';
+  if(status==='user_disabled') return 'Disabled';
+  if(status==='enabled') return 'Enabled';
+  return 'Unknown';
+}
+
+function _extensionEntryBadge(entry){
+  const enabled=!!(entry&&entry.effective_enabled);
+  const cls=enabled?'extension-status-badge-on':'extension-status-badge-off';
+  return `<span class="extension-status-badge ${cls}">${esc(_extensionEntryStatusLabel(entry))}</span>`;
+}
+
+function _extensionInstalledList(extensions,extensionDirConfigured){
+  const list=Array.isArray(extensions)?extensions:[];
+  if(!list.length){
+    if(!extensionDirConfigured) return '<div class="extension-url-empty">No extension directory is configured.</div>';
+    return '<div class="extension-url-empty">No manifest extensions are installed in the configured bundle.</div>';
+  }
+  return `<div class="extension-installed-list">${list.map(entry=>{
+    const id=(entry&&entry.id)||'';
+    const name=(entry&&entry.name)||id||'Unnamed extension';
+    const canToggle=!!(entry&&entry.can_toggle);
+    const userEnabled=!!(entry&&entry.user_enabled);
+    const disabledAttr=canToggle?'':' disabled aria-disabled="true"';
+    const buttonText=userEnabled?'Disable':'Enable';
+    const nextEnabled=userEnabled?'false':'true';
+    const note=canToggle
+      ? 'Toggles the WebUI-managed override for the next app load.'
+      : 'Manifest-disabled entries cannot be enabled from WebUI.';
+    return `<div class="extension-installed-row" data-extension-id="${esc(id)}">
+      <div class="extension-installed-main">
+        <div class="extension-installed-title-row">
+          <div class="extension-installed-title">${esc(name)}</div>
+          ${_extensionEntryBadge(entry)}
+        </div>
+        <div class="extension-installed-meta"><code>${esc(id)}</code><span>${esc(note)}</span></div>
+      </div>
+      <button class="sm-btn extension-toggle-btn" type="button" data-extension-toggle-id="${esc(id)}" data-extension-next-enabled="${nextEnabled}"${disabledAttr}>${esc(buttonText)}</button>
+    </div>`;
+  }).join('')}</div>`;
 }
 
 function _extensionSidecarHealthBadge(status,label){
@@ -7716,16 +8081,19 @@ function _renderExtensionsPanel(data,seq){
   const scripts=Array.isArray(data&&data.script_urls)?data.script_urls:[];
   const styles=Array.isArray(data&&data.stylesheet_urls)?data.stylesheet_urls:[];
   const sidecars=Array.isArray(data&&data.sidecars)?data.sidecars:[];
+  const extensions=Array.isArray(data&&data.extensions)?data.extensions:[];
   const statusClass=(data&&data.enabled)?'extension-card-enabled':'extension-card-disabled';
   const scriptCount=_extensionCountValue(counts,'script_urls',scripts);
   const styleCount=_extensionCountValue(counts,'stylesheet_urls',styles);
   const sidecarCount=_extensionCountValue(counts,'sidecars',sidecars);
+  const manifestExtensionCount=_extensionCountValue(counts,'manifest_extensions',extensions);
+  const userDisabledCount=_extensionCountValue(counts,'user_disabled',[]);
   target.innerHTML=`
     <div class="provider-card extension-status-card ${statusClass}">
       <div class="provider-card-header plugin-card-header">
         <div class="provider-card-info">
           <div class="provider-card-name">Extension runtime</div>
-          <div class="provider-card-meta">Read-only status from /api/extensions/status</div>
+          <div class="provider-card-meta">Status from /api/extensions/status; toggles persist a local override for installed manifest entries.</div>
         </div>
         <span class="provider-card-badge ${data&&data.enabled?'':'plugin-card-badge-disabled'}">${_extensionStatusLabel(!!(data&&data.enabled))}</span>
       </div>
@@ -7743,7 +8111,20 @@ function _renderExtensionsPanel(data,seq){
           <div><span>Final script count</span><code>${scriptCount}</code></div>
           <div><span>Final stylesheet count</span><code>${styleCount}</code></div>
           <div><span>Loopback sidecar count</span><code>${sidecarCount}</code></div>
+          <div><span>Installed manifest extensions</span><code>${manifestExtensionCount}</code></div>
+          <div><span>User-disabled extensions</span><code>${userDisabledCount}</code></div>
         </div>
+      </div>
+    </div>
+    <div class="provider-card extension-installed-card">
+      <div class="provider-card-header plugin-card-header">
+        <div class="provider-card-info">
+          <div class="provider-card-name">Installed manifest extensions</div>
+          <div class="provider-card-meta">Enable or disable already-present local extensions. Reload WebUI to apply injected asset changes to this browser tab.</div>
+        </div>
+      </div>
+      <div class="provider-card-body extension-card-body">
+        ${_extensionInstalledList(extensions,!!(data&&data.extension_dir_configured))}
       </div>
     </div>
     <div class="provider-card extension-assets-card">
@@ -7773,7 +8154,34 @@ function _renderExtensionsPanel(data,seq){
       </div>
     </div>
   `;
+  _bindExtensionToggleButtons(target);
   _monitorExtensionSidecars(sidecars,seq);
+}
+
+function _bindExtensionToggleButtons(root){
+  if(!root) return;
+  root.querySelectorAll('[data-extension-toggle-id]').forEach(btn=>{
+    btn.addEventListener('click',()=>handleExtensionToggle(btn));
+  });
+}
+
+async function handleExtensionToggle(btn){
+  if(!btn||btn.disabled) return;
+  const id=btn.dataset.extensionToggleId||'';
+  const enabled=btn.dataset.extensionNextEnabled==='true';
+  if(!id) return;
+  const previousText=btn.textContent;
+  btn.disabled=true;
+  btn.textContent=enabled?'Enabling…':'Disabling…';
+  try{
+    const data=await api('/api/extensions/toggle',{method:'POST',body:JSON.stringify({id,enabled})});
+    showToast(enabled?'Extension enabled. Reload WebUI to apply changes.':'Extension disabled. Reload WebUI to apply changes.');
+    _renderExtensionsPanel(data,++_extensionsSidecarMonitorSeq);
+  }catch(e){
+    btn.disabled=false;
+    btn.textContent=previousText;
+    showToast('Failed to update extension: '+(e&&e.message?e.message:String(e)));
+  }
 }
 
 async function loadExtensionsPanel(){
@@ -7965,7 +8373,7 @@ async function switchPluginPage(event, path, label) {
   _currentPanel = 'plugin';
   const mainEl = document.querySelector('main.main');
   if (mainEl) {
-    ['settings','skills','memory','tasks','kanban','workspaces','profiles','insights','logs','plugin'].forEach(p => {
+    MAIN_VIEW_PANELS.forEach(p => {
       mainEl.classList.toggle('showing-' + p, p === 'plugin');
     });
   }
@@ -8793,6 +9201,9 @@ function _applySavedSettingsUi(saved, body, opts){
   window._busyInputMode=body.busy_input_mode||'queue';
   window._sessionEndlessScrollEnabled=!!body.session_endless_scroll;
   window._autoScrollFollow=body.auto_scroll_follow!==false;
+  if(Object.prototype.hasOwnProperty.call(body,'structured_code_default_view')){
+    _applyStructuredCodeViewSettings(body.structured_code_default_view,body.structured_code_auto_tree_lines,false);
+  }
   window._botName=body.bot_name||'Hermes';
   if(typeof applyBotName==='function') applyBotName();
   if(typeof setLocale==='function') setLocale(language);
@@ -9089,6 +9500,14 @@ function _openAuxAdvancedOptions(taskKey,cfg){
     if(typeof showToast==='function') showToast(isMain?(t('settings_main_advanced_saved')||'Main model options saved'):(t('settings_aux_advanced_saved')||'Auxiliary options saved'));
     overlay.style.display='none';
     _loadAuxiliaryModels();
+    // #4650 review: a main-model advanced save can change base_url, which
+    // /api/reasoning's answer depends on for some providers (e.g. LM Studio),
+    // WITHOUT changing the model/provider cache key. Invalidate the reasoning
+    // cache and refresh so the chip reflects the new config (one refetch).
+    if(isMain){
+      if(typeof _lastReasoningFetchKey!=='undefined') _lastReasoningFetchKey=null;
+      if(typeof fetchReasoningChip==='function') fetchReasoningChip();
+    }
    }catch(e){
     if(typeof showToast==='function') showToast(isMain?(t('settings_main_advanced_save_failed')||'Failed to save main model options'):(t('settings_aux_advanced_save_failed')||'Failed to save auxiliary options'));
    }
@@ -9306,6 +9725,7 @@ async function saveSettings(andClose){
   body.chat_activity_display_mode=(($('settingsChatActivityDisplayMode')||{}).value==='transparent_stream')?'transparent_stream':'compact_worklog';
   body.auto_scroll_follow=!!($('settingsAutoScrollFollow')||{}).checked;
   body.render_user_markdown=!!($('settingsRenderUserMarkdown')||{}).checked;
+  Object.assign(body,_structuredCodeViewFromUi());
   body.language=language;
   body.show_token_usage=showTokenUsage;
   body.show_quota_chip=showQuotaChip===true;

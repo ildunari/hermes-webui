@@ -349,6 +349,7 @@ function _renderUserFencedBlocks(text){
     if(code.endsWith('\n')) code=code.slice(0,-1);
     const h=lang?`<div class="pre-header">${esc(lang)}</div>`:'';
     const langAttr=lang?` class="language-${esc(lang)}"`:'';
+    const preClass=/^(md|markdown|mdx)$/.test(lang)?' class="md-source-block"':'';
     if(lang==='diff'||lang==='patch'){
       const colored=esc(code).split('\n').map(line=>{
         if(line.startsWith('@@')) return `<span class="diff-line diff-hunk">${line}</span>`;
@@ -358,7 +359,7 @@ function _renderUserFencedBlocks(text){
       }).join('\n');
       stash.push(`${h}<pre class="diff-block"><code${langAttr}>${colored}</code></pre>`);
     } else {
-      stash.push(`${h}<pre><code${langAttr}>${esc(code)}</code></pre>`);
+      stash.push(`${h}<pre${preClass}><code${langAttr}>${esc(code)}</code></pre>`);
     }
     return lead+'\x00UF'+(stash.length-1)+'\x00';
   });
@@ -435,6 +436,9 @@ let _messageVirtualMeasurementRetryCount=0;
 let _messageVirtualScrollActive=false;
 let _messageVirtualScrollSettleTimer=0;
 let _messageVirtualDeferredMeasurement=null;
+let _msgNodeRecycleEnabled=false;
+const _recycleStash=new Map();
+let _scrollbarDragActive=false;
 function _markMessageVirtualScrollActive(){
   _messageVirtualScrollActive=true;
   clearTimeout(_messageVirtualScrollSettleTimer);
@@ -734,6 +738,35 @@ function _messageVisibleIndexForRawIdx(rawIdx, visWithIdx){
   }
   return -1;
 }
+function _messageViewportAnchorKeyForMessage(m){
+  if(typeof _compressionMessageAnchorKey!=='function') return '';
+  const key=_compressionMessageAnchorKey(m);
+  if(!key) return '';
+  return [key.role||'',key.ts??'',key.attachments??0,key.text||''].map(v=>encodeURIComponent(String(v))).join('|');
+}
+function _messageVisibleIndexForAnchorKey(anchorKey, visWithIdx){
+  const key=String(anchorKey||'');
+  if(!key) return -1;
+  const list=Array.isArray(visWithIdx)?visWithIdx:_getVisibleMessagesWithIdx();
+  for(let i=0;i<list.length;i++){
+    if(list[i]&&_messageViewportAnchorKeyForMessage(list[i].m)===key) return i;
+  }
+  return -1;
+}
+function _messageSessionIndexBase(){
+  const n=Number(typeof _oldestIdx!=='undefined'?_oldestIdx:0);
+  return Number.isFinite(n)?Math.max(0,n):0;
+}
+function _messageSessionIndexForRawIdx(rawIdx){
+  const n=Number(rawIdx);
+  if(!Number.isFinite(n)) return null;
+  return _messageSessionIndexBase()+n;
+}
+function _messageRawIdxForSessionIndex(sessionIdx){
+  const n=Number(sessionIdx);
+  if(!Number.isFinite(n)) return null;
+  return n-_messageSessionIndexBase();
+}
 function _messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container){
   const idx=Math.max(0,Number(visibleIdx)||0);
   _syncMessageVirtualHeightCache(visWithIdx);
@@ -759,7 +792,13 @@ function _captureMessageViewportAnchor(){
     if(!Number.isFinite(rawIdx)) continue;
     const rect=row.getBoundingClientRect();
     if(rect.bottom>containerRect.top+1){
-      return {rawIdx, topOffset:rect.top-containerRect.top};
+      const sessionIdx=Number(row&&row.dataset&&row.dataset.sessionMsgIdx);
+      return {
+        rawIdx,
+        sessionIdx:Number.isFinite(sessionIdx)?sessionIdx:_messageSessionIndexForRawIdx(rawIdx),
+        key:row&&row.dataset?String(row.dataset.messageAnchorKey||''):'',
+        topOffset:rect.top-containerRect.top,
+      };
     }
   }
   return null;
@@ -767,31 +806,51 @@ function _captureMessageViewportAnchor(){
 function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
   const container=$('messages');
   if(!container||!anchor) return false;
+  const anchorKey=String(anchor.key||'');
+  let row=anchorKey?Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el&&el.dataset&&el.dataset.messageAnchorKey===anchorKey):null;
+  if(row&&row.getClientRects&&row.getClientRects().length===0) row=null;
+  if(!row&&anchorKey) return false;
+  const sessionIdx=Number(anchor.sessionIdx);
+  const hasSessionIdx=Number.isFinite(sessionIdx);
+  if(!row&&hasSessionIdx) row=container.querySelector(`[data-session-msg-idx="${sessionIdx}"]`);
+  if(!row&&hasSessionIdx) return false;
   const targetIdx=Number(anchor.rawIdx)+Number(rawIdxDelta||0);
-  if(!Number.isFinite(targetIdx)) return false;
-  const row=container.querySelector(`[data-msg-idx="${targetIdx}"]`);
+  if(!row&&Number.isFinite(targetIdx)) row=container.querySelector(`[data-msg-idx="${targetIdx}"]`);
   if(!row) return false;
   const containerRect=container.getBoundingClientRect();
   const rect=row.getBoundingClientRect();
   const targetTop=Number(anchor.topOffset)||0;
-  _programmaticScroll=true;
+  _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
   container.scrollTop+=(rect.top-containerRect.top)-targetTop;
-  requestAnimationFrame(()=>{ _programmaticScroll=false; });
+  if(typeof _deferClearProgrammaticScroll==='function') _deferClearProgrammaticScroll();
+  else requestAnimationFrame(()=>{ setTimeout(()=>{ _programmaticScroll=false; },0); });
   return true;
 }
 let _messageViewportAnchorRemounting=false;
 function _remountMessageViewportAnchor(anchor){
   const container=$('messages');
   if(!container||!anchor||_messageViewportAnchorRemounting) return false;
+  const anchorKey=String(anchor.key||'');
+  const visibleKeyNode=anchorKey
+    ? Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(node=>node&&node.dataset&&node.dataset.messageAnchorKey===anchorKey&&(!node.getClientRects||node.getClientRects().length>0))
+    : null;
+  if(visibleKeyNode) return true;
+  const sessionIdx=Number(anchor.sessionIdx);
+  const hasSessionIdx=Number.isFinite(sessionIdx);
+  if(!anchorKey&&hasSessionIdx&&container.querySelector(`[data-session-msg-idx="${sessionIdx}"]`)) return true;
   const targetIdx=Number(anchor.rawIdx);
-  if(!Number.isFinite(targetIdx)) return false;
-  if(container.querySelector(`[data-msg-idx="${targetIdx}"]`)) return true;
+  if(!anchorKey&&!hasSessionIdx&&Number.isFinite(targetIdx)&&container.querySelector(`[data-msg-idx="${targetIdx}"]`)) return true;
   if(typeof _getVisibleMessagesWithIdx!=='function'||
      typeof _messageVisibleIndexForRawIdx!=='function'||
      typeof _messageVirtualScrollTopForVisibleIdx!=='function'||
      typeof renderMessages!=='function') return false;
   const visWithIdx=_getVisibleMessagesWithIdx();
-  const visIdx=_messageVisibleIndexForRawIdx(targetIdx,visWithIdx);
+  let visIdx=anchorKey?_messageVisibleIndexForAnchorKey(anchorKey,visWithIdx):-1;
+  if(visIdx<0&&hasSessionIdx){
+    const rawFromSession=_messageRawIdxForSessionIndex(sessionIdx);
+    if(Number.isFinite(rawFromSession)) visIdx=_messageVisibleIndexForRawIdx(rawFromSession,visWithIdx);
+  }
+  if(visIdx<0&&Number.isFinite(targetIdx)) visIdx=_messageVisibleIndexForRawIdx(targetIdx,visWithIdx);
   if(visIdx<0) return false;
   // A virtualized anchor may be outside the current DOM. Scroll to its virtual
   // row and render once so the semantic restore below has a real target.
@@ -805,14 +864,19 @@ function _remountMessageViewportAnchor(anchor){
     _messageViewportAnchorRemounting=false;
     requestAnimationFrame(()=>{ setTimeout(()=>{ _programmaticScroll=false; },0); });
   }
-  return !!container.querySelector(`[data-msg-idx="${targetIdx}"]`);
+  if(anchorKey){
+    return !!Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(node=>node&&node.dataset&&node.dataset.messageAnchorKey===anchorKey&&(!node.getClientRects||node.getClientRects().length>0));
+  }
+  if(hasSessionIdx) return !!container.querySelector(`[data-session-msg-idx="${sessionIdx}"]`);
+  return Number.isFinite(targetIdx)&&!!container.querySelector(`[data-msg-idx="${targetIdx}"]`);
 }
 function _compensateScrollForMeasurementDelta(renderFn){
   const container=$('messages');
   if(!container) return renderFn();
   const anchorBefore=_captureMessageViewportAnchor();
   const scrollTopBefore=container.scrollTop;
-  renderFn();
+  container.classList.add('vscroll-measuring');
+  try{ renderFn(); }finally{ container.classList.remove('vscroll-measuring'); }
   if(!anchorBefore) return;
   if(scrollTopBefore<1){
     const spacer=container.querySelector('[data-virtual-spacer="before"]');
@@ -825,10 +889,10 @@ function _compensateScrollForMeasurementDelta(renderFn){
   const actualOffset=rowRect.top-containerRect.top;
   const delta=actualOffset-anchorBefore.topOffset;
   if(Math.abs(delta)<2) return;
-  _programmaticScroll=true;
+  _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
   container.scrollTop=scrollTopBefore+delta;
   _lastScrollTop=container.scrollTop;
-  requestAnimationFrame(()=>{ setTimeout(()=>{ _programmaticScroll=false; },0); });
+  _deferClearProgrammaticScroll();
 }
 function _messageViewportIntersectsRenderedRow(){
   const container=$('messages');
@@ -905,7 +969,19 @@ function _scheduleMessageVirtualizedRender(force){
     const liveWindow=_currentMessageVirtualWindow(liveVisWithIdx,_messageVirtualKeepTailCount());
     const liveKey=_messageVirtualWindowKeyFor(liveWindow);
     if(!force&&liveKey===_messageVirtualWindowKey) return;
-    _compensateScrollForMeasurementDelta(()=>{ renderMessages({ preserveScroll:true }); });
+    if(_scrollbarDragActive){
+      _programmaticScroll=true;
+      _programmaticScrollSetAt=performance.now();
+      _compensateScrollForMeasurementDelta(()=>{ renderMessages({ preserveScroll:true }); });
+      _deferClearProgrammaticScroll();
+      _messageVirtualWindowKey=liveKey;
+      return;
+    }
+    _msgNodeRecycleEnabled=true;
+    try{
+      _compensateScrollForMeasurementDelta(()=>{ renderMessages({ preserveScroll:true }); });
+    }
+    finally{ _msgNodeRecycleEnabled=false; }
   });
 }
 
@@ -986,7 +1062,7 @@ async function jumpToSessionStart(){
   if(!container||!S.session) return;
   _scrollPinned=false;
   _messageUserUnpinned=true;
-  _programmaticScroll=true;
+  _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
   try{
     // During active streaming, skip full message load — API response won't
     // include live messages from the current turn, and replacing S.messages
@@ -1005,7 +1081,7 @@ async function jumpToSessionStart(){
     requestAnimationFrame(()=>{
       container.scrollTop=0;
       _updateSessionStartJumpButton();
-      requestAnimationFrame(()=>{ _programmaticScroll=false; });
+      _deferClearProgrammaticScroll();
     });
   }catch(e){
     console.warn('jumpToSessionStart failed:',e);
@@ -1064,7 +1140,7 @@ async function jumpToTurnQuestion(questionRawIdx, assistantRawIdx){
   if(visibleIdx>=0){
     _scrollPinned=false;
     _messageUserUnpinned=true;
-    _programmaticScroll=true;
+    _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
     container.scrollTop=_messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container);
     _messageVirtualWindowKey='';
     renderMessages({ preserveScroll:true });
@@ -1075,7 +1151,7 @@ async function jumpToTurnQuestion(questionRawIdx, assistantRawIdx){
         renderMessages({ preserveScroll:true });
         requestAnimationFrame(scrollToTarget);
       }
-      requestAnimationFrame(()=>{ _programmaticScroll=false; });
+      _deferClearProgrammaticScroll();
     });
     return;
   }
@@ -3069,13 +3145,61 @@ function _applyReasoningChip(eff){
   _highlightReasoningOption(effort);
 }
 
+// Tracks the model/provider identity of the last reasoning fetch so routine
+// topbar syncs can serve the cached chip state instead of re-hitting the
+// network. null = never fetched.
+let _lastReasoningFetchKey=null;
+// Monotonic dispatch counter. Each fetchReasoningChip() increments it and the
+// async handlers capture their own value; a response (success OR failure) only
+// applies if it is still the most recent dispatch. This defeats out-of-order
+// resolution even when two fetches share the same model/provider key (e.g. a
+// profile switch that resets the cache and refetches the same default model but
+// a different agent.reasoning_effort) — #4650 review.
+let _reasoningFetchSeq=0;
+
 function fetchReasoningChip(){
-  api('/api/reasoning'+_reasoningEffortQuery()).then(function(st){
+  // Set the cache key OPTIMISTICALLY before the request so rapid routine syncs
+  // while this GET is in flight short-circuit instead of re-dispatching (that
+  // in-flight window is exactly where the #4650 storm lived).
+  const key=_reasoningEffortQuery();
+  const seq=++_reasoningFetchSeq;
+  _lastReasoningFetchKey=key;
+  api('/api/reasoning'+key).then(function(st){
+    // Ignore a stale/superseded response: only the most recent dispatch may
+    // apply, so an older in-flight GET can't poison the current chip (#4650).
+    if(seq!==_reasoningFetchSeq) return;
     _applyReasoningChip((st&&st.reasoning_effort)||'', st||{});
-  }).catch(function(){_applyReasoningChip('', {supported_efforts:[]});});
+  }).catch(function(){
+    // Same staleness guard on failure: a stale error must neither hide the chip
+    // nor clear a newer fetch's key. Only the latest dispatch clears the key so
+    // routine syncs retry after a genuine transient failure.
+    if(seq!==_reasoningFetchSeq) return;
+    _lastReasoningFetchKey=null;
+    _applyReasoningChip('', {supported_efforts:[]});
+  });
 }
 
 function syncReasoningChip(){
+  // #4650: syncTopbar() calls this on every routine UI refresh, and during
+  // streaming those fire at high frequency. Before a9ce2889 this served the
+  // cached _currentReasoningEffort after the first load; that commit made it
+  // refetch unconditionally to refresh supported-efforts after a model switch,
+  // which turned ordinary syncs into a GET /api/reasoning storm (one per token).
+  // Restore the cache short-circuit but keep a9ce2889's intent: only hit the
+  // network when nothing is cached yet OR the model/provider identity changed
+  // since the last fetch (the only inputs that change /api/reasoning's answer).
+  // The user-pick and model-switch paths still update the cache directly.
+  const key=_reasoningEffortQuery();
+  // Short-circuit on the KEY alone: if a fetch for this exact model/provider has
+  // already been dispatched (in-flight) or completed, do not dispatch another —
+  // this is what stops the #4650 storm, including the COLD-cache window where
+  // _currentReasoningEffort is still null between the first dispatch and its
+  // response (10 syncs before the first GET resolves must produce ONE request,
+  // not ten). Apply the cached chip only once we actually have an effort value.
+  if(_lastReasoningFetchKey===key){
+    if(_currentReasoningEffort!==null) _applyReasoningChip(_currentReasoningEffort);
+    return;
+  }
   fetchReasoningChip();
 }
 
@@ -3559,6 +3683,9 @@ window.addEventListener('resize',function(){
 // Programmatic scrolls are ignored via _programmaticScroll. Fixes #1469 / #1360 / #1731.
 let _scrollPinned=true;
 let _programmaticScroll=false;
+let _programmaticScrollSetAt=0;
+let _programmaticScrollResetTimer=0;
+function _deferClearProgrammaticScroll(ms){clearTimeout(_programmaticScrollResetTimer);_programmaticScrollResetTimer=setTimeout(()=>{_programmaticScroll=false;},ms||80);}
 let _nearBottomCount=0;
 let _lastScrollTop=null;
 // Sticky-unpin model (#3343 supersedes #3330's proximity re-pin): once the user
@@ -3577,16 +3704,48 @@ let _settleTimer=0;
 let _settleFinalTimer=0;
 const NON_MESSAGE_SCROLL_INTENT_SUPPRESS_MS=350;
 let _touchStartY=null;
+let _messageTouchScrollActive=false;
+let _lastMessageTouchScrollIntentMs=-Infinity;
+let _deferredOlderMessagesTimer=0;
+const MESSAGE_TOUCH_SCROLL_SUPPRESS_MS=1200;
 let _newMessageCueVisible=false;
 function _cancelBottomSettle(){ _bottomSettleToken++; if(_settleRO){ _settleRO.disconnect(); _settleRO=null; } clearTimeout(_settleTimer); clearTimeout(_settleFinalTimer); cancelAnimationFrame(_settleRAF); }
+function _markMessageTouchScrollIntent(active=true){
+  _messageTouchScrollActive=!!active;
+  _lastMessageTouchScrollIntentMs=performance.now();
+}
+function _recentMessageTouchScrollIntent(){
+  return _messageTouchScrollActive || performance.now()-_lastMessageTouchScrollIntentMs<MESSAGE_TOUCH_SCROLL_SUPPRESS_MS;
+}
+function _isMessageReaderUnpinned(){
+  return !!_messageUserUnpinned;
+}
+function _olderMessagesPrefetchReady(){
+  const el=document.getElementById('messages');
+  if(!el) return false;
+  const olderPrefetchPx=Math.max(600,el.clientHeight*1.5);
+  return _isSessionEndlessScrollEnabled()&&el.scrollTop<olderPrefetchPx && typeof _messagesTruncated!=='undefined' && _messagesTruncated && typeof _loadOlderMessages==='function';
+}
+function _scheduleDeferredOlderMessagesLoad(){
+  clearTimeout(_deferredOlderMessagesTimer);
+  _deferredOlderMessagesTimer=setTimeout(()=>{
+    _deferredOlderMessagesTimer=0;
+    if(_recentMessageTouchScrollIntent()){
+      _scheduleDeferredOlderMessagesLoad();
+      return;
+    }
+    if(_olderMessagesPrefetchReady()) _loadOlderMessages();
+  },MESSAGE_TOUCH_SCROLL_SUPPRESS_MS+50);
+}
 function _recordNonMessageScrollIntent(e){
   const el=document.getElementById('messages');
   const target=e&&e.target;
   if(!el||!target) return;
   if(!el.contains(target)) _lastNonMessageScrollIntentMs=performance.now();
-  else if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY<0)){
+  else if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)){
     _cancelBottomSettle();
-    if(typeof e.deltaY==='number'&&e.deltaY<0){
+    if(e.type==='touchmove') _markMessageTouchScrollIntent(true);
+    if(typeof e.deltaY==='number'&&e.deltaY< -30){
       _messageUserUnpinned=true;
       _nearBottomCount=0;
       _scrollPinned=false;
@@ -3652,10 +3811,12 @@ if(typeof document!=='undefined'){
   document.addEventListener('wheel',_recordNonMessageScrollIntent,{capture:true,passive:true});
   document.addEventListener('touchmove',_recordNonMessageScrollIntent,{capture:true,passive:true});
   document.addEventListener('touchstart',function(e){
+    const el=document.getElementById('messages');
     if(e.touches&&e.touches[0]) _touchStartY=e.touches[0].clientY;
+    if(el&&e.target&&el.contains(e.target)) _markMessageTouchScrollIntent(true);
   },{capture:true,passive:true});
-  document.addEventListener('touchend',function(){ _touchStartY=null; },{capture:true,passive:true});
-  document.addEventListener('touchcancel',function(){ _touchStartY=null; },{capture:true,passive:true});
+  document.addEventListener('touchend',function(){ _touchStartY=null; if(_messageTouchScrollActive) _markMessageTouchScrollIntent(false); },{capture:true,passive:true});
+  document.addEventListener('touchcancel',function(){ _touchStartY=null; if(_messageTouchScrollActive) _markMessageTouchScrollIntent(false); },{capture:true,passive:true});
 }
 // Reset hook for session-switch — called from sessions.js loadSession() to
 // prevent the new chat's first scroll comparing against the previous chat's
@@ -3667,6 +3828,10 @@ function _resetScrollDirectionTracker(){
   _scrollPinned=true;
   _nearBottomCount=0;
   _touchStartY=null;
+  _messageTouchScrollActive=false;
+  _lastMessageTouchScrollIntentMs=-Infinity;
+  clearTimeout(_deferredOlderMessagesTimer);
+  _deferredOlderMessagesTimer=0;
 }
 function _resetStreamScrollFollow(){
   _clearNewMessageScrollCue();
@@ -3752,15 +3917,34 @@ if(typeof window!=='undefined'){
 (function(){
   const el=document.getElementById('messages');
   if(!el) return;
+  el.addEventListener('pointerdown',(e)=>{
+    if(e.offsetX>=el.clientWidth) _scrollbarDragActive=true;
+  },{passive:true});
+  window.addEventListener('pointerup',()=>{
+    if(!_scrollbarDragActive) return;
+    _scrollbarDragActive=false;
+    _scheduleMessageVirtualizedRender(true);
+  },{passive:true});
+  window.addEventListener('pointercancel',()=>{
+    if(!_scrollbarDragActive) return;
+    _scrollbarDragActive=false;
+    _scheduleMessageVirtualizedRender(true);
+  },{passive:true});
+  window.addEventListener('blur',()=>{ _scrollbarDragActive=false; },{passive:true});
+  document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState==='hidden') _scrollbarDragActive=false;
+  },{passive:true});
   let _scrollRaf=0;
   el.addEventListener('scroll',()=>{
     _scheduleMessageVirtualizedRender();
-    if(_programmaticScroll) return; // ignore scrolls we triggered ourselves
+    if(_programmaticScroll&&(performance.now()-_programmaticScrollSetAt)>150) _programmaticScroll=false;
+    if(_programmaticScroll) return;
     _markMessageVirtualScrollActive();
     cancelAnimationFrame(_scrollRaf);
     _scrollRaf=requestAnimationFrame(()=>{
       const top=el.scrollTop;
-      const nearBottom=el.scrollHeight-top-el.clientHeight<250;
+      const bottomDistance=el.scrollHeight-top-el.clientHeight;
+      const nearBottom=bottomDistance<250;
       const movedUp=_lastScrollTop!==null&&top<_lastScrollTop-2;
       const movedDown=_lastScrollTop!==null&&top>_lastScrollTop+2;
       _lastScrollTop=top;
@@ -3772,13 +3956,16 @@ if(typeof window!=='undefined'){
       }else if(movedDown&&nearBottom){
         _nearBottomCount=_nearBottomCount+1;
         if(_nearBottomCount>=2){
-          _scrollPinned=true;
-          _messageUserUnpinned=false;
+          if(!_messageUserUnpinned||bottomDistance<=80){
+            _messageUserUnpinned=false;
+            _scrollPinned=true;
+          }
+          _nearBottomCount=0;
         }
       }else if(!_messageUserUnpinned){
         if(nearBottom){
           _nearBottomCount=_nearBottomCount+1;
-          if(_nearBottomCount>=2) _scrollPinned=true;
+          if(_nearBottomCount>=2){_scrollPinned=true;_nearBottomCount=0;}
         }else{
           _nearBottomCount=0;
           _scrollPinned=false;
@@ -3796,7 +3983,8 @@ if(typeof window!=='undefined'){
       // the user's continued upward wheel/touch movement.
       const olderPrefetchPx=Math.max(600,el.clientHeight*1.5);
       if(_isSessionEndlessScrollEnabled()&&el.scrollTop<olderPrefetchPx && typeof _messagesTruncated!=='undefined' && _messagesTruncated && typeof _loadOlderMessages==='function'){
-        _loadOlderMessages();
+        if(_recentMessageTouchScrollIntent()) _scheduleDeferredOlderMessagesLoad();
+        else _loadOlderMessages();
       }
     });
   });
@@ -4248,7 +4436,7 @@ document.addEventListener('DOMContentLoaded',function(){
 function _setMessageScrollToBottom(){
   const el=$('messages');
   if(!el) return;
-  _programmaticScroll=true;
+  _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
   el.scrollTop=el.scrollHeight;
   _lastScrollTop=el.scrollTop;
   _nearBottomCount=2;
@@ -4261,14 +4449,14 @@ function _setMessageScrollToBottom(){
     // is the authoritative "user scrolled away" signal, so DON'T snap them back
     // or re-pin if so; only release the programmatic-scroll latch.
     if(_messageUserUnpinned || !_scrollPinned || _recentNonMessageScrollIntent()){
-      requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
+      _deferClearProgrammaticScroll();
       return;
     }
     el.scrollTop=el.scrollHeight;
     _lastScrollTop=el.scrollTop;
     _nearBottomCount=2;
     _scrollPinned=true;
-    requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
+    _deferClearProgrammaticScroll();
   });
 }
 function _isMessagePaneNearBottom(threshold=250){
@@ -4378,14 +4566,16 @@ function _settleFinalScroll(token){
   if(token!==_bottomSettleToken) return;
   const el=document.getElementById('messages');
   if(!el){ _programmaticScroll=false; return; }
-  _programmaticScroll=true;
+  if(_messageUserUnpinned||!_scrollPinned||_recentNonMessageScrollIntent()||_recentMessageTouchScrollIntent()){
+    _programmaticScroll=false;
+    return;
+  }
+  _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
   el.scrollTop=el.scrollHeight;
   _lastScrollTop=el.scrollTop;
   _nearBottomCount=2;
   _scrollPinned=true;
-  requestAnimationFrame(()=>{
-    setTimeout(()=>{ _programmaticScroll=false; },0);
-  });
+  _deferClearProgrammaticScroll();
 }
 function scrollIfPinned(){
   if(!_autoScrollFollow) return;
@@ -4408,6 +4598,7 @@ function scrollToBottom(){
   _settleMessageScrollToBottom(false, true);
   _syncScrollToBottomCue(false,{newMessage:false});
   if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
+  if(typeof _flushDeferredActiveSessionExternalRefresh==='function') _flushDeferredActiveSessionExternalRefresh();
 }
 
 function _fmtOllamaLabel(mid){
@@ -4702,6 +4893,7 @@ function renderMd(raw){
     } else {
       const h=lang?`<div class="pre-header">${esc(lang)}</div>`:'';
       const langAttr=lang?` class="language-${esc(lang)}"`:'';
+      const preClass=/^(md|markdown|mdx)$/.test(lang)?' class="md-source-block"':'';
       // For diff/patch blocks, wrap each line in a colored span
       if(lang==='diff'||lang==='patch'){
         const colored=esc(code.replace(/\n$/,'')).split('\n').map(line=>{
@@ -4727,10 +4919,10 @@ function renderMd(raw){
           const body=rows.slice(1).map(r=>'<tr>'+r.split(',').map(c=>`<td>${esc(c.trim())}</td>`).join('')+'</tr>').join('');
           _preBlock_stash.push(`${h}<div class="csv-table-wrap"><table class="csv-table"><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${body}</tbody></table></div>`);
         } else {
-          _preBlock_stash.push(`${h}<pre><code${langAttr}>${esc(code.replace(/\n$/,''))}</code></pre>`);
+          _preBlock_stash.push(`${h}<pre${preClass}><code${langAttr}>${esc(code.replace(/\n$/,''))}</code></pre>`);
         }
       } else {
-        _preBlock_stash.push(`${h}<pre><code${langAttr}>${esc(code.replace(/\n$/,''))}</code></pre>`);
+        _preBlock_stash.push(`${h}<pre${preClass}><code${langAttr}>${esc(code.replace(/\n$/,''))}</code></pre>`);
       }
     }
     return lead+'\x00P'+(_preBlock_stash.length-1)+'\x00';
@@ -5581,8 +5773,7 @@ function _renderQueueChips(sid){
       if(!card.classList.contains('visible')) return;
       const h=card.getBoundingClientRect().height;
       if(h>0) _msgs.style.setProperty('--queue-card-height', h+'px');
-      if(S.activeStreamId&&typeof scrollIfPinned==='function') scrollIfPinned();
-      else if(!S.activeStreamId&&typeof scrollToBottom==='function') scrollToBottom();
+      if(typeof scrollIfPinned==='function') scrollIfPinned();
     }, 360);
   }
 
@@ -5772,8 +5963,7 @@ function _updateQueuePill(sid,count){
         }, 360);
       }
       if(pillOuter) pillOuter.classList.remove('show');
-      if(S.activeStreamId&&typeof scrollIfPinned==='function') scrollIfPinned();
-      else if(!S.activeStreamId&&typeof scrollToBottom==='function') scrollToBottom();
+      if(typeof scrollIfPinned==='function') scrollIfPinned();
     };
   } else {
     if(pillOuter) pillOuter.classList.remove('show');
@@ -6978,6 +7168,8 @@ async function refreshSession() {
     const data = await api(`/api/session?session_id=${encodeURIComponent(S.session.session_id)}`);
     S.session = data.session;
     S.messages = data.session.messages || [];
+    _messagesTruncated = !!data.session._messages_truncated;
+    _oldestIdx = data.session._messages_offset || 0;
     const pendingMsg=getPendingSessionMessage(data.session,S.messages);
     if(pendingMsg) S.messages.push(pendingMsg);
     S.activeStreamId=data.session.active_stream_id||null;
@@ -7607,6 +7799,8 @@ function syncTopbar(){
     // Update profile chip even when no session is active (e.g. right after profile switch)
     const _profileLabel=$('profileChipLabel');
     if(_profileLabel) _profileLabel.textContent=S.activeProfile||'default';
+    const _titleLabel=$('titlebarProfileLabel');
+    if(_titleLabel) _titleLabel.textContent=S.activeProfile||'default';
     return;
   }
   const sessionTitle=S.session.title||t('untitled');
@@ -7732,6 +7926,8 @@ function syncTopbar(){
   // unaffected by this line.
   const profileLabel=$('profileChipLabel');
   if(profileLabel) profileLabel.textContent=S.activeProfile||'default';
+  const titleLabel=$('titlebarProfileLabel');
+  if(titleLabel) titleLabel.textContent=S.activeProfile||'default';
 }
 
 function msgContent(m){
@@ -8064,6 +8260,10 @@ function _worklogDetailBaseKey(el){
 function _worklogDetailDisclosureIsOpen(el){
   return !!(el&&el.classList&&el.classList.contains('open'));
 }
+function _worklogDetailScrollableBody(el){
+  if(!el||!el.querySelector) return null;
+  return el.querySelector('.thinking-card-body,.tool-card-detail');
+}
 function _setWorklogDetailDisclosureOpen(el, open){
   if(!el||!el.classList) return;
   el.classList.toggle('open', !!open);
@@ -8092,7 +8292,12 @@ function _captureWorklogDetailDisclosureState(root){
   const counts=Object.create(null);
   root.querySelectorAll(_worklogDetailDisclosureSelector).forEach(el=>{
     const key=_worklogDetailDisclosureKeyForElement(el, counts);
-    if(key) state.set(key, _worklogDetailDisclosureIsOpen(el));
+    if(!key) return;
+    const body=_worklogDetailScrollableBody(el);
+    state.set(key,{
+      open:_worklogDetailDisclosureIsOpen(el),
+      scrollTop:body?Math.max(0,Number(body.scrollTop)||0):0,
+    });
   });
   return state;
 }
@@ -8104,7 +8309,14 @@ function _restoreWorklogDetailDisclosureState(root, state){
   root.querySelectorAll(_worklogDetailDisclosureSelector).forEach(el=>{
     const key=_worklogDetailDisclosureKeyForElement(el, counts);
     if(!key||!state.has(key)) return;
-    _setWorklogDetailDisclosureOpen(el, state.get(key));
+    const saved=state.get(key);
+    const open=(saved&&typeof saved==='object'&&'open' in saved)?saved.open:saved;
+    _setWorklogDetailDisclosureOpen(el, open);
+    const scrollTop=(saved&&typeof saved==='object')?Number(saved.scrollTop):0;
+    if(open&&Number.isFinite(scrollTop)&&scrollTop>0){
+      const body=_worklogDetailScrollableBody(el);
+      if(body) body.scrollTop=Math.min(scrollTop, Math.max(0, body.scrollHeight-body.clientHeight));
+    }
   });
 }
 function _thinkingCardHtml(text, open){
@@ -8163,6 +8375,31 @@ function _transparentToolStatus(tc, settled){
   if(tc&&tc.is_error) return 'Failed';
   if(tc&&tc.done===false) return settled?'Interrupted':'Running';
   return 'Completed';
+}
+// Quiet one-line summary for a collapsed transparent tool row (#4658).
+// The transparent view overrides the row name to the bare tool name
+// (_toolShortName, e.g. "read_file"/"terminal"), so — unlike the worklog view —
+// it has no action-label carrying the target, and buildToolCard's collapsed
+// preview is blanked for the common arg/shell case (the #4411 suppression that
+// assumes the name carries the target). That left transparent rows showing only
+// the bare tool name with no hint of what each call did. Rebuild a summary from
+// the call's TARGET (path/command/query/skill/...) — NOT the raw result JSON —
+// so it stays consistent with the "keep collapsed previews quiet" intent
+// (test_tool_card_preview_summary.py) while restoring "understand the call
+// without expanding it".
+function _transparentToolSummary(tc){
+  if(!tc||typeof tc!=='object') return '';
+  // Explicit progress text (e.g. subagent_progress) wins while still running.
+  const explicit=String(tc.preview||'').trim();
+  if(tc.done===false&&explicit) return _shortToolLabel(explicit,160);
+  // Target-based summary only (path/command/query/skill). Deliberately NO generic
+  // arg-preview fallback: a call with args but no real target (e.g. `terminal`
+  // with only {workdir} or an unknown tool with {mode:"dry-run"}) must yield an
+  // EMPTY collapsed preview rather than dumping a raw arg snippet — that keeps the
+  // collapsed row quiet and consistent with the no-args case (#4658 review).
+  const target=typeof _toolVisibleTargetLabel==='function'?_toolVisibleTargetLabel(tc,{limit:160}):'';
+  if(target) return target;
+  return '';
 }
 function _copyEventToClipboard(row){
   if(!row) return;
@@ -8425,6 +8662,22 @@ function _decorateTransparentEventRow(row, opts){
       // also prefix the name with "Running:" — that's the same redundancy class
       // V6 removed from the detail body. (Trifecta r2 #4.)
       if(nameEl) nameEl.textContent=_toolShortName(name);
+      // #4658: restore the collapsed-row inline summary. buildToolCard emits a
+      // `.tool-card-preview` span but blanks its text for the common case, and
+      // the bare _toolShortName above drops the target the worklog view carries
+      // in its action-label name. Populate the preview from a quiet,
+      // target-based summary so each collapsed row says what it did without
+      // expanding. Idempotent across re-decoration (status updates re-run this).
+      const previewEl=header.querySelector('.tool-card-preview');
+      if(previewEl){
+        const summary=_transparentToolSummary(tc);
+        if(summary){
+          previewEl.textContent=summary;
+          previewEl.removeAttribute('hidden');
+        }else{
+          previewEl.textContent='';
+        }
+      }
       let statusEl=header.querySelector('.transparent-event-status');
       if(!statusEl){
         statusEl=document.createElement('span');
@@ -8735,9 +8988,6 @@ function _onLiveActivityToggle(group){
 function _toggleActivityGroup(summary){
   const group=summary&&summary.closest?summary.closest('.agent-activity-group,.tool-call-group'):null;
   if(!group) return;
-  if(group.getAttribute('data-live-tool-call-group')==='1'&&group.getAttribute('data-live-activity-current')==='1'){
-    return;
-  }
   const collapsed=group.classList.toggle('tool-call-group-collapsed');
   group.classList.toggle('open',!collapsed);
   summary.setAttribute('aria-expanded',String(!collapsed));
@@ -8861,6 +9111,7 @@ function _syncWorklogReasonFromAnchor(group, anchor, displayTextOverride){
   if(anchor){
     anchor.classList.add('assistant-segment-worklog-source');
     anchor.setAttribute('aria-hidden','true');
+    anchor.hidden=true;
   }
 }
 function ensureLiveWorklogContainer(blocks, opts){
@@ -8924,6 +9175,7 @@ function _appendWorklogReason(list, anchor){
   if(anchor){
     anchor.classList.add('assistant-segment-worklog-source');
     anchor.setAttribute('aria-hidden','true');
+    anchor.hidden=true;
   }
   return reason;
 }
@@ -9045,8 +9297,11 @@ function _appendWorklogStep(group, anchor, cards, thinkingText, opts){
 function _anchorSceneRowsForRendering(scene, opts){
   const rows=Array.isArray(scene&&scene.activity_rows)?scene.activity_rows:[];
   const settled=!!(opts&&opts.settled);
+  const live=!settled;
   const out=[];
   const byKey=new Map();
+  const liveProseTextKeys=new Map();
+  const proseTextKey=(value)=>String(value||'').replace(/\s+/g,' ').trim();
   const keyFor=(row)=>{
     if(!row) return '';
     if(row.role==='tool') return `tool:${_anchorSceneToolRowLogicalKey(row)||row.row_id||row.event_id||row.local_id||out.length}`;
@@ -9068,8 +9323,23 @@ function _anchorSceneRowsForRendering(scene, opts){
     const key=keyFor(row);
     if(byKey.has(key)){
       const index=byKey.get(key);
+      if(live&&row.role==='prose'){
+        const textKey=proseTextKey(text);
+        const duplicateIndex=textKey?liveProseTextKeys.get(textKey):undefined;
+        if(duplicateIndex!==undefined&&duplicateIndex!==index) continue;
+        const previousTextKey=proseTextKey(out[index]&&out[index].text);
+        if(previousTextKey&&previousTextKey!==textKey&&liveProseTextKeys.get(previousTextKey)===index){
+          liveProseTextKeys.delete(previousTextKey);
+        }
+        if(textKey) liveProseTextKeys.set(textKey,index);
+      }
       out[index]=row.role==='tool'?_anchorSceneMergeToolRows(out[index],row):row;
     }else{
+      if(live&&row.role==='prose'){
+        const textKey=proseTextKey(text);
+        if(textKey&&liveProseTextKeys.has(textKey)) continue;
+        if(textKey) liveProseTextKeys.set(textKey,out.length);
+      }
       byKey.set(key,out.length);
       out.push(row);
     }
@@ -9353,6 +9623,44 @@ function _projectLiveAnchorActivitySceneForStream(streamId, mode){
     return null;
   }
 }
+function _prepareLiveAnchorScrollRebuildGuard(scrollSnapshot){
+  const messagesEl=$('messages');
+  if(!messagesEl||!scrollSnapshot) return {readerAwayFromBottom:false,release:null};
+  const beforeBottomDistance=Math.max(0,messagesEl.scrollHeight-messagesEl.scrollTop-messagesEl.clientHeight);
+  // Only treat the reader as away if they were ALREADY in a non-follow state.
+  // A pinned follower can transiently have bottomDistance>250 mid-render (the
+  // assistant body grows before the anchor scene re-renders), so keying on a
+  // raw scrollTop>0 here would mis-classify a pinned reader as unpinned and kill
+  // auto-follow. Require an explicit unpin/non-pinned signal instead.
+  const readerAwayFromBottom=beforeBottomDistance>250&&(_messageUserUnpinned||_scrollPinned===false);
+  if(!readerAwayFromBottom) return {readerAwayFromBottom:false,release:null};
+  scrollSnapshot.pinned=false;
+  scrollSnapshot.userUnpinned=true;
+  scrollSnapshot.bottom=beforeBottomDistance;
+  _messageUserUnpinned=true;
+  _scrollPinned=false;
+  _nearBottomCount=0;
+  const msgInner=$('msgInner');
+  if(!msgInner||!msgInner.style) return {readerAwayFromBottom:true,release:null};
+  const guardPreviousKey='liveAnchorScrollGuardPreviousMinHeight';
+  let previousMinHeight=msgInner.style.minHeight||'';
+  if(msgInner.dataset&&Object.prototype.hasOwnProperty.call(msgInner.dataset,guardPreviousKey)){
+    previousMinHeight=msgInner.dataset[guardPreviousKey]||'';
+  }else if(msgInner.dataset){
+    msgInner.dataset[guardPreviousKey]=previousMinHeight;
+  }
+  const guardHeight=Math.max(messagesEl.scrollHeight,Number(scrollSnapshot.scrollHeight)||0);
+  if(guardHeight>0) msgInner.style.minHeight=`${guardHeight}px`;
+  return {
+    readerAwayFromBottom:true,
+    release:()=>{
+      msgInner.style.minHeight=previousMinHeight;
+      if(msgInner.dataset&&msgInner.dataset[guardPreviousKey]===previousMinHeight){
+        delete msgInner.dataset[guardPreviousKey];
+      }
+    },
+  };
+}
 function renderLiveAnchorActivityScene(streamId, scene, opts){
   opts=opts||{};
   if(typeof isCompactWorklogMode==='function'&&!isCompactWorklogMode()) return false;
@@ -9376,11 +9684,14 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
   const liveDisclosureState=typeof _captureWorklogDetailDisclosureState==='function'
     ? _captureWorklogDetailDisclosureState(blocks)
     : null;
+  const scrollSnapshot=_captureMessageScrollSnapshot();
+  const scrollRebuildGuard=_prepareLiveAnchorScrollRebuildGuard(scrollSnapshot);
   blocks.querySelectorAll('[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
-  blocks.querySelectorAll('.live-worklog[data-live-worklog-shell="1"],.tool-worklog-group[data-live-tool-call-group="1"],.tool-call-group[data-live-tool-call-group="1"],.tool-card-row[data-live-tid]:not(.transparent-event-row),.agent-activity-thinking[data-live-thinking="1"]').forEach(el=>el.remove());
+  blocks.querySelectorAll('.live-worklog[data-live-worklog-shell="1"],.tool-worklog-group[data-live-tool-call-group="1"],.tool-call-group[data-live-tool-call-group="1"],.tool-card-row[data-live-tid]:not(.transparent-event-row),.agent-activity-thinking[data-live-thinking="1"],.interim-collapse-toggle').forEach(el=>el.remove());
   blocks.querySelectorAll('[data-live-assistant="1"]').forEach(el=>{
     el.classList.add('assistant-segment-worklog-source');
     el.setAttribute('aria-hidden','true');
+    el.hidden=true;
   });
   const group=_anchorSceneWorklogGroup(blocks,{
     live:true,
@@ -9399,7 +9710,17 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
   if(typeof _startActivityElapsedTimer==='function') _startActivityElapsedTimer(group);
   _dedupeLiveProcessedWorklogAnchors(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
-  if(typeof scrollIfPinned==='function') scrollIfPinned();
+  _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
+  if(scrollRebuildGuard&&scrollRebuildGuard.release){
+    requestAnimationFrame(()=>{
+      scrollRebuildGuard.release();
+      // Only re-restore the unpinned snapshot if the reader is STILL unpinned at
+      // rAF time. If they re-pinned between guard-engage and this frame, the
+      // stale re-restore would yank them back off the bottom (Opus gate finding).
+      if(_messageUserUnpinned) _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
+    });
+  }
+  if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
   return true;
 }
 function _renderLiveAnchorActivitySceneForStream(streamId, sessionId, opts){
@@ -9444,6 +9765,7 @@ function _renderSettledAnchorSceneTransparentForMessage(message, segment, rawIdx
     if(Number.isFinite(idx)&&idx<rawIdx){
       node.classList.add('assistant-segment-worklog-source');
       node.setAttribute('aria-hidden','true');
+      node.hidden=true;
     }
   });
   let wrote=false;
@@ -9476,6 +9798,7 @@ function _renderSettledAnchorSceneForMessage(message, segment, rawIdx){
     if(Number.isFinite(idx)&&idx<rawIdx){
       node.classList.add('assistant-segment-worklog-source');
       node.setAttribute('aria-hidden','true');
+      node.hidden=true;
     }
   });
   blocks.querySelectorAll('.tool-worklog-group:not([data-anchor-scene-owner="1"]),.tool-call-group:not([data-anchor-scene-owner="1"]),.agent-activity-thinking:not([data-anchor-scene-row="1"]),.wl-reason').forEach(el=>el.remove());
@@ -9625,15 +9948,9 @@ function ensureActivityGroup(inner, opts){
   if(opts.turnStartedAt!==undefined&&opts.turnStartedAt!==null) group.setAttribute('data-turn-started-at',String(opts.turnStartedAt));
   const summary=group.querySelector('.tool-worklog-summary,.tool-call-group-summary');
   if(summary){
-    if(live){
-      summary.setAttribute('data-live-summary-static','1');
-      summary.setAttribute('aria-disabled','true');
-      summary.disabled=true;
-    }else{
-      summary.removeAttribute('data-live-summary-static');
-      summary.removeAttribute('aria-disabled');
-      summary.disabled=false;
-    }
+    summary.removeAttribute('data-live-summary-static');
+    summary.removeAttribute('aria-disabled');
+    summary.disabled=false;
   }
   const anchor=opts.anchor||null;
   if(anchor&&anchor.parentElement===inner&&group.parentElement===inner){
@@ -10641,7 +10958,7 @@ function _restoreMessageScrollSnapshot(snapshot){
       : false;
   }
   if(!restoredViaAnchor){
-    _programmaticScroll=true;
+    _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
     el.scrollTop=Math.max(0,Math.min(Number(snapshot.top)||0,maxTop));
   }
   // Sync _lastScrollTop after programmatic restore so sticky-unpin does not false-trigger (#1731).
@@ -10667,7 +10984,8 @@ function _restoreMessageScrollSnapshot(snapshot){
     }
   }
   if(!restoredViaAnchor){
-    requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
+    if(typeof _deferClearProgrammaticScroll==='function') _deferClearProgrammaticScroll();
+    else requestAnimationFrame(()=>{ setTimeout(()=>{ _programmaticScroll=false; },0); });
   }
 }
 function _restoreMessageScrollSnapshotSameFrame(snapshot){
@@ -10687,7 +11005,7 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
     const target=(snapshot.pinned===true&&Number.isFinite(bottom))
       ? maxTop-Math.max(0,bottom)
       : Number(snapshot.top)||0;
-    _programmaticScroll=true;
+    _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
     el.scrollTop=Math.max(0,Math.min(target,maxTop));
   }
   _lastScrollTop=el.scrollTop;
@@ -10701,7 +11019,8 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
     _nearBottomCount=0;
   }
   if(!restoredViaAnchor){
-    requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
+    if(typeof _deferClearProgrammaticScroll==='function') _deferClearProgrammaticScroll();
+    else requestAnimationFrame(()=>{ setTimeout(()=>{ _programmaticScroll=false; },0); });
   }
 }
 function _renderMessagesWithScrollSnapshot(options){
@@ -10759,15 +11078,15 @@ function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
     scrollIfPinned();
     return;
   }
-  // Auto-follow OFF + the user has scrolled up: don't yank them to the bottom on
-  // an automatic (non-preserve) re-render. This also covers the send() race where
-  // renderMessages() runs before S.activeStreamId is set, so a stream-start
-  // wouldn't otherwise be caught by the scrollIfPinned() branch above. A fresh
-  // session load (not unpinned) still lands at the bottom as expected. (Codex #4006.)
+  // Manual unpin is sticky: once the reader scrolls away, automatic idle/non-
+  // preserve re-renders must restore their viewport rather than clearing the
+  // unpin state with scrollToBottom(). A fresh session load (not unpinned) still
+  // lands at the bottom as expected. (Codex #4006 follow-up.)
   // renderMessages() captures the pre-wipe snapshot for this case too (see its
   // scrollSnapshot init), so restoring here lands the reader where they were.
-  if(!_autoScrollFollow && _messageUserUnpinned){
+  if(_messageUserUnpinned){
     _restoreMessageScrollSnapshot(scrollSnapshot);
+    _maybeShowNewMessageScrollCue(scrollSnapshot);
     return;
   }
   scrollToBottom();
@@ -10787,10 +11106,10 @@ function _maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualW
 function renderMessages(options){
   const preserveScroll=!!(options&&options.preserveScroll);
   const virtualFallback=!!(options&&options._virtualFallback);
-  // Capture the pre-wipe scroll position when preserving OR when Auto-follow is
-  // off and the user has scrolled up — both need to restore the reader's position
-  // after the DOM rebuild rather than snap to the bottom. (Codex #4006 r3.)
-  const scrollSnapshot=(preserveScroll||(!_autoScrollFollow&&_messageUserUnpinned))?_captureMessageScrollSnapshot():null;
+  // Capture the pre-wipe scroll position when preserving OR when the reader has
+  // manually unpinned; both need to restore the reader's position after the DOM
+  // rebuild rather than snap to the bottom. (Codex #4006 r3 follow-up.)
+  const scrollSnapshot=(preserveScroll||_messageUserUnpinned)?_captureMessageScrollSnapshot():null;
   const inner=$('msgInner');
   const sid=S.session?S.session.session_id:null;
   const msgCount=S.messages.length;
@@ -10894,6 +11213,15 @@ function renderMessages(options){
     S.session && typeof S.session.compression_anchor_summary==='string'
   ) ? S.session.compression_anchor_summary.trim() : '';
   const worklogDetailDisclosureState=_captureWorklogDetailDisclosureState(inner);
+  _recycleStash.clear();
+  if(_msgNodeRecycleEnabled){
+    for(const child of Array.from(inner.children)){
+      const key=child.dataset&&(child.dataset.recycleKey||child.dataset.msgIdx);
+      if(!key) continue;
+      if(child.id==='liveAssistantTurn'||child.querySelector&&child.querySelector('#liveAssistantTurn')) continue;
+      _recycleStash.set(Number(key), child);
+    }
+  }
   inner.innerHTML='';
   const compressionNode=compressionState?_compressionCardsNode(compressionState):null;
   const {message:referenceMessage, rawIdx:referenceMessageRawIdx}=_latestCompressionReferenceMessage(
@@ -11161,25 +11489,61 @@ function renderMessages(options){
 
     if(isUser){
       currentAssistantTurn=null;
-      const row=document.createElement('div');
-      row.className='msg-row';
-      row.id=_userMessageDomId(rawIdx);
-      row.dataset.msgIdx=rawIdx;
-      row.dataset.role='user';
-      row.dataset.rawText=String(displayContent).trim();
-      row.innerHTML=`${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`;
+      let row=_msgNodeRecycleEnabled?_recycleStash.get(rawIdx):null;
+      if(row&&(!row.classList.contains('msg-row')||row.classList.contains('assistant-turn'))) row=null;
+      const newRawText=String(displayContent).trim();
+      const nextRowHtml=`${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`;
+      if(row){
+        row.id=_userMessageDomId(rawIdx);
+        row.dataset.msgIdx=rawIdx;
+        row.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
+        row.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
+        row.dataset.role='user';
+        delete row.dataset.editing;
+        if(row.dataset.rawText!==newRawText||row.innerHTML!==nextRowHtml){
+          row.dataset.rawText=newRawText;
+          row.innerHTML=nextRowHtml;
+        }
+      }else{
+        row=document.createElement('div');
+        row.className='msg-row';
+        row.id=_userMessageDomId(rawIdx);
+        row.dataset.msgIdx=rawIdx;
+        row.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
+        row.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
+        row.dataset.role='user';
+        row.dataset.rawText=newRawText;
+        row.innerHTML=nextRowHtml;
+      }
       inner.appendChild(row);
       userRows.set(rawIdx, row);
       continue;
     }
 
     if(!currentAssistantTurn){
-      currentAssistantTurn=_createAssistantTurn(tsTitle, isTpsDisplayEnabled()?_formatTurnTps(m._turnTps):'');
+      let recycled=_msgNodeRecycleEnabled?_recycleStash.get(rawIdx):null;
+      if(recycled&&!recycled.classList.contains('assistant-turn')) recycled=null;
+      if(recycled){
+        const blocks=_assistantTurnBlocks(recycled);
+        if(blocks) blocks.innerHTML='';
+        recycled.removeAttribute('data-transparent-turn-collapsed');
+        recycled.removeAttribute('data-transparent-turn-toggle-bound');
+        const role=recycled.querySelector('.msg-role.assistant');
+        if(role) role.outerHTML=_assistantRoleHtml(tsTitle, isTpsDisplayEnabled()?_formatTurnTps(m._turnTps):'');
+        currentAssistantTurn=recycled;
+      }else{
+        currentAssistantTurn=_createAssistantTurn(tsTitle, isTpsDisplayEnabled()?_formatTurnTps(m._turnTps):'');
+      }
+      currentAssistantTurn.dataset.role='assistant';
+      if(S.session) currentAssistantTurn.dataset.sessionId=S.session.session_id;
+      currentAssistantTurn.dataset.recycleKey=rawIdx;
       inner.appendChild(currentAssistantTurn);
     }
     const seg=document.createElement('div');
     seg.className='assistant-segment';
     seg.dataset.msgIdx=rawIdx;
+    seg.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
+    seg.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
     seg.dataset.rawText=String(content).trim();
     if(m._activityBurstId!==undefined&&m._activityBurstId!==null) seg.setAttribute('data-activity-burst-id',String(m._activityBurstId));
     if(Number.isFinite(Number(m._liveSegmentSeq))) seg.setAttribute('data-live-segment-seq',String(Number(m._liveSegmentSeq)));
@@ -11187,6 +11551,7 @@ function renderMessages(options){
     if(messageBelongsInWorklog){
       seg.classList.add('assistant-segment-worklog-source');
       seg.setAttribute('aria-hidden','true');
+      seg.hidden=true;
     }
     if(m._live){
       currentAssistantTurn.id='liveAssistantTurn';
@@ -11924,6 +12289,7 @@ function renderMessages(options){
           if(!(seg.textContent||'').trim()) continue;
           seg.classList.remove('assistant-segment-worklog-source');
           seg.removeAttribute('aria-hidden');
+          seg.hidden=false;
         }
       }
     }
@@ -12049,6 +12415,7 @@ function renderMessages(options){
     }
   }
   _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
+  _recycleStash.clear();
 }
 
 function _toolDisplayName(tc){
@@ -13140,6 +13507,34 @@ function _loadJsyamlThen(cb){
   document.head.appendChild(s);
 }
 
+// ── JSON/YAML structured code-block default-view configuration (#484) ──
+// Read the user's configured default-view mode for valid JSON/YAML fenced
+// blocks. Falls back to 'auto' for any missing/invalid value so the renderer
+// stays safe before settings load and in non-browser test contexts.
+function _structuredCodeMode(){
+  const m=(typeof window!=='undefined')?window._structuredCodeDefaultView:undefined;
+  return (m==='on'||m==='off'||m==='auto')?m:'auto';
+}
+// Read the configured 'auto'-mode line threshold, clamped to a sane integer
+// range. Invalid/missing values fall back to 10 (the original hardcoded value).
+function _structuredCodeThreshold(){
+  const raw=(typeof window!=='undefined')?window._structuredCodeAutoTreeLines:undefined;
+  const n=parseInt(raw,10);
+  return (Number.isFinite(n)&&n>=1&&n<=1000)?n:10;
+}
+// Pure decision helper: should a structured block default to Tree view?
+// Factored out so the (mode, threshold, lineCount) contract is unit-testable.
+//   mode 'on'   => always Tree
+//   mode 'off'  => always Raw
+//   mode 'auto' => Tree only when lineCount >= threshold (threshold sanitized,
+//                  fallback 10)
+function _structuredCodeShowTree(mode,threshold,lineCount){
+  if(mode==='on') return true;
+  if(mode==='off') return false;
+  const th=(Number.isFinite(threshold)&&threshold>=1&&threshold<=1000)?threshold:10;
+  return lineCount>=th;
+}
+
 function initTreeViews(container){
   const root=container||document;
   root.querySelectorAll('.code-tree-wrap:not([data-tree-init])').forEach(wrap=>{
@@ -13177,8 +13572,11 @@ function initTreeViews(container){
       return; // leave as raw view
     }
     const lineCount=rawText.split('\n').length;
-    // Default to raw for short blocks (<10 lines), tree for longer
-    const showTree=lineCount>=10;
+    // Default view is user-configurable (#484 follow-up). 'on' => always Tree,
+    // 'off' => always Raw, 'auto' => Tree only when the block is >= the
+    // configured line threshold (default 10, preserving the original behavior).
+    // The per-block Raw/Tree toggle below always remains available regardless.
+    const showTree=_structuredCodeShowTree(_structuredCodeMode(),_structuredCodeThreshold(),lineCount);
     // Build tree DOM
     const treeDiv=document.createElement('div');
     treeDiv.className='tree-view'+(showTree?'':' tree-hidden');
@@ -14407,18 +14805,27 @@ function _renderTreeItems(container, entries, depth){
     el.style.paddingLeft=(8+depth*16)+'px';
     el.setAttribute('draggable','true');
     el.dataset.wsType=item.type;
-    el.oncontextmenu=(e)=>{e.preventDefault();e.stopPropagation();_showFileContextMenu(e,item);};
+    el.oncontextmenu=(e)=>{
+      const grant=typeof _workspaceEscapeGrantForPath==='function' ? _workspaceEscapeGrantForPath(item.path) : null;
+      const isDirRow=item.type==='dir'||(item.type==='symlink'&&item.is_dir);
+      if(grant&&!isDirRow){e.preventDefault();e.stopPropagation();return;}
+      e.preventDefault();e.stopPropagation();_showFileContextMenu(e,item);
+    };
     el.ondragstart=(e)=>{e.dataTransfer.setData('application/ws-path',item.path);e.dataTransfer.setData('application/ws-type',item.type);e.dataTransfer.effectAllowed='copy';el.classList.add('dragging');};
     el.ondragend=()=>{el.classList.remove('dragging');_clearWorkspaceMoveDragOver();};
 
     const isLk = item.type === 'symlink';
     const isExternalLink = isLk && item.target_outside_workspace;
+    const escapeGrant = typeof _workspaceEscapeGrantForPath === 'function' ? _workspaceEscapeGrantForPath(item.path) : null;
+    const exactEscapeGrant = typeof _workspaceEscapeExactGrant === 'function' ? _workspaceEscapeExactGrant(item.path) : null;
+    const isReadOnlyEscape = !!escapeGrant;
+    const isNestedEscape = !!escapeGrant && !exactEscapeGrant;
     // External symlinks are display-only: not expandable, not openable.
     // The read gate (safe_resolve_ws) still blocks navigation through them.
     const isDirLike = !isExternalLink && (item.type === 'dir' || (isLk && item.is_dir));
     const isFileLike = !isExternalLink && !isDirLike;
     el.dataset.wsIsDir = String(isDirLike);
-    if(isExternalLink){el.removeAttribute('draggable');el.ondragstart=null;}
+    if(isExternalLink || isReadOnlyEscape){el.removeAttribute('draggable');el.ondragstart=null;}
 
     if(isDirLike){
       // Toggle arrow for directories
@@ -14454,8 +14861,21 @@ function _renderTreeItems(container, entries, depth){
     // (the "Double-click to rename" hint here would be misleading). #1710.
     if(isLk && item.target)
       nameEl.title = t('symlink_link_to').replace('{target}', () => elideMiddle(item.target));
+    else if(isExternalLink)
+      nameEl.title = (typeof isReadOnlyEscape!=='undefined'
+        ? isReadOnlyEscape
+        : (typeof _workspaceEscapeGrantForPath==='function' ? !!_workspaceEscapeGrantForPath(item.path) : false))
+        ? t('external_link_read_only')
+        : t('external_link_open_confirm');
+    else if(typeof isReadOnlyEscape!=='undefined'
+      ? isReadOnlyEscape
+      : (typeof _workspaceEscapeGrantForPath==='function' ? !!_workspaceEscapeGrantForPath(item.path) : false))
+      nameEl.title = t('external_link_read_only');
     else if(!isDirLike)
       nameEl.title = t('double_click_rename');
+    const nameIsReadOnlyEscape=typeof isReadOnlyEscape!=='undefined'
+      ? isReadOnlyEscape
+      : (typeof _workspaceEscapeGrantForPath==='function' ? !!_workspaceEscapeGrantForPath(item.path) : false);
     // Single-click opens (file) or expand-toggles (dir) but is debounced 300ms so a
     // double-click can cancel it and trigger rename instead. Without the debounce, the
     // click bubbles to el.onclick before dblclick can fire — that's #1698. Without the
@@ -14475,8 +14895,12 @@ function _renderTreeItems(container, entries, depth){
       if(_nameClickTimer){clearTimeout(_nameClickTimer);_nameClickTimer=null;}
       // For directories, double-click navigates (breadcrumb view)
       if(isDirLike){loadDir(item.path);return;}
-      // External symlinks: show informational dialog, not rename
-      if(isExternalLink){if(typeof el.onclick==='function')el.onclick(e);return;}
+      // Escape-root rows remain browse-only, nested escape rows stay display-only.
+      if(nameIsReadOnlyEscape){
+        if(isExternalLink){if(typeof el.onclick==='function')el.onclick(e);return;}
+        openFile(item.path);
+        return;
+      }
       const inp=document.createElement('input');
       inp.className='file-rename-input';inp.value=item.name;
       inp.onclick=(e2)=>e2.stopPropagation();
@@ -14531,11 +14955,13 @@ function _renderTreeItems(container, entries, depth){
 
     // Delete button -- for file-like rows and directory-like rows
     if(isFileLike){
-      const del=document.createElement('button');
-      del.className='file-del-btn';del.title=t('delete_title');del.textContent='\u00d7';
-      del.onclick=async(e)=>{e.stopPropagation();await deleteWorkspaceFile(item.path,item.name);};
-      el.appendChild(del);
-    }else if(isDirLike){
+      if(!isReadOnlyEscape){
+        const del=document.createElement('button');
+        del.className='file-del-btn';del.title=t('delete_title');del.textContent='\u00d7';
+        del.onclick=async(e)=>{e.stopPropagation();await deleteWorkspaceFile(item.path,item.name);};
+        el.appendChild(del);
+      }
+    }else if(isDirLike&& !isReadOnlyEscape){
       const del=document.createElement('button');
       del.className='file-del-btn';del.title=t('delete_title');del.textContent='\u00d7';
       del.onclick=async(e)=>{e.stopPropagation();await deleteWorkspaceDir(item.path,item.name);};
@@ -14543,8 +14969,10 @@ function _renderTreeItems(container, entries, depth){
     }
 
     if(isDirLike){
-      _bindWorkspaceMoveDropTarget(el,item.path);
-      _bindWorkspaceOsUploadDropTarget(el,item.path);
+      if(!isReadOnlyEscape){
+        _bindWorkspaceMoveDropTarget(el,item.path);
+        _bindWorkspaceOsUploadDropTarget(el,item.path);
+      }
       // Single-click toggles expand/collapse
       el.onclick=async(e)=>{
         e.stopPropagation();
@@ -14558,7 +14986,7 @@ function _renderTreeItems(container, entries, depth){
           // Fetch children if not cached
           if(!S._dirCache[item.path]){
             try{
-              const data=await api(`/api/list?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(item.path)}`);
+              const data=await api(_workspaceRouteForPath(item.path, 'list'));
               S._dirCache[item.path]=data.entries||[];
             }catch(e2){S._dirCache[item.path]=[];}
           }
@@ -14567,18 +14995,25 @@ function _renderTreeItems(container, entries, depth){
       };
     }else if(isExternalLink){
       // Display-only: the link points outside the workspace. We do NOT disclose
-      // the resolved outside path (#4581 hardening) and do NOT call openFile —
-      // the read gate (safe_resolve_ws) blocks navigation through the link.
+      // the resolved outside path (#4581 hardening) and do NOT recursively
+      // authorize nested escape rows under an already-authorized external root.
       el.onclick=async(e)=>{
         e.stopPropagation();
-        await showConfirmDialog({
-          title:item.name,
-          message:t('external_link_open_confirm'),
-          confirmLabel:t('dialog_confirm_btn'),
-          danger:false,
-          hideCancel:true,
-          focusCancel:false,
-        });
+        if(isNestedEscape){
+          await showConfirmDialog({
+            title:item.name,
+            message:t('external_link_read_only'),
+            confirmLabel:t('dialog_confirm_btn'),
+            danger:false,
+            hideCancel:true,
+            focusCancel:false,
+          });
+          return;
+        }
+        const grant = await authorizeWorkspaceEscapeNavigation(item);
+        if(!grant) return;
+        if(grant.isDir) await loadDir(item.path);
+        else await openFile(item.path);
       };
     }else{
       el.onclick=async()=>openFile(item.path);
@@ -14604,6 +15039,10 @@ function _renderTreeItems(container, entries, depth){
 
 async function deleteWorkspaceDir(relPath, name){
   if(!S.session)return;
+  if(typeof _workspacePathIsReadOnly==='function'&&_workspacePathIsReadOnly(relPath)){
+    showToast(t('external_link_read_only'), 2000);
+    return;
+  }
   const ok=await showConfirmDialog({title:t('delete_dir_confirm',name),message:'',confirmLabel:'Delete',danger:true,focusCancel:true});
   if(!ok)return;
   try{
@@ -14627,83 +15066,86 @@ function _showFileContextMenu(e, item){
   menu.style.top=(e.clientY+100>vh?e.clientY-100:e.clientY)+'px';
   const isDirLike=item.type==='dir'||(item.type==='symlink'&&item.is_dir);
   const targetDir=isDirLike ? item.path : _workspaceParentDir(item.path);
+  const isReadOnlyEscape=typeof _workspaceEscapeGrantForPath==='function' ? !!_workspaceEscapeGrantForPath(item.path) : false;
 
-  menu.appendChild(_workspaceContextMenuItem(t('new_file'),async()=>{
-    menu.remove();
-    await promptNewFile(targetDir);
-  }));
+  if(!isReadOnlyEscape){
+    menu.appendChild(_workspaceContextMenuItem(t('new_file'),async()=>{
+      menu.remove();
+      await promptNewFile(targetDir);
+    }));
 
-  menu.appendChild(_workspaceContextMenuItem(t('new_folder'),async()=>{
-    menu.remove();
-    await promptNewFolder(targetDir);
-  }));
+    menu.appendChild(_workspaceContextMenuItem(t('new_folder'),async()=>{
+      menu.remove();
+      await promptNewFolder(targetDir);
+    }));
 
-  const createSep=document.createElement('hr');
-  createSep.style.cssText='border:none;border-top:1px solid var(--border);margin:4px 0;';
-  menu.appendChild(createSep);
+    const createSep=document.createElement('hr');
+    createSep.style.cssText='border:none;border-top:1px solid var(--border);margin:4px 0;';
+    menu.appendChild(createSep);
 
-  // Rename
-  const renameItem=document.createElement('div');
-  renameItem.textContent=t('rename_title');
-  renameItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
-  renameItem.onmouseenter=()=>renameItem.style.background='var(--hover-bg)';
-  renameItem.onmouseleave=()=>renameItem.style.background='';
-  renameItem.onclick=()=>{menu.remove();_inlineRenameFileItem(item);};
-  menu.appendChild(renameItem);
+    // Rename
+    const renameItem=document.createElement('div');
+    renameItem.textContent=t('rename_title');
+    renameItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
+    renameItem.onmouseenter=()=>renameItem.style.background='var(--hover-bg)';
+    renameItem.onmouseleave=()=>renameItem.style.background='';
+    renameItem.onclick=()=>{menu.remove();_inlineRenameFileItem(item);};
+    menu.appendChild(renameItem);
 
-  // Reveal in File Manager
-  const revealItem=document.createElement('div');
-  revealItem.textContent=t('reveal_in_finder');
-  revealItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
-  revealItem.onmouseenter=()=>revealItem.style.background='var(--hover-bg)';
-  revealItem.onmouseleave=()=>revealItem.style.background='';
-  revealItem.onclick=async()=>{menu.remove();try{await api('/api/file/reveal',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:item.path})});}catch(err){showToast(t('reveal_failed')+(err.message||err));}};
-  menu.appendChild(revealItem);
+    // Reveal in File Manager
+    const revealItem=document.createElement('div');
+    revealItem.textContent=t('reveal_in_finder');
+    revealItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
+    revealItem.onmouseenter=()=>revealItem.style.background='var(--hover-bg)';
+    revealItem.onmouseleave=()=>revealItem.style.background='';
+    revealItem.onclick=async()=>{menu.remove();try{await api('/api/file/reveal',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:item.path})});}catch(err){showToast(t('reveal_failed')+(err.message||err));}};
+    menu.appendChild(revealItem);
 
-  // Open in VS Code (#2735)
-  const vscodeItem=document.createElement('div');
-  vscodeItem.textContent=t('open_in_vscode');
-  vscodeItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
-  vscodeItem.onmouseenter=()=>vscodeItem.style.background='var(--hover-bg)';
-  vscodeItem.onmouseleave=()=>vscodeItem.style.background='';
-  vscodeItem.onclick=async()=>{menu.remove();try{await api('/api/file/open-vscode',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:item.path})});}catch(err){showToast(t('open_in_vscode_failed')+(err.message||err));}};
-  menu.appendChild(vscodeItem);
+    // Open in VS Code (#2735)
+    const vscodeItem=document.createElement('div');
+    vscodeItem.textContent=t('open_in_vscode');
+    vscodeItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
+    vscodeItem.onmouseenter=()=>vscodeItem.style.background='var(--hover-bg)';
+    vscodeItem.onmouseleave=()=>vscodeItem.style.background='';
+    vscodeItem.onclick=async()=>{menu.remove();try{await api('/api/file/open-vscode',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:item.path})});}catch(err){showToast(t('open_in_vscode_failed')+(err.message||err));}};
+    menu.appendChild(vscodeItem);
 
-  // Copy file path — resolves the absolute on-disk path on the server (so the
-  // user gets the full /home/.../workspace/foo.py rather than the relative
-  // path the file tree shows) and writes it to the OS clipboard. Useful for
-  // pasting into terminals, editors, or other apps without taking the slower
-  // Reveal-in-Finder round trip.
-  const copyPathItem=document.createElement('div');
-  copyPathItem.textContent=t('copy_file_path');
-  copyPathItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
-  copyPathItem.onmouseenter=()=>copyPathItem.style.background='var(--hover-bg)';
-  copyPathItem.onmouseleave=()=>copyPathItem.style.background='';
-  copyPathItem.onclick=async()=>{
-    menu.remove();
-    try{
-      const r=await api('/api/file/path',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:item.path})});
-      const abs=(r&&r.path)||item.path;
+    // Copy file path — resolves the absolute on-disk path on the server (so the
+    // user gets the full /home/.../workspace/foo.py rather than the relative
+    // path the file tree shows) and writes it to the OS clipboard. Useful for
+    // pasting into terminals, editors, or other apps without taking the slower
+    // Reveal-in-Finder round trip.
+    const copyPathItem=document.createElement('div');
+    copyPathItem.textContent=t('copy_file_path');
+    copyPathItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
+    copyPathItem.onmouseenter=()=>copyPathItem.style.background='var(--hover-bg)';
+    copyPathItem.onmouseleave=()=>copyPathItem.style.background='';
+    copyPathItem.onclick=async()=>{
+      menu.remove();
       try{
-        await navigator.clipboard.writeText(abs);
-        showToast(t('path_copied'));
-      }catch(clipErr){
-        const ta=document.createElement('textarea');
-        ta.value=abs;
-        ta.style.cssText='position:fixed;left:-9999px;top:-9999px;';
-        document.body.appendChild(ta);
-        ta.select();
-        let copied=false;
-        try{copied=document.execCommand('copy');}catch(_){}
-        ta.remove();
-        if(copied) showToast(t('path_copied'));
-        else showToast(t('path_copy_failed')+(clipErr&&clipErr.message?clipErr.message:String(clipErr)));
+        const r=await api('/api/file/path',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:item.path})});
+        const abs=(r&&r.path)||item.path;
+        try{
+          await navigator.clipboard.writeText(abs);
+          showToast(t('path_copied'));
+        }catch(clipErr){
+          const ta=document.createElement('textarea');
+          ta.value=abs;
+          ta.style.cssText='position:fixed;left:-9999px;top:-9999px;';
+          document.body.appendChild(ta);
+          ta.select();
+          let copied=false;
+          try{copied=document.execCommand('copy');}catch(_){}
+          ta.remove();
+          if(copied) showToast(t('path_copied'));
+          else showToast(t('path_copy_failed')+(clipErr&&clipErr.message?clipErr.message:String(clipErr)));
+        }
+      }catch(err){
+        showToast(t('path_copy_failed')+(err.message||err));
       }
-    }catch(err){
-      showToast(t('path_copy_failed')+(err.message||err));
-    }
-  };
-  menu.appendChild(copyPathItem);
+    };
+    menu.appendChild(copyPathItem);
+  }
 
   if(isDirLike){
     const dlItem=document.createElement('div');
@@ -14720,16 +15162,18 @@ function _showFileContextMenu(e, item){
     menu.appendChild(dlItem);
   }
 
-  const sep=document.createElement('hr');
-  sep.style.cssText='border:none;border-top:1px solid var(--border);margin:4px 0;';
-  menu.appendChild(sep);
-  const delItem=document.createElement('div');
-  delItem.textContent=t('delete_title');
-  delItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--error,#e94560);';
-  delItem.onmouseenter=()=>delItem.style.background='var(--hover-bg)';
-  delItem.onmouseleave=()=>delItem.style.background='';
-  delItem.onclick=()=>{menu.remove();if(isDirLike)deleteWorkspaceDir(item.path,item.name);else deleteWorkspaceFile(item.path,item.name);};
-  menu.appendChild(delItem);
+  if(!isReadOnlyEscape){
+    const sep=document.createElement('hr');
+    sep.style.cssText='border:none;border-top:1px solid var(--border);margin:4px 0;';
+    menu.appendChild(sep);
+    const delItem=document.createElement('div');
+    delItem.textContent=t('delete_title');
+    delItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--error,#e94560);';
+    delItem.onmouseenter=()=>delItem.style.background='var(--hover-bg)';
+    delItem.onmouseleave=()=>delItem.style.background='';
+    delItem.onclick=()=>{menu.remove();if(isDirLike)deleteWorkspaceDir(item.path,item.name);else deleteWorkspaceFile(item.path,item.name);};
+    menu.appendChild(delItem);
+  }
 
   document.body.appendChild(menu);
   const dismiss=()=>{menu.remove();document.removeEventListener('click',dismiss);};
@@ -14738,6 +15182,10 @@ function _showFileContextMenu(e, item){
 
 async function _inlineRenameFileItem(item){
   if(!S.session)return;
+  if(typeof _workspacePathIsReadOnly==='function'&&_workspacePathIsReadOnly(item.path)){
+    showToast(t('external_link_read_only'), 2000);
+    return;
+  }
   const isDirLike=item.type==='dir'||(item.type==='symlink'&&item.is_dir);
   // Pre-fill the input with the current name and select just the stem
   // (everything before the last '.') so the user can immediately retype the
@@ -14771,6 +15219,10 @@ async function _inlineRenameFileItem(item){
 
 async function deleteWorkspaceFile(relPath, name){
   if(!S.session)return;
+  if(typeof _workspacePathIsReadOnly==='function'&&_workspacePathIsReadOnly(relPath)){
+    showToast(t('external_link_read_only'), 2000);
+    return;
+  }
   const _delFile=await showConfirmDialog({title:t('delete_confirm',name),message:'',confirmLabel:'Delete',danger:true,focusCancel:true});
   if(!_delFile) return;
   try{
@@ -14792,6 +15244,10 @@ async function promptNewFile(targetDir = S.currentDir || '.'){
     }catch(e){setStatus(t('create_failed')+e.message);return;}
   }
   if(!S.session)return;
+  if(typeof _workspacePathIsReadOnly==='function'&&_workspacePathIsReadOnly(targetDir)){
+    showToast(t('external_link_read_only'), 2000);
+    return;
+  }
   const targetLabel=_workspaceCreateTargetLabel(targetDir);
   const name=await showPromptDialog({
     title:t('new_file_prompt_title', targetLabel),
@@ -14819,6 +15275,10 @@ async function promptNewFolder(targetDir = S.currentDir || '.'){
     }catch(e){setStatus(t('folder_create_failed')+e.message);return;}
   }
   if(!S.session)return;
+  if(typeof _workspacePathIsReadOnly==='function'&&_workspacePathIsReadOnly(targetDir)){
+    showToast(t('external_link_read_only'), 2000);
+    return;
+  }
   const targetLabel=_workspaceCreateTargetLabel(targetDir);
   const name=await showPromptDialog({
     title:t('new_folder_prompt_title', targetLabel),
