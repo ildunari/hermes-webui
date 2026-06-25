@@ -1658,11 +1658,13 @@ def _session_list_cache_key(
     visible_only: bool = False,
     source_filter: str | None = None,
     sidebar_source: str | None = None,
+    show_messaging_sessions: bool = False,
 ) -> tuple:
     return (
         _session_list_cache_profile_scope(active_profile),
         bool(all_profiles),
         bool(show_cli_sessions),
+        bool(show_messaging_sessions),
         bool(show_previous_messaging_sessions),
         bool(show_cron_sessions),
         bool(include_archived),
@@ -1997,6 +1999,7 @@ def _build_session_list_cache_payload(
     source_filter: str | None = None,
     sidebar_source: str | None = None,
     diag=None,
+    show_messaging_sessions: bool = False,
 ) -> dict:
     diag_stage = diag.stage if diag is not None else lambda *_a, **_k: None
 
@@ -2047,6 +2050,7 @@ def _build_session_list_cache_payload(
         webui_sessions = _all_sessions_for_sidebar()
     diag_stage("normalize_cli_rows")
     show_cli_sessions = bool(show_cli_sessions)
+    show_messaging_sessions = bool(show_messaging_sessions)
     show_previous_messaging_sessions = bool(show_previous_messaging_sessions)
     show_cron_sessions = bool(show_cron_sessions)
     webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
@@ -2170,6 +2174,15 @@ def _build_session_list_cache_payload(
     else:
         scoped = [s for s in merged if _profiles_match(s.get("profile"), active_profile)]
         other_profile_count = 0 if _is_isolated_profile_mode() else len(merged) - len(scoped)
+    diag_stage("source_visibility")
+    scoped = [
+        s for s in scoped
+        if _session_allowed_by_webui_source_visibility(
+            s,
+            show_messaging_sessions=show_messaging_sessions,
+            show_cron_sessions=show_cron_sessions,
+        )
+    ]
     diag_stage("messaging_dedupe")
     archived_scoped = _keep_latest_messaging_session_per_source(
         list(scoped),
@@ -2236,6 +2249,7 @@ def _build_session_list_cache_payload(
         "other_profile_count": other_profile_count,
         "settings": {
             "show_cli_sessions": show_cli_sessions,
+            "show_messaging_sessions": show_messaging_sessions,
             "show_previous_messaging_sessions": show_previous_messaging_sessions,
             "show_cron_sessions": show_cron_sessions,
         },
@@ -5833,6 +5847,30 @@ def _is_messaging_session_record(session) -> bool:
         session.get("source_label") if isinstance(session, dict) else None,
     )
     return _is_known_messaging_source(raw)
+
+
+def _is_cron_session_record(session) -> bool:
+    """Return true for rows backed by scheduled cron-job runs."""
+    if not session:
+        return False
+    values = []
+    for key in ("raw_source", "source_tag", "source", "session_source", "source_label"):
+        values.append(getattr(session, key, None) if not isinstance(session, dict) else session.get(key))
+    return any(_normalized_source_marker(value) == "cron" for value in values)
+
+
+def _session_allowed_by_webui_source_visibility(
+    session,
+    *,
+    show_messaging_sessions: bool = False,
+    show_cron_sessions: bool = False,
+) -> bool:
+    """Default WebUI history policy: local/WebUI/terminal rows yes, messaging+cron no."""
+    if not show_messaging_sessions and _is_messaging_session_record(session):
+        return False
+    if not show_cron_sessions and _is_cron_session_record(session):
+        return False
+    return True
 
 
 def _messages_include_tool_metadata(messages) -> bool:
@@ -9941,6 +9979,7 @@ def handle_get(handler, parsed) -> bool:
             diag.stage("load_settings")
             settings = load_settings()
             show_cli_sessions = bool(settings.get("show_cli_sessions"))
+            show_messaging_sessions = bool(settings.get("show_messaging_sessions"))
             show_previous_messaging_sessions = bool(
                 settings.get("show_previous_messaging_sessions")
             )
@@ -9959,6 +9998,7 @@ def handle_get(handler, parsed) -> bool:
                 active_profile=active_profile,
                 all_profiles=all_profiles,
                 show_cli_sessions=show_cli_sessions,
+                show_messaging_sessions=show_messaging_sessions,
                 show_previous_messaging_sessions=show_previous_messaging_sessions,
                 show_cron_sessions=show_cron_sessions,
                 include_archived=include_archived,
@@ -9977,6 +10017,7 @@ def handle_get(handler, parsed) -> bool:
                     active_profile=active_profile,
                     all_profiles=all_profiles,
                     show_cli_sessions=show_cli_sessions,
+                    show_messaging_sessions=show_messaging_sessions,
                     show_previous_messaging_sessions=show_previous_messaging_sessions,
                     show_cron_sessions=show_cron_sessions,
                     include_archived=include_archived,

@@ -199,6 +199,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 
 ### Sessions
 - Create, rename, duplicate, delete, search by title and message content
+- Auto-title sessions after the opening exchange, then refresh generated titles every 5 exchanges by default for non-messaging sessions while preserving manual titles
 - Session actions via `⋯` dropdown per session — pin, move to project, archive, duplicate, delete
 - Pin/star sessions to the top of the sidebar (gold indicator)
 - Archive sessions (hide without deleting, toggle to show)

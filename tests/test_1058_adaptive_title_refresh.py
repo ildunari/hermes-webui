@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from api.streaming import (
     _count_exchanges,
     _latest_exchange_snippets,
+    _title_refresh_context_snippets,
     _get_title_refresh_interval,
     _run_background_title_refresh,
     _maybe_schedule_title_refresh,
@@ -182,6 +183,25 @@ class TestLatestExchangeSnippets:
         assert a == 'a'
 
 
+class TestTitleRefreshContextSnippets:
+    def test_combines_conversation_start_and_latest_exchange(self):
+        msgs = [
+            _user_msg('fix the session naming system'),
+            _asst_msg('I will inspect the title generation path'),
+            _user_msg('make it update after a few turns'),
+            _asst_msg('I changed the adaptive title refresh policy'),
+        ]
+        u, a = _title_refresh_context_snippets(msgs)
+        assert 'Conversation start: fix the session naming system' in u
+        assert 'Latest user turn: make it update after a few turns' in u
+        assert 'Opening answer: I will inspect the title generation path' in a
+        assert 'Latest assistant answer: I changed the adaptive title refresh policy' in a
+
+    def test_single_exchange_stays_plain_for_initial_title_quality(self):
+        msgs = [_user_msg('first q'), _asst_msg('first a')]
+        assert _title_refresh_context_snippets(msgs) == ('first q', 'first a')
+
+
 # ---------------------------------------------------------------------------
 # _get_title_refresh_interval
 # ---------------------------------------------------------------------------
@@ -197,9 +217,9 @@ class TestGetTitleRefreshInterval:
         with patch('api.config.load_settings', return_value={'auto_title_refresh_every': '0'}):
             assert _get_title_refresh_interval() == 0
 
-    def test_returns_zero_when_key_absent(self):
+    def test_defaults_to_five_when_key_absent(self):
         with patch('api.config.load_settings', return_value={}):
-            assert _get_title_refresh_interval() == 0
+            assert _get_title_refresh_interval() == 5
 
     def test_returns_zero_on_exception(self):
         with patch('api.config.load_settings', side_effect=Exception('boom')):
@@ -405,10 +425,53 @@ class TestMaybeScheduleTitleRefresh:
                 _maybe_schedule_title_refresh(session, self._noop_put, None)
                 assert mock_thread_cls.called
 
+    def test_passes_start_and_latest_context_to_refresh_thread(self):
+        """Adaptive retitle uses both the opening topic and latest exchange."""
+        with patch('api.streaming._get_title_refresh_interval', return_value=5):
+            with patch('threading.Thread') as mock_thread_cls:
+                mock_thread = MagicMock()
+                mock_thread_cls.return_value = mock_thread
+                session = _make_session(messages=[
+                    _user_msg('first topic'),
+                    _asst_msg('first answer'),
+                    _user_msg('middle'),
+                    _asst_msg('middle answer'),
+                    _user_msg('latest topic'),
+                    _asst_msg('latest answer'),
+                    _user_msg('extra'),
+                    _asst_msg('extra answer'),
+                    _user_msg('final detail'),
+                    _asst_msg('final answer'),
+                ])
+                _maybe_schedule_title_refresh(session, self._noop_put, None)
+        args = mock_thread_cls.call_args.kwargs['args']
+        assert 'Conversation start: first topic' in args[1]
+        assert 'Latest user turn: final detail' in args[1]
+        assert 'Opening answer: first answer' in args[2]
+        assert 'Latest assistant answer: final answer' in args[2]
+
+    def test_skips_messaging_sourced_sessions(self):
+        with patch('api.streaming._get_title_refresh_interval', return_value=5):
+            with patch('threading.Thread') as mock_thread_cls:
+                session = _make_session(messages=[_user_msg('q'), _asst_msg('a')] * 5)
+                session.source_tag = 'telegram'
+                _maybe_schedule_title_refresh(session, self._noop_put, None)
+        assert mock_thread_cls.called is False
+
+    def test_allows_cli_sourced_sessions(self):
+        with patch('api.streaming._get_title_refresh_interval', return_value=5):
+            with patch('threading.Thread') as mock_thread_cls:
+                mock_thread = MagicMock()
+                mock_thread_cls.return_value = mock_thread
+                session = _make_session(messages=[_user_msg('q'), _asst_msg('a')] * 5)
+                session.source_tag = 'cli'
+                _maybe_schedule_title_refresh(session, self._noop_put, None)
+        assert mock_thread_cls.called is True
+
     def test_does_nothing_when_no_exchange_content(self):
         """Even at interval, if both snippets are empty, don't spawn."""
         with patch('api.streaming._get_title_refresh_interval', return_value=5), \
-             patch('api.streaming._latest_exchange_snippets', return_value=('', '')):
+             patch('api.streaming._title_refresh_context_snippets', return_value=('', '')):
             spawned = []
             with patch('threading.Thread', side_effect=lambda **kw: spawned.append(kw) or MagicMock()):
                 session = _make_session(messages=[_user_msg('q'), _asst_msg('a')] * 5)

@@ -2384,6 +2384,34 @@ def _latest_exchange_snippets(messages):
     return user_text[:500], asst_text[:500]
 
 
+def _title_refresh_context_snippets(messages):
+    """Return compact conversation-start + latest-turn context for adaptive retitles.
+
+    The first title is intentionally based on the opening exchange. A later
+    retitle should know where the conversation started *and* what it turned into;
+    using only the latest exchange makes titles drift toward a tangent.
+    """
+    first_user, first_asst = _first_exchange_snippets(messages)
+    latest_user, latest_asst = _latest_exchange_snippets(messages)
+    if not latest_user and not latest_asst:
+        return first_user, first_asst
+    if not first_user and not first_asst:
+        return latest_user, latest_asst
+    if first_user == latest_user and first_asst == latest_asst:
+        return first_user, first_asst
+    user_parts = []
+    asst_parts = []
+    if first_user:
+        user_parts.append(f"Conversation start: {first_user}")
+    if latest_user:
+        user_parts.append(f"Latest user turn: {latest_user}")
+    if first_asst:
+        asst_parts.append(f"Opening answer: {first_asst}")
+    if latest_asst:
+        asst_parts.append(f"Latest assistant answer: {latest_asst}")
+    return "\n\n".join(user_parts)[:500], "\n\n".join(asst_parts)[:500]
+
+
 def _count_exchanges(messages):
     """Count the number of user messages (rough exchange count)."""
     count = 0
@@ -2402,7 +2430,7 @@ def _get_title_refresh_interval() -> int:
     try:
         from api.config import load_settings
         settings = load_settings()
-        val = settings.get('auto_title_refresh_every', '0')
+        val = settings.get('auto_title_refresh_every', '5')
         return int(val) if str(val).strip().isdigit() and int(val) > 0 else 0
     except Exception:
         return 0
@@ -3416,8 +3444,49 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
         logger.debug("Failed to preserve pre-compression session file", exc_info=True)
 
 
+_MESSAGING_TITLE_REFRESH_SOURCES = {
+    'telegram',
+    'discord',
+    'slack',
+    'whatsapp',
+    'signal',
+    'matrix',
+    'mattermost',
+    'email',
+    'sms',
+    'dingtalk',
+    'feishu',
+    'wecom',
+    'weixin',
+    'bluebubbles',
+    'qqbot',
+}
+
+
+def _session_allows_adaptive_title_refresh(session) -> bool:
+    """Return True for local/non-messaging sessions eligible for auto-retitle."""
+    if getattr(session, 'read_only', False) is True:
+        return False
+
+    def _source_attr(name: str) -> str:
+        value = getattr(session, name, '')
+        if value is None or value.__class__.__module__.startswith('unittest.mock'):
+            return ''
+        return str(value or '').strip().lower()
+
+    candidates = {
+        _source_attr('source_tag'),
+        _source_attr('raw_source'),
+        _source_attr('session_source'),
+        _source_attr('pending_user_source'),
+    }
+    return not any(source in _MESSAGING_TITLE_REFRESH_SOURCES for source in candidates if source)
+
+
 def _maybe_schedule_title_refresh(session, put_event, agent):
     """Check if the session is due for an adaptive title refresh and schedule it."""
+    if not _session_allows_adaptive_title_refresh(session):
+        return
     refresh_interval = _get_title_refresh_interval()
     if refresh_interval <= 0:
         return
@@ -3431,7 +3500,7 @@ def _maybe_schedule_title_refresh(session, put_event, agent):
     exchange_count = _count_exchanges(session.messages)
     if exchange_count <= 0 or exchange_count % refresh_interval != 0:
         return
-    last_u, last_a = _latest_exchange_snippets(session.messages)
+    last_u, last_a = _title_refresh_context_snippets(session.messages)
     if not last_u and not last_a:
         return
     threading.Thread(

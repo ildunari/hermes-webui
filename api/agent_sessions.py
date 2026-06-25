@@ -8,13 +8,25 @@ logger = logging.getLogger(__name__)
 
 
 MESSAGING_SOURCES = {
+    'bluebubbles',
+    'dingtalk',
     'discord',
     'email',
+    'feishu',
+    'homeassistant',
+    'matrix',
+    'mattermost',
+    'qqbot',
+    'signal',
+    'slack',
+    'sms',
+    'telegram',
+    'webhook',
     'wecom',
     'wecom_callback',
-    'slack',
-    'telegram',
     'weixin',
+    'whatsapp',
+    'yuanbao',
 }
 
 CLI_MIN_UNTITLED_MESSAGE_COUNT = 6
@@ -23,6 +35,7 @@ CLI_MIN_UNTITLED_USER_MESSAGE_COUNT = 2
 SOURCE_LABELS = {
     'api_server': 'API',
     'cli': 'CLI',
+    'bluebubbles': 'iMessage',
     'cron': 'Cron',
     'discord': 'Discord',
     'email': 'Email',
@@ -31,6 +44,7 @@ SOURCE_LABELS = {
     'slack': 'Slack',
     'telegram': 'Telegram',
     'tool': 'Tool',
+    'webhook': 'Webhook',
     'tui': 'TUI',
     'webui': 'WebUI',
     'weixin': 'Weixin',

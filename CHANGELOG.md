@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Generated conversation titles now get a second look as local sessions develop.** Adaptive title refresh is enabled by default every 5 exchanges for non-messaging WebUI/CLI-style sessions, using both the opening exchange and latest turn so the title can improve after the conversation's real topic becomes clear. Manual titles remain protected, and messaging-sourced sessions such as Telegram/Discord imports are skipped.
+
 ## [v0.51.641] — 2026-06-25 — Release WV (disabled plugins read as disabled in dark mode, active ones sort first)
 
 ### Fixed
