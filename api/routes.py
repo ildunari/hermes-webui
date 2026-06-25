@@ -6364,6 +6364,17 @@ def _is_api_server_sidecar_row(session: dict) -> bool:
     return bool(markers & {"api", "api_server"})
 
 
+def _is_subagent_sidebar_row(session: dict) -> bool:
+    """Return True for delegated subagent sessions hidden from the main sidebar."""
+    if not isinstance(session, dict):
+        return False
+    markers = {
+        _normalized_source_marker(session.get(key))
+        for key in ("source", "source_tag", "raw_source", "session_source", "source_label")
+    }
+    return "subagent" in markers
+
+
 def _session_lineage_ids(session: dict) -> set[str]:
     """Return known ids that identify one logical sidebar lineage."""
     if not isinstance(session, dict):
@@ -6408,6 +6419,7 @@ def _dedupe_cli_sidebar_sessions_for_api(cli: list[dict], represented_webui_ids:
         s for s in cli
         if s["session_id"] not in represented_webui_ids
         and not _is_duplicate_webui_state_projection(s, represented_webui_ids)
+        and not _is_subagent_sidebar_row(s)
         and is_cli_session_row_visible(s)
     ]
     visible = [s for s in candidates if not _cron_hide(s, show_cron=show_cron_sessions)]
