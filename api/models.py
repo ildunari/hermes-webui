@@ -41,6 +41,24 @@ _CLI_SESSIONS_CACHE_TTL_SECONDS = 5.0
 _CLI_SESSIONS_CACHE_LOCK = threading.Lock()
 _CLI_SESSIONS_CACHE = {}
 
+# Per-file parse cache for Claude Code JSONL transcripts (#4718/#4662 phase 4).
+# ``~/.claude/projects`` is a GLOBAL, profile-independent directory, but the
+# sidebar re-derives every Claude Code row from scratch on each /api/sessions
+# build — fully re-reading and JSON-parsing up to CLAUDE_CODE_MAX_FILES
+# transcripts line-by-line (hundreds of MB) just to recover a title + message
+# count. That parse dominates the cold sidebar build (~650-1000ms measured on a
+# 200-file / ~130MB tree) and it repeats on every profile switch, on the 5s
+# CLI-cache expiry, and on every sidebar poll, because the higher CLI cache is
+# keyed per active profile while the underlying transcripts never change between
+# switches. This cache memoizes the EXPENSIVE per-file parse result keyed by the
+# file's (path, mtime_ns, size, ctime_ns); a warm sidebar build then re-stats the
+# files (~4ms for 200) instead of re-parsing them. Any external edit/append to a
+# transcript changes mtime_ns/size/ctime_ns and transparently invalidates just
+# that one file's entry. Bounded so a pathological projects tree can't grow it unbounded.
+_CLAUDE_CODE_PARSE_CACHE_LOCK = threading.Lock()
+_CLAUDE_CODE_PARSE_CACHE: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_CLAUDE_CODE_PARSE_CACHE_MAX = 1000
+
 # ---------------------------------------------------------------------------
 # Stale temp-file cleanup
 # ---------------------------------------------------------------------------
@@ -428,12 +446,15 @@ def _append_recovered_pending_turn(session, *, timestamp: int | None = None) -> 
         recovered['attachments'] = list(session.pending_attachments)
     session.messages.append(recovered)
     _append_recovered_turn_to_context(session, recovered)
-    # The new user turn is now committed to messages (#3831): retire a positive
-    # truncation watermark from a prior retry/undo/edit so it can't freeze at the
-    # old edit boundary and drop these post-edit turns on a later empty-sidecar
-    # reconcile. None, never 0.0 (the truncate-to-empty sentinel, #2914).
+    # The new user turn is now committed to messages (#3831): advance the
+    # truncation watermark to the new message's timestamp so that
+    # merge_session_messages_append_only() still filters out replaced
+    # pre-edit rows from state.db whose timestamps fall below the boundary.
+    # The merge's sidecar_advanced_past_watermark guard allows state.db rows
+    # newer than the watermark, so post-edit turns are not dropped.
+    # Never 0.0 (the truncate-to-empty sentinel, #2914).
     if getattr(session, 'truncation_watermark', None):
-        session.truncation_watermark = None
+        session.truncation_watermark = recovered_ts
     return recovered
 
 
@@ -535,6 +556,16 @@ def _find_top_level_json_key(text, key):
             depth -= 1
         i += 1
     return None
+
+
+def _read_file_head(path: Path, max_prefix_bytes: int = 4096) -> str:
+    """Read at most ``max_prefix_bytes`` bytes from ``path`` and decode UTF-8."""
+    if not isinstance(path, Path):
+        path = Path(path)
+    if max_prefix_bytes <= 0:
+        return ''
+    with path.open('rb') as fp:
+        return fp.read(max_prefix_bytes).decode('utf-8', errors='ignore')
 
 
 def _read_metadata_json_prefix(path, max_prefix_bytes=65536):
@@ -643,6 +674,7 @@ class Session:
                  context_length=None, threshold_tokens=None,
                  last_prompt_tokens=None,
                  truncation_watermark=None,
+                 truncation_boundary=None,
                  gateway_routing=None, gateway_routing_history=None,
                  llm_title_generated: bool=False,
                  manual_title: bool=False,
@@ -693,6 +725,7 @@ class Session:
         self.threshold_tokens = threshold_tokens
         self.last_prompt_tokens = last_prompt_tokens
         self.truncation_watermark = truncation_watermark
+        self.truncation_boundary = truncation_boundary
         self.gateway_routing = gateway_routing if isinstance(gateway_routing, dict) else None
         self.gateway_routing_history = gateway_routing_history if isinstance(gateway_routing_history, list) else []
         self.llm_title_generated = bool(llm_title_generated)
@@ -762,6 +795,7 @@ class Session:
             'compression_anchor_details', 'context_engine_state',
             'context_length', 'threshold_tokens', 'last_prompt_tokens',
             'truncation_watermark',
+            'truncation_boundary',
             'gateway_routing', 'gateway_routing_history', 'llm_title_generated', 'manual_title',
             'parent_session_id',
             'worktree_path', 'worktree_branch', 'worktree_repo_root', 'worktree_created_at',
@@ -2123,9 +2157,13 @@ def _has_compression_continuation(session) -> bool:
             if path.name.startswith('_') or path.stem == sid:
                 continue
             try:
-                head = path.read_text(encoding='utf-8', errors='ignore')[:4096]
-            except TypeError:
-                head = path.read_text(encoding='utf-8')[:4096]
+                # Preserve the old read_text()[:4096] CHARACTER-prefix semantics
+                # with bounded I/O: a UTF-8 char is at most 4 bytes, so 4096 chars
+                # fit in <=16384 bytes. Reading bytes then slicing to 4096 chars
+                # avoids a regression where a multi-byte (e.g. emoji) compression
+                # summary written before parent_session_id pushes the needle past a
+                # 4096-BYTE cutoff even though it was within the old 4096-CHAR one.
+                head = _read_file_head(path, max_prefix_bytes=16384)[:4096]
             except OSError:
                 continue
             if needle in head:
@@ -3851,6 +3889,65 @@ def _parse_claude_code_jsonl(path: Path, *, max_messages: int = CLAUDE_CODE_MAX_
     return messages, summary_title, first_ts, last_ts
 
 
+def _parse_claude_code_jsonl_cached(
+    path: Path, *, max_messages: int = CLAUDE_CODE_MAX_MESSAGES_PER_FILE
+) -> tuple[list[dict], str | None, float | None, float | None]:
+    """``_parse_claude_code_jsonl`` memoized by the file's (path, mtime_ns, size, ctime_ns).
+
+    The transcript files under ``~/.claude/projects`` are global and rarely
+    change between sidebar builds, but parsing them dominates the cold
+    /api/sessions latency (and repeats on every profile switch). Caching the
+    parse result keyed by the file's stat signature collapses the warm cost to a
+    single ``os.stat`` per file. A genuine append/edit bumps ``mtime_ns``/``size``
+    /``ctime_ns`` and misses the cache, so staleness is impossible without
+    re-parsing.
+
+    ``max_messages`` is part of the key so a caller asking for a different cap
+    never reads a result truncated to a smaller one.
+    """
+    try:
+        st = path.stat()
+        # Key on mtime_ns + size + ctime_ns: size is the strong discriminator for
+        # append-only JSONL (any write changes it), and ctime_ns guards the rare
+        # same-size, same-mtime in-place edit so a content change can never serve
+        # a stale parse. A spurious ctime bump only costs one harmless re-parse.
+        key = (str(path), st.st_mtime_ns, st.st_size, st.st_ctime_ns, int(max_messages))
+    except OSError:
+        # Can't stat -> fall back to a direct (uncached) parse; it will also
+        # likely fail and return the empty tuple, matching prior behavior.
+        return _parse_claude_code_jsonl(path, max_messages=max_messages)
+
+    with _CLAUDE_CODE_PARSE_CACHE_LOCK:
+        hit = _CLAUDE_CODE_PARSE_CACHE.get(key)
+        if hit is not None:
+            _CLAUDE_CODE_PARSE_CACHE.move_to_end(key)
+            messages, summary_title, first_ts, last_ts = hit
+            # Return a shallow copy of the message list so a caller mutating it
+            # can't corrupt the cached entry; the per-message dicts are treated
+            # as read-only by all current callers.
+            return list(messages), summary_title, first_ts, last_ts
+
+    parsed = _parse_claude_code_jsonl(path, max_messages=max_messages)
+
+    with _CLAUDE_CODE_PARSE_CACHE_LOCK:
+        # Re-check under lock in case a concurrent build populated it; either
+        # entry is equally valid for the same stat signature.
+        existing = _CLAUDE_CODE_PARSE_CACHE.get(key)
+        if existing is None:
+            _CLAUDE_CODE_PARSE_CACHE[key] = parsed
+            _CLAUDE_CODE_PARSE_CACHE.move_to_end(key)
+            while len(_CLAUDE_CODE_PARSE_CACHE) > _CLAUDE_CODE_PARSE_CACHE_MAX:
+                _CLAUDE_CODE_PARSE_CACHE.popitem(last=False)
+    messages, summary_title, first_ts, last_ts = parsed
+    return list(messages), summary_title, first_ts, last_ts
+
+
+def clear_claude_code_parse_cache() -> None:
+    """Drop all memoized Claude Code transcript parses (test/lifecycle hook)."""
+    with _CLAUDE_CODE_PARSE_CACHE_LOCK:
+        _CLAUDE_CODE_PARSE_CACHE.clear()
+
+
 def _iter_claude_code_jsonl_files(projects_dir: Path | str | None = None, *, max_files: int = CLAUDE_CODE_MAX_FILES, max_file_bytes: int = CLAUDE_CODE_MAX_FILE_BYTES):
     root = Path(projects_dir).expanduser() if projects_dir is not None else _default_claude_code_projects_dir()
     if root is None:
@@ -3906,20 +4003,40 @@ def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_file
     never read during test runs.
     """
     sessions = []
+    # ``get_last_workspace()`` is loop-invariant (the same active workspace for
+    # every Claude Code row) but internally stats config.yaml + probes terminal
+    # cwd, so calling it once per row was ~200 redundant stat()s on the cold
+    # sidebar build (#4718). Resolve it a single time.
+    cc_workspace = str(get_last_workspace())
     for path in _iter_claude_code_jsonl_files(projects_dir, max_files=max_files, max_file_bytes=max_file_bytes) or []:
-        messages, summary_title, first_ts, last_ts = _parse_claude_code_jsonl(path)
+        messages, summary_title, first_ts, last_ts = _parse_claude_code_jsonl_cached(path)
         if not messages:
             continue
         sid = _claude_code_session_id(path)
+        # Match the truthiness fallback used in the assignments below: the old
+        # inline code was ``first_ts or last_ts or path.stat().st_mtime``, which
+        # also fell back to mtime for a falsy-but-not-None ``0.0`` timestamp
+        # (epoch-0 / 1970 transcripts). An identity (``is None``) guard would
+        # leave those rows with ``None`` instead of the file mtime, so use the
+        # same ``not`` test the assignments use to stay bug-for-bug compatible.
+        if not first_ts and not last_ts:
+            try:
+                _mtime = path.stat().st_mtime
+            except OSError:
+                _mtime = 0.0
+        else:
+            _mtime = None
+        created_at = first_ts or last_ts or _mtime
+        updated_at = last_ts or first_ts or _mtime
         sessions.append({
             'session_id': sid,
             'title': _claude_code_title(messages, summary_title),
-            'workspace': str(get_last_workspace()),
+            'workspace': cc_workspace,
             'model': 'claude-code',
             'message_count': len(messages),
-            'created_at': first_ts or last_ts or path.stat().st_mtime,
-            'updated_at': last_ts or first_ts or path.stat().st_mtime,
-            'last_message_at': last_ts or first_ts or path.stat().st_mtime,
+            'created_at': created_at,
+            'updated_at': updated_at,
+            'last_message_at': updated_at,
             'pinned': False,
             'archived': False,
             'project_id': None,
@@ -3943,7 +4060,7 @@ def get_claude_code_session_messages(sid, projects_dir: Path | str | None = None
     for path in _iter_claude_code_jsonl_files(projects_dir) or []:
         if _claude_code_session_id(path) != sid:
             continue
-        messages, _summary_title, _first_ts, _last_ts = _parse_claude_code_jsonl(path)
+        messages, _summary_title, _first_ts, _last_ts = _parse_claude_code_jsonl_cached(path)
         return messages
     return []
 
@@ -4677,6 +4794,38 @@ def _session_message_merge_key(msg: dict):
     )
 
 
+_SESSION_MESSAGE_DISPLAY_METADATA_KEYS = (
+    "_turnDuration",
+    "_turnTps",
+    "_turnUsage",
+    "_firstTokenMs",
+    "_gatewayRouting",
+    "_statusCard",
+    "_anchor_stream_id",
+    "_anchor_activity_scene",
+)
+
+
+def _message_display_metadata_value_present(value) -> bool:
+    if value is None or value == "":
+        return False
+    if isinstance(value, (dict, list, tuple, set)) and not value:
+        return False
+    return True
+
+
+def _merge_session_display_metadata(target: dict | None, source: dict | None) -> None:
+    """Preserve display-only turn metadata when duplicate transcript rows merge."""
+    if not isinstance(target, dict) or not isinstance(source, dict):
+        return
+    for key in _SESSION_MESSAGE_DISPLAY_METADATA_KEYS:
+        if _message_display_metadata_value_present(target.get(key)):
+            continue
+        value = source.get(key)
+        if _message_display_metadata_value_present(value):
+            target[key] = copy.deepcopy(value)
+
+
 def _session_message_dedup_key(msg: dict):
     """Like _session_message_merge_key but preserves full-precision timestamp.
 
@@ -5074,38 +5223,85 @@ def merge_session_messages_append_only(
     state_messages: list,
     *,
     truncation_watermark=None,
+    truncation_boundary=None,
 ) -> list:
-    """Merge sidecar/context and state.db messages without deleting local rows."""
+    """Merge sidecar/context and state.db messages without deleting local rows.
+
+    ``truncation_boundary``: the original truncate cutoff — the
+    timestamp of the last message kept by the truncate operation.  When the
+    watermark is later advanced (new turn committed), this boundary is preserved
+    so the empty-sidecar recovery can distinguish a legitimate prefix from a
+    deleted suffix instead of guessing by dropping one turn pair.
+    """
     sidecar_messages = list(sidecar_messages or [])
     state_messages = list(state_messages or [])
     watermark_timestamp = _message_timestamp_as_float({"timestamp": truncation_watermark})
     if not state_messages:
         return sidecar_messages
     if not sidecar_messages:
-        if watermark_timestamp is not None:
-            filtered = [
-                msg for msg in state_messages
-                if (
-                    (timestamp := _message_timestamp_as_float(msg)) is not None
-                    and timestamp <= watermark_timestamp
-                )
-            ]
-        else:
+        if watermark_timestamp is None:
+            # No watermark — keep everything, just dedup.
             filtered = state_messages
+        elif watermark_timestamp == 0:
+            # Truncate-to-empty sentinel (#2914) — block all replay.
+            return []
+        else:
+            # Positive watermark after edit/retry/undo (#4767).  Without a
+            # sidecar there's no seen_content_keys to check against, so we
+            # reconstruct the correct transcript from state.db alone.
+            #
+            # `at_or_after` (ts >= watermark) is legitimate POST-EDIT content
+            # ONLY when the watermark was ADVANCED strictly past the original
+            # truncate cutoff — i.e. a new turn was committed after the edit, so
+            # truncation_boundary (the original cutoff) is strictly below the
+            # advanced watermark.  In that state we keep the legitimate prefix
+            # (ts <= boundary) plus the post-edit tail (ts >= watermark) and drop
+            # the deleted (boundary, watermark) suffix.
+            #
+            # In every OTHER state the content above the watermark is the deleted
+            # suffix, NOT post-edit content, so keeping it would resurrect deleted
+            # turns (the exact data-loss this fix exists to kill):
+            #   * boundary == watermark — just truncated, no new turn committed
+            #     yet (e.g. crash/cold-load with metadata-vs-sidecar divergence);
+            #   * boundary is None — legacy session saved before this field
+            #     existed.  In the pre-#4767 model committing a turn CLEARED the
+            #     watermark to None, so a persisted positive watermark always
+            #     meant "frozen at cutoff, not advanced".
+            # For all of those, fall back to the conservative pre-#4767 filter
+            # `ts <= watermark`, which never resurrects a deleted suffix.
+            boundary_ts = _message_timestamp_as_float({"timestamp": truncation_boundary})
+            if boundary_ts is not None and boundary_ts < watermark_timestamp:
+                pre_legitimate = [
+                    m for m in state_messages
+                    if (ts := _message_timestamp_as_float(m)) is not None
+                    and ts <= boundary_ts
+                ]
+                at_or_after = [
+                    m for m in state_messages
+                    if (ts := _message_timestamp_as_float(m)) is not None
+                    and ts >= watermark_timestamp
+                ]
+                filtered = pre_legitimate + at_or_after
+            else:
+                filtered = [
+                    m for m in state_messages
+                    if (ts := _message_timestamp_as_float(m)) is not None
+                    and ts <= watermark_timestamp
+                ]
+
         # Deduplicate true duplicates (same role, content, exact timestamp)
         # without collapsing legitimately-repeated identical turns (#3346).
-        # Note: rows whose timestamps were mutated by compaction/recovery to
-        # microsecond-different values will not be folded — only byte-identical
-        # timestamps are treated as the same message.  This is intentional;
-        # collapsing same-second distinct turns would be worse than retaining
-        # a compaction-restamped duplicate.
         seen = set()
+        seen_messages = {}
         deduped = []
         for msg in filtered:
             key = _session_message_dedup_key(msg)
             if key not in seen:
                 seen.add(key)
+                seen_messages[key] = msg
                 deduped.append(msg)
+            else:
+                _merge_session_display_metadata(seen_messages.get(key), msg)
         return deduped
 
     merged_messages = []
@@ -5114,9 +5310,21 @@ def merge_session_messages_append_only(
     seen_content_keys = set()
     seen_visible_keys = set()
     sidecar_visible_sequence = []
+    sidecar_visible_messages = []
     sidecar_visible_keys = set()
     sidecar_visible_counts = {}
+    merged_by_message_key = {}
+    merged_by_dedup_key = {}
+    merged_by_visible_key = {}
     max_sidecar_timestamp = None
+
+    def _remember_merged_message(message):
+        if not isinstance(message, dict):
+            return
+        merged_by_message_key.setdefault(_session_message_merge_key(message), message)
+        merged_by_dedup_key.setdefault(_session_message_dedup_key(message), message)
+        merged_by_visible_key.setdefault(_session_message_visible_key(message), message)
+
     for msg in sidecar_messages:
         timestamp = _message_timestamp_as_float(msg)
         if timestamp is not None:
@@ -5130,25 +5338,42 @@ def merge_session_messages_append_only(
         sidecar_visible_keys.add(visible_key)
         sidecar_visible_counts[visible_key] = sidecar_visible_counts.get(visible_key, 0) + 1
         sidecar_visible_sequence.append(visible_key)
+        sidecar_visible_messages.append(msg)
         merged_messages.append(msg)
+        _remember_merged_message(msg)
     if _sidecar_has_terminal_partial_error(sidecar_messages):
         return merged_messages
     sidecar_visible_lookup = _build_visible_duplicate_lookup(sidecar_visible_keys)
     state_replay_idx = 0
     skipped_state_visible_counts = {}
+    # Loop-invariant: a session whose original truncate cutoff (truncation_boundary)
+    # is strictly below the watermark is genuinely ADVANCED (a new turn was
+    # committed after the edit). In that state post-watermark state.db rows are
+    # legitimate post-edit content, even when the sidecar's newest row only
+    # EQUALS the watermark (the post-edit user is checkpointed but its assistant
+    # reply exists only in state.db). Conservative for boundary None / == watermark.
+    boundary_ts = _message_timestamp_as_float({"timestamp": truncation_boundary})
+    watermark_advanced_by_boundary = (
+        watermark_timestamp is not None
+        and boundary_ts is not None
+        and boundary_ts < watermark_timestamp
+    )
     for msg in state_messages:
         timestamp = _message_timestamp_as_float(msg)
         key = _session_message_merge_key(msg)
         visible_key = _session_message_visible_key(msg)
         replays_sidecar_prefix = False
+        replay_target = None
         if state_replay_idx < len(sidecar_visible_sequence):
             expected_visible_key = sidecar_visible_sequence[state_replay_idx]
             if visible_key == expected_visible_key or _has_visible_duplicate(
                 visible_key, {expected_visible_key}
             ):
                 replays_sidecar_prefix = True
+                replay_target = sidecar_visible_messages[state_replay_idx]
                 state_replay_idx += 1
         if replays_sidecar_prefix:
+            _merge_session_display_metadata(replay_target, msg)
             matched_visible_key = _matching_visible_duplicate(
                 visible_key,
                 sidecar_visible_keys,
@@ -5169,10 +5394,33 @@ def merge_session_messages_append_only(
         # rows once the session moves forward past the edit boundary. Once the
         # sidecar's own max timestamp is beyond the watermark (the session has
         # advanced), allow state rows newer than the sidecar tail to merge.
+        #
+        # The sidecar's max timestamp can also EQUAL the watermark when the new
+        # post-edit USER turn has been checkpointed into the sidecar (its
+        # timestamp == the advanced watermark) but its ASSISTANT reply exists
+        # only in state.db (recovery before the sidecar tail advances). In that
+        # state truncation_boundary < watermark proves the session is genuinely
+        # advanced, so the post-watermark state-only reply is legitimate
+        # post-edit content and must merge through (not be dropped as a replaced
+        # tail). The conservative skip still applies for boundary is None and
+        # boundary == watermark (not-advanced / legacy).
+        #
+        # CRITICAL: the boundary-advanced signal may only bypass the skip AFTER
+        # state replay has consumed the sidecar's visible checkpoint
+        # (state_replay_idx >= len(sidecar_visible_sequence)). A deleted suffix
+        # row with ts > watermark that appears in state.db BEFORE the edited
+        # checkpoint must still be skipped — otherwise the advanced signal would
+        # resurrect it. The sidecar-max-timestamp signal needs no such gate (a
+        # sidecar tail beyond the watermark is itself proof the checkpoint has
+        # advanced).
+        checkpoint_consumed = state_replay_idx >= len(sidecar_visible_sequence)
         sidecar_advanced_past_watermark = (
             watermark_timestamp is not None
-            and max_sidecar_timestamp is not None
-            and max_sidecar_timestamp > watermark_timestamp
+            and (
+                (max_sidecar_timestamp is not None
+                 and max_sidecar_timestamp > watermark_timestamp)
+                or (watermark_advanced_by_boundary and checkpoint_consumed)
+            )
         )
         if (
             watermark_timestamp is not None
@@ -5199,6 +5447,25 @@ def merge_session_messages_append_only(
             and _session_message_content_key(msg) not in seen_content_keys
         ):
             continue
+        # Same-second edit: if timestamp equals the watermark and the message
+        # content is not in the sidecar, it's a replaced message edited at the
+        # same second — skip it.  The edited version (same timestamp, different
+        # content) is in the sidecar and survives this check.
+        #
+        # Only apply the same-second guard to user messages.  An assistant reply
+        # (or tool message) at the same second as the watermark is a legitimate
+        # post-edit recovery row — the sidecar holds only the edited user
+        # checkpoint, so the assistant reply's content won't be in it and would
+        # be silently dropped without this role guard.
+        if (
+            watermark_timestamp is not None
+            and timestamp is not None
+            and timestamp == watermark_timestamp
+            and key not in seen_message_keys
+            and _session_message_content_key(msg) not in seen_content_keys
+            and str(msg.get("role", "")).lower() == "user"
+        ):
+            continue
         # Check for true duplicates using full-precision timestamp (#3346).
         # Must run before the merge-key guards so that legitimately distinct
         # sub-second messages with the same second-level merge key are not
@@ -5206,6 +5473,7 @@ def merge_session_messages_append_only(
         # not.
         dedup_key = _session_message_dedup_key(msg)
         if dedup_key in seen_dedup_keys:
+            _merge_session_display_metadata(merged_by_dedup_key.get(dedup_key), msg)
             continue
         if max_sidecar_timestamp is not None and timestamp is not None and timestamp <= max_sidecar_timestamp:
             # For message_id keys the merge key is authoritative — skip if
@@ -5213,6 +5481,7 @@ def merge_session_messages_append_only(
             # handled true duplicates; same-second distinct messages must
             # fall through.
             if key in seen_message_keys and key[0] == "message_id":
+                _merge_session_display_metadata(merged_by_message_key.get(key), msg)
                 continue
             if not (isinstance(key, tuple) and key[:1] == ("message_id",)):
                 # Legacy key within sidecar timestamp range — only skip if
@@ -5221,8 +5490,10 @@ def merge_session_messages_append_only(
                 # identical content/timestamp, so an unchecked continue here
                 # would drop legitimately distinct turns.  (#3346 / PR #3665)
                 if key in seen_message_keys:
+                    _merge_session_display_metadata(merged_by_message_key.get(key), msg)
                     continue
         if key in seen_message_keys and key[0] == "message_id":
+            _merge_session_display_metadata(merged_by_message_key.get(key), msg)
             continue
         matched_visible_key = _matching_visible_duplicate(
             visible_key,
@@ -5234,6 +5505,7 @@ def merge_session_messages_append_only(
             sidecar_count = sidecar_visible_counts.get(matched_visible_key, 0)
             if skipped_count < sidecar_count:
                 skipped_state_visible_counts[matched_visible_key] = skipped_count + 1
+                _merge_session_display_metadata(merged_by_visible_key.get(matched_visible_key), msg)
                 continue
         # State rows at or before the newest sidecar timestamp are normally
         # assumed to have already been observed by the sidecar. The <= gate
@@ -5251,32 +5523,56 @@ def merge_session_messages_append_only(
             and timestamp is not None
             and timestamp <= max_sidecar_timestamp
         ):
-            # Legacy key within sidecar timestamp range.  Normally skip — the
-            # sidecar already has this message.  Exception: if the state.db
-            # message has tool_calls that DIFFER from the sidecar version
-            # (same content_key but different dedup_key because tool_calls
-            # differ), preserve it — distinct tool_calls must not be collapsed.
-            _tc = msg.get("tool_calls")
-            if _tc:
-                _ck = _session_message_content_key(msg)
-                if _ck in seen_content_keys and dedup_key not in seen_dedup_keys:
-                    pass  # different tool_calls from sidecar — preserve
-                else:
-                    continue
+            # When a truncation watermark is active and the sidecar holds only
+            # the edited user checkpoint, state.db may contain an assistant/tool
+            # reply at the same timestamp that is NOT in the sidecar.  This
+            # block would normally skip it ("sidecar already has this message"),
+            # but the sidecar doesn't — it's a genuine state-only recovery row.
+            # Let it through (CORE-B, #4767).
+            #
+            # Only AFTER the sidecar's visible checkpoint has been consumed
+            # (checkpoint_consumed) — a same-second row appearing in state.db
+            # BEFORE the edited user replay is a deleted/replaced row, not the
+            # post-edit reply, and must stay skipped.
+            if (
+                watermark_timestamp is not None
+                and timestamp == watermark_timestamp
+                and checkpoint_consumed
+                and str(msg.get("role", "")).lower() != "user"
+                and _session_message_content_key(msg) not in seen_content_keys
+            ):
+                pass  # fall through to append below
             else:
-                if msg.get("role") == "user" and _session_message_content_key(msg) not in seen_content_keys:
-                    if _insert_state_message_chronologically(merged_messages, msg):
-                        seen_message_keys.add(key)
-                        seen_dedup_keys.add(dedup_key)
-                        seen_content_keys.add(_session_message_content_key(msg))
-                        seen_visible_keys.add(visible_key)
+                # Legacy key within sidecar timestamp range.  Normally skip — the
+                # sidecar already has this message.  Exception: if the state.db
+                # message has tool_calls that DIFFER from the sidecar version
+                # (same content_key but different dedup_key because tool_calls
+                # differ), preserve it — distinct tool_calls must not be collapsed.
+                _tc = msg.get("tool_calls")
+                if _tc:
+                    _ck = _session_message_content_key(msg)
+                    if _ck in seen_content_keys and dedup_key not in seen_dedup_keys:
+                        pass  # different tool_calls from sidecar — preserve
+                    else:
+                        _merge_session_display_metadata(merged_by_message_key.get(key), msg)
+                        continue
+                else:
+                    if msg.get("role") == "user" and _session_message_content_key(msg) not in seen_content_keys:
+                        if _insert_state_message_chronologically(merged_messages, msg):
+                            seen_message_keys.add(key)
+                            seen_dedup_keys.add(dedup_key)
+                            seen_content_keys.add(_session_message_content_key(msg))
+                            seen_visible_keys.add(visible_key)
+                            _remember_merged_message(msg)
+                        continue
+                    _merge_session_display_metadata(merged_by_message_key.get(key), msg)
                     continue
-                continue
         seen_message_keys.add(key)
         seen_dedup_keys.add(dedup_key)
         seen_content_keys.add(_session_message_content_key(msg))
         seen_visible_keys.add(visible_key)
         merged_messages.append(msg)
+        _remember_merged_message(msg)
     return merged_messages
 
 
@@ -5321,6 +5617,7 @@ def reconciled_state_db_messages_for_session(
         local_messages,
         state_messages,
         truncation_watermark=getattr(session, "truncation_watermark", None),
+        truncation_boundary=getattr(session, "truncation_boundary", None),
     )
 
 

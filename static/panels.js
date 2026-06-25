@@ -1312,6 +1312,17 @@ function cancelCronForm(){
   _clearCronDetail();
 }
 
+function _cronModelBareName(model, provider) {
+  // Strip @provider: prefix from a model value when provider is stored separately.
+  // The model dropdown may contain values like "@custom:9router:chat" (from
+  // _apply_provider_prefix) but cron jobs store model and provider separately,
+  // so the model should be just "chat".
+  if (model && provider && model.startsWith('@' + provider + ':')) {
+    return model.slice(('@' + provider + ':').length);
+  }
+  return model;
+}
+
 async function saveCronForm(){
   const nameEl=$('cronFormName');
   const schEl=$('cronFormSchedule');
@@ -1346,7 +1357,7 @@ async function saveCronForm(){
           const modelState = (typeof _modelStateForSelect === 'function')
             ? _modelStateForSelect(modelEl, selectedModel)
             : { model: selectedModel, model_provider: null };
-          updates.model = modelState.model || null;
+          updates.model = _cronModelBareName(modelState.model, modelState.model_provider) || null;
           updates.provider = modelState.model_provider || null;
         } else if (modelLoaded) {
           updates.model = null;
@@ -1373,11 +1384,11 @@ async function saveCronForm(){
         const modelState = (typeof _modelStateForSelect === 'function')
           ? _modelStateForSelect(modelEl, selectedModel)
           : { model: selectedModel, model_provider: null };
-        body.model = modelState.model || null;
+        body.model = _cronModelBareName(modelState.model, modelState.model_provider) || null;
         body.provider = modelState.model_provider || null;
       }
     } else if (_cronIsDuplicate && _cronPreFormDetail && _cronPreFormDetail.model) {
-      body.model = _cronPreFormDetail.model;
+      body.model = _cronModelBareName(_cronPreFormDetail.model, _cronPreFormDetail.provider) || null;
       body.provider = _cronPreFormDetail.provider || null;
     }
     const res = await api('/api/crons/create',{method:'POST',body:JSON.stringify(body)});
@@ -6450,6 +6461,7 @@ let _settingsThemeOnOpen = null; // track theme at open time for discard revert
 let _settingsSkinOnOpen = null; // track skin at open time for discard revert
 let _settingsFontSizeOnOpen = null; // track font size at open time for discard revert
 let _settingsHermesDefaultModelOnOpen = '';
+let _settingsHermesDefaultModelProviderOnOpen = null;
 let _settingsSection = 'conversation';
 let _currentSettingsSection = 'conversation';
 let _settingsIndex = null;
@@ -7364,7 +7376,15 @@ async function _autosavePreferencesSettings(payload){
     const pwField=$('settingsPassword');
     const pwDirty=!!(pwField&&pwField.value);
     const modelSel=$('settingsModel');
-    const modelDirty=!!(modelSel&&((modelSel.value||'')!==(_settingsHermesDefaultModelOnOpen||'')));
+    const modelState=(typeof _captureModelDropdownSelection==='function'&&modelSel)
+      ? (_captureModelDropdownSelection(modelSel)||{model:String((modelSel&&modelSel.value)||''),model_provider:null})
+      : {model:String((modelSel&&modelSel.value)||''),model_provider:null};
+    const modelDirty=!!(
+      modelSel&&(
+        (modelState.model||'')!==(_settingsHermesDefaultModelOnOpen||'')||
+        ((modelState.model_provider||null)!==(_settingsHermesDefaultModelProviderOnOpen||null))
+      )
+    );
     if(!pwDirty&&!modelDirty){
       _settingsDirty=false;
       const bar=$('settingsUnsavedBar');
@@ -7582,6 +7602,7 @@ async function loadSettingsPanel(){
         }
       }catch(e){}
       _settingsHermesDefaultModelOnOpen=(models&&models.default_model)||'';
+      _settingsHermesDefaultModelProviderOnOpen=(models&&models.active_provider)||null;
       // Use the smart matcher so a saved bare form like "anthropic/claude-opus-4.6"
       // (what the CLI's `hermes model` command writes) still selects the matching
       // `@nous:anthropic/claude-opus-4.6` option on a Nous setup. Without this, the
@@ -8232,6 +8253,32 @@ async function handlePluginEnableToggle(pluginKey, checked){
   }
 }
 
+function _pluginActivationState(plugin){
+  const activation=(plugin&&typeof plugin.activation==='string')
+    ? plugin.activation
+    : (plugin&&plugin.enabled===false ? 'disabled' : 'enabled');
+  // Mirror _buildPluginCard's isProviderActive precedence: an explicit
+  // is_active_provider===true overrides the activation string so the sort
+  // bucket always matches the badge.
+  if(plugin&&plugin.is_active_provider===true) return 'provider';
+  if(activation==='exclusive'||activation==='provider'){
+    if(plugin&&plugin.is_active_provider===false) return 'disabled';
+    return 'provider';
+  }
+  if(activation==='enabled') return 'enabled';
+  return 'disabled';
+}
+
+function _partitionPluginsActiveFirst(plugins){
+  const active=[];
+  const inactive=[];
+  for(const p of plugins){
+    if(_pluginActivationState(p)==='disabled') inactive.push(p);
+    else active.push(p);
+  }
+  return active.concat(inactive);
+}
+
 async function loadPluginsPanel(){
   const list=$('pluginsList');
   const empty=$('pluginsEmpty');
@@ -8250,7 +8297,7 @@ async function loadPluginsPanel(){
     }
     if(empty) empty.style.display='none';
     list.style.display='';
-    for(const plugin of plugins){
+    for(const plugin of _partitionPluginsActiveFirst(plugins)){
       list.appendChild(_buildPluginCard(plugin));
     }
   }catch(e){
@@ -9220,8 +9267,10 @@ function _applySavedSettingsUi(saved, body, opts){
   const bar=$('settingsUnsavedBar');
   if(bar) bar.style.display='none';
   _settingsHermesDefaultModelOnOpen=body.default_model||_settingsHermesDefaultModelOnOpen||'';
+  if(Object.prototype.hasOwnProperty.call(body,'default_model_provider')) _settingsHermesDefaultModelProviderOnOpen=body.default_model_provider||null;
   // Sync window._defaultModel so newSession() uses the just-saved default without a reload (#908).
   if(body.default_model) window._defaultModel=body.default_model;
+  if(Object.prototype.hasOwnProperty.call(body,'default_model_provider')) window._activeProvider=body.default_model_provider||null;
   if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
   renderMessages();
   if(typeof syncTopbar==='function') syncTopbar();
@@ -9696,7 +9745,10 @@ async function _applyAuxModels(){
 
 async function saveSettings(andClose){
   const model=($('settingsModel')||{}).value;
-  const modelChanged=(model||'')!==(_settingsHermesDefaultModelOnOpen||'');
+  const modelState=(typeof _captureModelDropdownSelection==='function'&&$('settingsModel'))
+    ? (_captureModelDropdownSelection($('settingsModel'))||{model:String(model||''),model_provider:null})
+    : {model:String(model||''),model_provider:null};
+  const modelChanged=(model||'')!==(_settingsHermesDefaultModelOnOpen||'')||((modelState.model_provider||null)!==(_settingsHermesDefaultModelProviderOnOpen||null));
   const sendKey=($('settingsSendKey')||{}).value;
   const showTokenUsage=!!($('settingsShowTokenUsage')||{}).checked;
   const showQuotaChip=!!($('settingsShowQuotaChip')||{}).checked;
@@ -9769,8 +9821,9 @@ async function saveSettings(andClose){
       const saved=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
       if(modelChanged && model){
         try{
-          await api('/api/default-model',{method:'POST',body:JSON.stringify({model})});
+          await api('/api/default-model',{method:'POST',body:JSON.stringify({model,provider:modelState.model_provider||null})});
           body.default_model=model;
+          body.default_model_provider=(modelState&&modelState.model===model)?(modelState.model_provider||null):null;
         }catch(_modelErr){
           if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
         }
@@ -9798,8 +9851,9 @@ async function saveSettings(andClose){
     const saved=await api('/api/settings',{method:'POST',body:JSON.stringify(body)});
     if(modelChanged && model){
       try{
-        await api('/api/default-model',{method:'POST',body:JSON.stringify({model})});
+        await api('/api/default-model',{method:'POST',body:JSON.stringify({model,provider:modelState.model_provider||null})});
         body.default_model=model;
+        body.default_model_provider=(modelState&&modelState.model===model)?(modelState.model_provider||null):null;
       }catch(_modelErr){
         if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
       }

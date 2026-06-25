@@ -427,6 +427,20 @@ def test_live_anchor_scene_removes_legacy_interim_collapse_toggle():
     assert guard_idx < remove_idx < legacy_create_idx
 
 
+def test_recycled_assistant_turn_clears_live_anchor_attrs_before_role_refresh():
+    reset_attrs = UI_JS[UI_JS.index("const _recycleResetAttrs="):UI_JS.index("let _scrollbarDragActive=false;")]
+    assert "data-anchor-scene-live-owner" in reset_attrs
+    assert "data-anchor-stream-id" in reset_attrs
+    assert "data-live-assistant-turn" in reset_attrs
+
+    recycle = _function_body(UI_JS, "renderMessages")
+    recycle = recycle[recycle.index("if(!currentAssistantTurn){"):]
+
+    loop_idx = recycle.index("for(const attr of _recycleResetAttrs) recycled.removeAttribute(attr);")
+    refresh_idx = recycle.index("if(role) role.outerHTML=_assistantRoleHtml(tsTitle, isTpsDisplayEnabled()?_formatTurnTps(m._turnTps):'');")
+    assert loop_idx < refresh_idx
+
+
 def test_tool_scene_rows_coalesce_by_logical_tool_call_identity():
     rows = _function_body(UI_JS, "_anchorSceneRowsForRendering")
     key = _function_body(UI_JS, "_anchorSceneToolRowLogicalKey")
@@ -695,9 +709,10 @@ def test_settled_anchor_scene_persists_the_full_assistant_turn_not_only_tail():
     assert "messages.slice(turnStart+1,lastAsstIndex+1)" in complete
     assert "message.reasoning||message._reasoning||message.reasoning_content||message.thinking" in reasoning_text
     assert "const reasoning=_anchorSceneMessageReasoningText(message);" in rows_by_message
-    assert "const toolCalls=Array.isArray(S.toolCalls)?S.toolCalls:[]" in rows_by_message
-    assert "idx<=turnStart||idx>=lastAsstIndex" in rows_by_message
-    assert "add(idx,_anchorSceneToolRowFromCall(tool,order++,idx));" in rows_by_message
+    assert "const toolsByIdx=new Map();" in rows_by_message
+    assert "if(S.toolCalls) for(const tc of S.toolCalls){" in rows_by_message
+    assert "for(const tool of (toolsByIdx.get(idx)||[]))" in rows_by_message
+    assert "_anchorSceneToolRowFromCall(tool,0,idx)" in rows_by_message
 
 
 def test_settled_anchor_scene_preserves_live_projected_order_before_backfill():

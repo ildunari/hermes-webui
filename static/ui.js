@@ -438,6 +438,14 @@ let _messageVirtualScrollSettleTimer=0;
 let _messageVirtualDeferredMeasurement=null;
 let _msgNodeRecycleEnabled=false;
 const _recycleStash=new Map();
+const _recycleResetAttrs=[
+  'data-transparent-turn-collapsed',
+  'data-transparent-turn-toggle-bound',
+  'data-anchor-scene-live-owner',
+  'data-anchor-stream-id',
+  // Defensive reset for legacy/restored shells that may still carry the fallback live-turn marker.
+  'data-live-assistant-turn',
+];
 let _scrollbarDragActive=false;
 function _markMessageVirtualScrollActive(){
   _messageVirtualScrollActive=true;
@@ -2008,6 +2016,8 @@ function _persistSessionModelCorrection(model, provider, opts){
   });
   return opts&&opts.propagateErrors ? request : request.catch(()=>{});
 }
+let _modelDropdownRequestSeq=0;
+
 function _applySessionModelFallback(sel){
   if(!sel) return null;
   const configuredDefault=String(window._defaultModel||'').trim();
@@ -2030,10 +2040,16 @@ function _applySessionModelFallback(sel){
 async function populateModelDropdown(opts={}){
   const sel=$('modelSelect');
   if(!sel) return;
+  if(typeof _modelDropdownRequestSeq!=='number') _modelDropdownRequestSeq=0;
+  const requestSeq=++_modelDropdownRequestSeq;
   try{
-    const _modelsRes=await fetch(new URL('api/models',document.baseURI||location.href).href,{credentials:'include'});
+    const modelsUrl=new URL('api/models',document.baseURI||location.href);
+    if(opts&&opts.freshness) modelsUrl.searchParams.set('freshness',opts.freshness);
+    const _modelsRes=await fetch(modelsUrl.href,{credentials:'include'});
+    if(requestSeq!==_modelDropdownRequestSeq) return;
     if(_redirectIfUnauth(_modelsRes)) return;
     const data=await _modelsRes.json();
+    if(requestSeq!==_modelDropdownRequestSeq) return;
     // Store active provider globally so the send path can warn on mismatch
     window._activeProvider=data.active_provider||null;
     // Store default model so newSession() can apply it (#872).
@@ -2128,8 +2144,9 @@ async function populateModelDropdown(opts={}){
     }
     // Kick off a background live-model fetch for the active provider.
     // This runs after the static list is already shown (no blocking flicker).
-    if(data.active_provider) _fetchLiveModels(data.active_provider, sel);
+    if(data.active_provider) _fetchLiveModels(data.active_provider, sel, requestSeq);
   }catch(e){
+    if(requestSeq!==_modelDropdownRequestSeq) return;
     // API unavailable -- keep the hardcoded HTML options as fallback
     console.warn('Failed to load models from server:',e.message);
     if(typeof syncModelChip==='function') syncModelChip();
@@ -2219,10 +2236,12 @@ function _addLiveModelsToSelect(provider, models, sel){
   return added;
 }
 
-async function _fetchLiveModels(provider, sel){
+async function _fetchLiveModels(provider, sel, requestSeq=null){
   if(!provider||!sel) return;
+  if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
   // Already fetched — apply cached models to this select element (#872)
   if(_liveModelCache[provider]){
+    if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
     const added=_addLiveModelsToSelect(provider,_liveModelCache[provider],sel);
     if(added>0 && typeof syncModelChip==='function') syncModelChip();
     return;
@@ -2232,10 +2251,13 @@ async function _fetchLiveModels(provider, sel){
     const url=new URL('api/models/live',document.baseURI||location.href);
     url.searchParams.set('provider',provider);
     const _liveRes=await fetch(url.href,{credentials:'include'});
+    if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
     if(_redirectIfUnauth(_liveRes)) return;
     const data=await _liveRes.json();
+    if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
     if(!data.models||!data.models.length) return;
     _liveModelCache[provider]=data.models;
+    if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
     const added=_addLiveModelsToSelect(provider,data.models,sel);
     if(added>0){
       if(typeof syncModelChip==='function') syncModelChip();
@@ -3688,6 +3710,7 @@ let _programmaticScrollResetTimer=0;
 function _deferClearProgrammaticScroll(ms){clearTimeout(_programmaticScrollResetTimer);_programmaticScrollResetTimer=setTimeout(()=>{_programmaticScroll=false;},ms||80);}
 let _nearBottomCount=0;
 let _lastScrollTop=null;
+let _lastMessageClientHeight=null;   // #4702: track scroller height to ignore iOS portrait toolbar-settle reflows (a clientHeight increase fires a scroll event with decreased scrollTop that is NOT a user scroll)
 // Sticky-unpin model (#3343 supersedes #3330's proximity re-pin): once the user
 // scrolls up, streaming stops auto-following until they return to the bottom or
 // click ↓. The upward-intent TIMEOUT mechanism (_lastMessageUpwardIntentMs /
@@ -3824,6 +3847,7 @@ if(typeof document!=='undefined'){
 function _resetScrollDirectionTracker(){
   _clearNewMessageScrollCue();
   _lastScrollTop=null;
+  _lastMessageClientHeight=null;
   _messageUserUnpinned=false;
   _scrollPinned=true;
   _nearBottomCount=0;
@@ -3918,7 +3942,7 @@ if(typeof window!=='undefined'){
   const el=document.getElementById('messages');
   if(!el) return;
   el.addEventListener('pointerdown',(e)=>{
-    if(e.offsetX>=el.clientWidth) _scrollbarDragActive=true;
+    if(e.target===el&&e.offsetX>=el.clientWidth) _scrollbarDragActive=true;
   },{passive:true});
   window.addEventListener('pointerup',()=>{
     if(!_scrollbarDragActive) return;
@@ -3945,7 +3969,17 @@ if(typeof window!=='undefined'){
       const top=el.scrollTop;
       const bottomDistance=el.scrollHeight-top-el.clientHeight;
       const nearBottom=bottomDistance<250;
-      const movedUp=_lastScrollTop!==null&&top<_lastScrollTop-2;
+      // #4702: iOS Safari (esp. portrait) resolves its dynamic toolbar height
+      // AFTER first paint. When the toolbar collapses the scroller GROWS
+      // (clientHeight increases), which fires a scroll event with a DECREASED
+      // scrollTop even though the user never scrolled. Without this guard that
+      // reflow is misread as an upward scroll and falsely unpins a freshly-opened
+      // session, stranding portrait readers at the top (sibling: #4701). On
+      // desktop/landscape the scroller height is stable, so `grew` is always
+      // false and behavior is byte-identical.
+      const grew=_lastMessageClientHeight!==null&&el.clientHeight>_lastMessageClientHeight+1;
+      _lastMessageClientHeight=el.clientHeight;
+      const movedUp=!grew&&_lastScrollTop!==null&&top<_lastScrollTop-2;
       const movedDown=_lastScrollTop!==null&&top>_lastScrollTop+2;
       _lastScrollTop=top;
       if(movedUp){
@@ -4438,7 +4472,7 @@ function _setMessageScrollToBottom(){
   if(!el) return;
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
   el.scrollTop=el.scrollHeight;
-  _lastScrollTop=el.scrollTop;
+  _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
   _nearBottomCount=2;
   _scrollPinned=true;
   requestAnimationFrame(()=>{
@@ -4453,7 +4487,7 @@ function _setMessageScrollToBottom(){
       return;
     }
     el.scrollTop=el.scrollHeight;
-    _lastScrollTop=el.scrollTop;
+    _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
     _nearBottomCount=2;
     _scrollPinned=true;
     _deferClearProgrammaticScroll();
@@ -4546,6 +4580,12 @@ function _settleMessageScrollToBottom(force, explicit){
   });
   _settleRO=ro;
   ro.observe(observed);
+  // #4702: for an explicit (user/open) settle, also observe the SCROLLER itself.
+  // On iOS the transcript content (#msgInner) may not resize, but the scroller
+  // grows when the portrait toolbar collapses after first paint — observing both
+  // re-anchors the bottom after that late viewport settle. Desktop never resizes
+  // here, so this is a no-op off-mobile.
+  if(explicit&&observed!==el){ try{ ro.observe(el); }catch(_){ } }
 
   // Static-content safety net: a fully-static response (no Prism/KaTeX/Mermaid/
   // late images) never resizes after the initial sync write, so the
@@ -4572,7 +4612,7 @@ function _settleFinalScroll(token){
   }
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
   el.scrollTop=el.scrollHeight;
-  _lastScrollTop=el.scrollTop;
+  _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
   _nearBottomCount=2;
   _scrollPinned=true;
   _deferClearProgrammaticScroll();
@@ -7941,8 +7981,8 @@ function _isRecoveryControlMessageText(text){
   const normalized=String(text||'').replace(/\s+/g,' ').trim();
   if(!normalized) return false;
   const systemRecovery=/^\[System:/i.test(normalized)
-    && /previous response was cut off by a network error/i.test(normalized)
-    && /continue exactly where you left off/i.test(normalized);
+    && (/continue exactly where you left off/i.test(normalized)
+      || /do not retry the same tool call/i.test(normalized));
   const backendRecovery=/^the live worker stopped before this run finished\.?$/i.test(normalized);
   return !!(systemRecovery || backendRecovery);
 }
@@ -10962,7 +11002,7 @@ function _restoreMessageScrollSnapshot(snapshot){
     el.scrollTop=Math.max(0,Math.min(Number(snapshot.top)||0,maxTop));
   }
   // Sync _lastScrollTop after programmatic restore so sticky-unpin does not false-trigger (#1731).
-  _lastScrollTop=el.scrollTop;
+  _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
   if(snapshot.userUnpinned===true){
     _messageUserUnpinned=true;
     _scrollPinned=false;
@@ -10988,6 +11028,23 @@ function _restoreMessageScrollSnapshot(snapshot){
     else requestAnimationFrame(()=>{ setTimeout(()=>{ _programmaticScroll=false; },0); });
   }
 }
+/**
+ * Mobile scroll-jank guard: temporarily disable overflow-anchor so
+ * Chromium cannot re-anchor to the topmost row during the innerHTML=''
+ * wipe-and-rebuild gap. The rAF callback restores CSS default afterward.
+ */
+window._fixMobileScrollJank=function _fixMobileScrollJank(){
+  const el=document.getElementById('messages');
+  if(!el) return;
+  // Desktop with a mouse: keep overflow-anchor:none (explicitly set by CSS).
+  // Mobile touch devices only: temporarily suppress anchor re-selection.
+  if(window.matchMedia('(hover:hover) and (pointer:fine)').matches) return;
+  el.style.overflowAnchor='none';
+  requestAnimationFrame(()=>{
+    if(el.style.overflowAnchor==='none') el.style.overflowAnchor='';
+  });
+};
+
 function _restoreMessageScrollSnapshotSameFrame(snapshot){
   const el=$('messages');
   if(!el||!snapshot) return;
@@ -11008,7 +11065,7 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
     _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
     el.scrollTop=Math.max(0,Math.min(target,maxTop));
   }
-  _lastScrollTop=el.scrollTop;
+  _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
   if(snapshot.pinned===true){
     _messageUserUnpinned=false;
     _scrollPinned=true;
@@ -11222,6 +11279,9 @@ function renderMessages(options){
       _recycleStash.set(Number(key), child);
     }
   }
+  // Mobile scroll-jank fix: temporarily disable overflow-anchor so Chromium
+  // cannot re-anchor to the topmost row during the DOM wipe-and-rebuild gap.
+  if(window._fixMobileScrollJank) window._fixMobileScrollJank();
   inner.innerHTML='';
   const compressionNode=compressionState?_compressionCardsNode(compressionState):null;
   const {message:referenceMessage, rawIdx:referenceMessageRawIdx}=_latestCompressionReferenceMessage(
@@ -11526,8 +11586,7 @@ function renderMessages(options){
       if(recycled){
         const blocks=_assistantTurnBlocks(recycled);
         if(blocks) blocks.innerHTML='';
-        recycled.removeAttribute('data-transparent-turn-collapsed');
-        recycled.removeAttribute('data-transparent-turn-toggle-bound');
+        for(const attr of _recycleResetAttrs) recycled.removeAttribute(attr);
         const role=recycled.querySelector('.msg-role.assistant');
         if(role) role.outerHTML=_assistantRoleHtml(tsTitle, isTpsDisplayEnabled()?_formatTurnTps(m._turnTps):'');
         currentAssistantTurn=recycled;
@@ -12839,9 +12898,21 @@ function _formatToolArgPreview(args){
   const out=parts.join(' · ');
   return out.length>180?`${out.slice(0,177)}…`:out;
 }
+function _toolResultOneLiner(preview){
+  if(!preview) return '';
+  const first=preview.split('\n').find(l=>l.trim())||'';
+  const trimmed=first.trim();
+  if(!trimmed) return '';
+  if(trimmed[0]==='{') return '';
+  if(trimmed[0]==='['){try{JSON.parse(trimmed);return '';}catch(e){/* not JSON */}}
+  return trimmed.length>180?trimmed.slice(0,177)+'…':trimmed;
+}
 function _toolCardPreviewText(tc, displaySnippet){
   const explicitPreview=String(tc&&tc.preview||'').trim();
   if(tc&&tc.done===false&&explicitPreview) return explicitPreview;
+  const resultSource=explicitPreview||String(tc&&tc.snippet||'').trim();
+  const resultLine=_toolResultOneLiner(resultSource);
+  if(tc&&tc.done!==false&&resultLine) return resultLine;
   const argPreview=_formatToolArgPreview(tc&&tc.args);
   if(argPreview) return argPreview;
   if(tc&&tc.done===false) return 'Running';
@@ -13560,15 +13631,12 @@ function initTreeViews(container){
     // Mark as initialised only after we've committed to a render decision
     wrap.setAttribute('data-tree-init','1');
     if(!parsed || typeof parsed!=='object'){
-      if(parseFailed){
-        const hint=wrap.querySelector('.tree-raw-view');
-        if(hint&&!hint.querySelector('.tree-parse-note')){
-          const note=document.createElement('div');
-          note.className='tree-parse-note';
-          note.textContent=t('parse_failed_note')||'parse failed';
-          hint.parentNode.insertBefore(note,hint.nextSibling);
-        }
-      }
+      // No tree view for non-object values or unparseable content. LLMs often
+      // emit JSON fragments (a bare "key": "val" line, snippets with ..., etc.)
+      // that legitimately fail JSON.parse; surfacing a "parse failed" note for
+      // those was pure noise. The block still renders as syntax-highlighted raw,
+      // so just fall through silently. (parseFailed is retained for clarity.)
+      void parseFailed;
       return; // leave as raw view
     }
     const lineCount=rawText.split('\n').length;
@@ -14699,8 +14767,58 @@ function renderFileTree(){
   _renderTreeItems(box, visibleEntries, 0);
 }
 
+let _wsActiveDragPath=null;
+let _wsActiveDragType=null;
+function _setWsDragData(e,item){
+  e.dataTransfer.setData('application/ws-path',item.path);
+  e.dataTransfer.setData('application/ws-type',item.type);
+  e.dataTransfer.setData('text/plain',item.path);
+  _wsActiveDragPath=item.path;
+  _wsActiveDragType=item.type;
+}
+function _clearWsDragData(){
+  _wsActiveDragPath=null;
+  _wsActiveDragType=null;
+}
+// Window-level fallback cleanup: if a workspace drag is abandoned without the
+// row's ondragend firing (drag cancelled, dropped outside any target, tab
+// blurred/hidden mid-drag), the active-drag flag must not survive — otherwise a
+// later FOREIGN text/plain drag could be misread as a workspace move.
+if(typeof window!=='undefined'&&!window._wsDragCleanupBound){
+  window._wsDragCleanupBound=true;
+  window.addEventListener('dragend',_clearWsDragData,true);
+  // Defer the drop cleanup a tick: this capture-phase window listener fires
+  // BEFORE the target element's ondrop, so clearing synchronously here would
+  // wipe _wsActiveDragPath before _isWorkspaceTreeMoveDrag()/_wsDragSrcPath()
+  // run in the target handler — re-breaking the macOS stripped-MIME move. The
+  // setTimeout lets the real drop handler complete, then clears the lingering flag.
+  window.addEventListener('drop',()=>setTimeout(_clearWsDragData,0),true);
+  window.addEventListener('pagehide',_clearWsDragData);
+  window.addEventListener('blur',_clearWsDragData);
+}
 function _isWorkspaceTreeMoveDrag(e){
-  return !!(e.dataTransfer&&e.dataTransfer.types&&e.dataTransfer.types.includes('application/ws-path')&&!e.dataTransfer.types.includes('Files'));
+  if(e.dataTransfer&&e.dataTransfer.types&&e.dataTransfer.types.includes('Files')) return false;
+  if(e.dataTransfer&&e.dataTransfer.types&&e.dataTransfer.types.includes('application/ws-path')) return true;
+  // Stripped-MIME (macOS WebKit) fallback: accept text/plain ONLY while a
+  // workspace drag is genuinely in flight. dragover/drop events can't read the
+  // payload, so gate on the active flag alone here; the drop handler additionally
+  // proves text/plain === _wsActiveDragPath before performing the move.
+  return !!(_wsActiveDragPath&&e.dataTransfer&&e.dataTransfer.types&&e.dataTransfer.types.includes('text/plain'));
+}
+function _wsDragSrcPath(e){
+  const custom=e.dataTransfer.getData('application/ws-path');
+  if(custom) return custom;
+  // Stripped-MIME fallback: only trust the active flag when the drop's own
+  // text/plain matches it. A foreign text/plain drag (different/empty content)
+  // must NOT resolve to our tracked workspace path even if the flag lingered.
+  const plain=e.dataTransfer.getData('text/plain')||'';
+  if(_wsActiveDragPath&&plain===_wsActiveDragPath) return _wsActiveDragPath;
+  return '';
+}
+function _wsDragSrcType(e){
+  const custom=e.dataTransfer.getData('application/ws-type');
+  if(custom) return custom;
+  return _wsActiveDragType||'file';
 }
 
 function _workspaceParentDir(relPath){
@@ -14786,10 +14904,14 @@ function _bindWorkspaceMoveDropTarget(el,destDir){
     if(!_isWorkspaceTreeMoveDrag(e))return;
     e.preventDefault();e.stopPropagation();
     el.classList.remove('drag-over');
-    const srcPath=e.dataTransfer.getData('application/ws-path');
-    if(!srcPath)return;
-    const srcType=e.dataTransfer.getData('application/ws-type');
-    await _performWorkspaceMove(srcPath,destDir,srcType==='dir');
+    try{
+      const srcPath=_wsDragSrcPath(e);
+      if(!srcPath)return;
+      const srcType=_wsDragSrcType(e);
+      await _performWorkspaceMove(srcPath,destDir,srcType==='dir');
+    }finally{
+      _clearWsDragData();
+    }
   };
 }
 
@@ -14811,8 +14933,8 @@ function _renderTreeItems(container, entries, depth){
       if(grant&&!isDirRow){e.preventDefault();e.stopPropagation();return;}
       e.preventDefault();e.stopPropagation();_showFileContextMenu(e,item);
     };
-    el.ondragstart=(e)=>{e.dataTransfer.setData('application/ws-path',item.path);e.dataTransfer.setData('application/ws-type',item.type);e.dataTransfer.effectAllowed='copy';el.classList.add('dragging');};
-    el.ondragend=()=>{el.classList.remove('dragging');_clearWorkspaceMoveDragOver();};
+    el.ondragstart=(e)=>{_setWsDragData(e,item);e.dataTransfer.effectAllowed='copy';el.classList.add('dragging');};
+    el.ondragend=()=>{el.classList.remove('dragging');_clearWorkspaceMoveDragOver();_clearWsDragData();};
 
     const isLk = item.type === 'symlink';
     const isExternalLink = isLk && item.target_outside_workspace;

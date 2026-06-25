@@ -431,6 +431,7 @@ def _visible_pinned_lineage_ids(session_rows) -> set[str]:
 from api.profiles import (  # noqa: F401, E402  (re-export)
     _profiles_match,
     _is_isolated_profile_mode,
+    _SKILLS_STATS_CACHE,
     get_active_profile_name,
     get_active_profile_name as _get_active_profile_name,
     get_active_hermes_home,
@@ -1243,6 +1244,52 @@ def _cron_jobs_for_api(jobs) -> list[dict]:
     return [_cron_job_for_api(job) for job in (jobs or [])]
 
 
+_AGENT_CRON_IMPORT_PATH_LOCK = threading.Lock()
+_AGENT_CRON_IMPORT_PATH_READY: str | None = None
+
+
+def _ensure_agent_cron_import_path() -> None:
+    """Prefer the agent's cron package over unrelated top-level cron packages."""
+    try:
+        from api import config as api_config
+    except Exception:
+        return
+
+    agent_dir = getattr(api_config, "_AGENT_DIR", None)
+    if not agent_dir:
+        return
+    agent_path = str(Path(agent_dir).expanduser().resolve())
+    agent_cron_path = str(Path(agent_path) / "cron")
+
+    global _AGENT_CRON_IMPORT_PATH_READY
+    with _AGENT_CRON_IMPORT_PATH_LOCK:
+        cron_mod = sys.modules.get("cron")
+        cron_file = str(getattr(cron_mod, "__file__", "") or "") if cron_mod else ""
+        cron_is_agent = bool(cron_mod is not None and cron_file.startswith(agent_cron_path + os.sep))
+        if _AGENT_CRON_IMPORT_PATH_READY == agent_path and (cron_mod is None or cron_is_agent):
+            return
+
+        while agent_path in sys.path:
+            sys.path.remove(agent_path)
+        shadow_indexes = [
+            idx
+            for idx, path_entry in enumerate(sys.path)
+            if path_entry
+            and Path(path_entry).resolve() != Path(agent_path)
+            and (Path(path_entry) / "cron" / "__init__.py").exists()
+        ]
+        if shadow_indexes:
+            sys.path.insert(min(shadow_indexes), agent_path)
+        else:
+            sys.path.append(agent_path)
+        _AGENT_CRON_IMPORT_PATH_READY = agent_path
+
+        if cron_mod is not None and not cron_is_agent:
+            for name in list(sys.modules):
+                if name == "cron" or name.startswith("cron."):
+                    sys.modules.pop(name, None)
+
+
 def _available_cron_profile_names() -> set[str]:
     from api.profiles import list_profiles_api
 
@@ -1572,6 +1619,16 @@ def _clear_live_models_cache() -> None:
 # ── /api/sessions response cache (hot-sidebar response) ──────────────────────
 
 _SESSIONS_CACHE_TTL_SECONDS = 2.5
+# #4808: while a turn is actively streaming the frontend polls /api/sessions on a
+# fixed cadence (static/sessions.js `_streamingPollMs` = 5000ms). With the idle TTL
+# of 2.5s, every streaming poll lands in a fresh window and forces a full
+# all_sessions() rebuild on the hot path under the global store LOCK — pinning CPU
+# and starving token rendering on large stores (recurrence of #4672). Hold the
+# sidebar cache steady for longer than one poll interval while streaming; live
+# runtime state (active stream, sort order, pending flags) is overlaid on every
+# response regardless of cache (_session_list_cache_overlay_runtime_rows), and
+# structural/settings changes still evict immediately via the source stamp.
+_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 10.0
 _SESSIONS_CACHE_MAX_ENTRIES = 64
 _SESSIONS_CACHE_WAIT_SECONDS = 0.25
 _SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
@@ -1630,7 +1687,12 @@ def _session_list_cache_get(
         if stamp != current_stamp:
             _SESSIONS_CACHE.pop(key, None)
             return None, False
-        fresh = (now - ts) < _SESSIONS_CACHE_TTL_SECONDS
+        # #4808: widen the freshness window while a turn is streaming so the fixed
+        # 5s streaming poll cadence doesn't force a full rebuild on every poll.
+        ttl = _SESSIONS_CACHE_TTL_SECONDS
+        if _session_list_cache_streaming_freeze_marker() is not None:
+            ttl = _SESSIONS_CACHE_STREAMING_TTL_SECONDS
+        fresh = (now - ts) < ttl
         if fresh:
             _SESSIONS_CACHE.move_to_end(key)
             return copy.deepcopy(payload), True
@@ -2331,6 +2393,7 @@ from api.config import (
     _resolve_cli_toolsets,
     _INDEX_HTML_PATH,
     get_available_models,
+    get_available_models_for_session_visit,
     _provider_is_known_or_configured,
     IMAGE_EXTS,
     MD_EXTS,
@@ -5997,6 +6060,7 @@ def _limited_webui_messages_for_display(session, state_db_messages) -> list:
         sidecar_messages,
         state_db_messages,
         truncation_watermark=getattr(session, "truncation_watermark", None),
+        truncation_boundary=getattr(session, "truncation_boundary", None),
     )
 
 
@@ -6055,6 +6119,7 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
             merged,
             getattr(segment, "messages", []) or [],
             truncation_watermark=getattr(segment, "truncation_watermark", None),
+            truncation_boundary=getattr(segment, "truncation_boundary", None),
         )
     return merge_session_messages_append_only(
         merged,
@@ -6081,6 +6146,7 @@ def _merged_session_messages_for_display(session, cli_messages=None) -> list:
                     sidecar_messages,
                     cli_messages,
                     truncation_watermark=getattr(session, "truncation_watermark", None),
+                    truncation_boundary=getattr(session, "truncation_boundary", None),
                 )
             merged_messages = []
             seen_message_keys = set()
@@ -6129,6 +6195,7 @@ def _merged_webui_lineage_messages_for_display(session, messages=None) -> list:
         return primary_messages
     merged_messages = []
     seen_message_keys = set()
+    seen_messages_by_key = {}
     for msg in sorted(list(parent_messages) + list(primary_messages), key=lambda m: (
         float(m.get("timestamp") or 0),
         str(m.get("role") or ""),
@@ -6136,8 +6203,10 @@ def _merged_webui_lineage_messages_for_display(session, messages=None) -> list:
     )):
         key = _session_message_merge_key(msg)
         if key in seen_message_keys:
+            _merge_session_display_metadata(seen_messages_by_key.get(key), msg)
             continue
         seen_message_keys.add(key)
+        seen_messages_by_key[key] = msg
         merged_messages.append(msg)
     return merged_messages
 
@@ -6585,6 +6654,7 @@ from api.models import (
     merge_session_messages_append_only,
     _enrich_sidebar_lineage_metadata,
     _active_stream_ids,
+    _merge_session_display_metadata,
     _session_message_merge_key,
     _session_message_visible_key,
     _is_empty_partial_activity_message,
@@ -7043,6 +7113,15 @@ _LOGIN_LOCALE = {
         "btn": "Zaloguj si\u0119",
         "invalid_pw": "Nieprawid\u0142owe has\u0142o",
         "conn_failed": "Po\u0142\u0105czenie nie powiod\u0142o si\u0119",
+    },
+    "vi": {
+        "lang": "vi",
+        "title": "\u0110\u0103ng nh\u1eadp",
+        "subtitle": "Nh\u1eadp m\u1eadt kh\u1ea9u c\u1ee7a b\u1ea1n \u0111\u1ec3 ti\u1ebfp t\u1ee5c",
+        "placeholder": "M\u1eadt kh\u1ea9u",
+        "btn": "\u0110\u0103ng nh\u1eadp",
+        "invalid_pw": "M\u1eadt kh\u1ea9u kh\u00f4ng h\u1ee3p l\u1ec7",
+        "conn_failed": "K\u1ebft n\u1ed1i th\u1ea5t b\u1ea1i",
     },
 }
 
@@ -9228,6 +9307,11 @@ def handle_get(handler, parsed) -> bool:
         # the detached rebuild worker (and the legacy synchronous rebuild),
         # which the request-thread wrapper could not reach. See
         # api.config.get_available_models cold path + profile_scope_for_detached_worker.
+        freshness = parse_qs(parsed.query or "").get("freshness", [""])[0].strip().lower()
+        if freshness == "session_visit":
+            return j(handler, get_available_models_for_session_visit())
+        if freshness:
+            return bad(handler, f"unknown models freshness: {freshness}", status=400)
         return j(handler, get_available_models())
 
     if parsed.path == "/api/models/live":
@@ -9480,6 +9564,7 @@ def handle_get(handler, parsed) -> bool:
                         _webui_sidecar_lineage_messages_for_display(s),
                         state_db_messages,
                         truncation_watermark=getattr(s, "truncation_watermark", None),
+                        truncation_boundary=getattr(s, "truncation_boundary", None),
                     )
                     _all_msgs = _merged_webui_lineage_messages_for_display(s, _all_msgs)
             else:
@@ -10175,7 +10260,19 @@ def handle_get(handler, parsed) -> bool:
     # os.environ (process-global) at call time. Wrap in cron_profile_context
     # so the TLS-active profile's jobs.json is read, not the process default.
     if parsed.path == "/api/crons":
-        from cron.jobs import list_jobs
+        # #4768: in split-container / minimal Docker deployments the WebUI image may
+        # not ship the agent's `cron` package on its import path. Degrade gracefully
+        # (empty list + cron_unavailable flag) instead of 500ing the whole Task tab.
+        # Only treat a genuinely-absent cron package as "unavailable"; a
+        # ModuleNotFoundError whose missing module is an internal dependency of an
+        # existing cron/jobs.py is a real bug and must still surface.
+        _ensure_agent_cron_import_path()
+        try:
+            from cron.jobs import list_jobs
+        except ModuleNotFoundError as exc:
+            if exc.name in ("cron", "cron.jobs"):
+                return j(handler, {"jobs": [], "cron_unavailable": True})
+            raise
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
@@ -10185,24 +10282,28 @@ def handle_get(handler, parsed) -> bool:
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
+            _ensure_agent_cron_import_path()
             return _handle_cron_output(handler, parsed)
 
     if parsed.path == "/api/crons/history":
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
+            _ensure_agent_cron_import_path()
             return _handle_cron_history(handler, parsed)
 
     if parsed.path == "/api/crons/run":
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
+            _ensure_agent_cron_import_path()
             return _handle_cron_run_detail(handler, parsed)
 
     if parsed.path == "/api/crons/recent":
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
+            _ensure_agent_cron_import_path()
             return _handle_cron_recent(handler, parsed)
 
     if parsed.path == "/api/crons/status":
@@ -10215,6 +10316,7 @@ def handle_get(handler, parsed) -> bool:
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
+            _ensure_agent_cron_import_path()
             return _handle_cron_delivery_options(handler)
 
     # ── Skills API (GET) ──
@@ -10809,6 +10911,7 @@ def handle_post(handler, parsed) -> bool:
                 context_length=getattr(session, "context_length", None),
                 threshold_tokens=getattr(session, "threshold_tokens", None),
                 truncation_watermark=getattr(session, "truncation_watermark", None),
+                truncation_boundary=getattr(session, "truncation_boundary", None),
                 # context_messages is the authoritative model-facing prefix — must be
                 # deepcopied so the duplicate has its own independent context that won't
                 # be mutated when the original session's context changes (#2914).
@@ -10853,7 +10956,10 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/default-model":
         try:
             advanced = body.get("advanced") if isinstance(body, dict) else None
-            return j(handler, set_hermes_default_model(body.get("model"), advanced=advanced))
+            provider = body.get("provider") if isinstance(body, dict) else None
+            if str(provider or "").strip().lower() == "auto":
+                provider = None
+            return j(handler, set_hermes_default_model(body.get("model"), provider=provider, advanced=advanced))
         except ValueError as e:
             return bad(handler, str(e))
         except RuntimeError as e:
@@ -10874,7 +10980,8 @@ def handle_post(handler, parsed) -> bool:
                 return bad(handler, str(exc), status=400)
         if scope == "main":
             try:
-                return j(handler, set_hermes_default_model(model, advanced=advanced))
+                main_provider = provider if provider != "auto" else None
+                return j(handler, set_hermes_default_model(model, provider=main_provider, advanced=advanced))
             except ValueError as exc:
                 return bad(handler, str(exc), status=400)
         return bad(handler, f"unknown scope: {scope}", status=400)
@@ -11374,8 +11481,11 @@ def handle_post(handler, parsed) -> bool:
             try:
                 from api.session_ops import _truncation_watermark_for
                 s.truncation_watermark = _truncation_watermark_for(s.messages)
+                # Persist the original truncate cutoff.
+                s.truncation_boundary = s.truncation_watermark
             except Exception:
                 s.truncation_watermark = 0.0
+                s.truncation_boundary = 0.0
             s.save()
             logger.info(
                 "truncate %s: messages %d→%d, context_messages %d→%d, watermark=%.2f",
@@ -11605,36 +11715,42 @@ def handle_post(handler, parsed) -> bool:
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
+            _ensure_agent_cron_import_path()
             return _handle_cron_create(handler, body)
 
     if parsed.path == "/api/crons/update":
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
+            _ensure_agent_cron_import_path()
             return _handle_cron_update(handler, body)
 
     if parsed.path == "/api/crons/delete":
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
+            _ensure_agent_cron_import_path()
             return _handle_cron_delete(handler, body)
 
     if parsed.path == "/api/crons/run":
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
+            _ensure_agent_cron_import_path()
             return _handle_cron_run(handler, body)
 
     if parsed.path == "/api/crons/pause":
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
+            _ensure_agent_cron_import_path()
             return _handle_cron_pause(handler, body)
 
     if parsed.path == "/api/crons/resume":
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
+            _ensure_agent_cron_import_path()
             return _handle_cron_resume(handler, body)
 
     # ── Git workspace ops (POST) ──
@@ -16152,15 +16268,15 @@ def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, st
     if attachments:
         user_msg["attachments"] = list(attachments)
     s.messages.append(user_msg)
-    # The new user turn is now committed to messages (#3831): a positive
-    # truncation watermark from a prior retry/undo/edit has been superseded and
-    # must retire, else it freezes at the old edit boundary and later drops these
-    # post-edit turns on an empty-sidecar reconcile. Safe here (not at chat-start)
-    # because the row is durably in messages, so the merge's max-sidecar guard now
-    # suppresses the replaced tail without the watermark. Cleared to None — never
-    # 0.0, which is the truncate-to-empty sentinel (#2914).
+    # The new user turn is now committed to messages (#3831): advance the
+    # truncation watermark to the new message's timestamp so that
+    # merge_session_messages_append_only() still filters out replaced
+    # pre-edit rows from state.db whose timestamps fall below the boundary.
+    # The merge's sidecar_advanced_past_watermark guard (models.py:5172)
+    # allows state.db rows newer than the watermark, so post-edit turns
+    # are not dropped. Never 0.0 (the truncate-to-empty sentinel, #2914).
     if getattr(s, "truncation_watermark", None):
-        s.truncation_watermark = None
+        s.truncation_watermark = user_msg.get("timestamp") or time.time()
 
 
 def _is_default_or_empty_session_title(title) -> bool:
@@ -19765,6 +19881,7 @@ def _handle_skill_save(handler, body):
     if skill_file.is_symlink():
         return bad(handler, "Cannot save to a symlinked skill file")
     skill_file.write_text(body["content"], encoding="utf-8")
+    _SKILLS_STATS_CACHE.clear()
     return j(handler, {"ok": True, "name": skill_name, "path": str(skill_file)})
 
 
@@ -19784,6 +19901,7 @@ def _handle_skill_delete(handler, body):
         return bad(handler, "Skill not found", 404)
     skill_dir = matches[0].parent
     shutil.rmtree(str(skill_dir))
+    _SKILLS_STATS_CACHE.clear()
     return j(handler, {"ok": True, "name": body["name"]})
 
 
@@ -19858,7 +19976,7 @@ def _handle_skill_toggle(handler, body):
         _save_yaml_config_file(config_path, cfg)
 
     reload_config()  # outside with block — reload_config() acquires the lock itself
-
+    _SKILLS_STATS_CACHE.clear()
     return j(handler, {"ok": True, "name": name, "enabled": enabled})
 
 

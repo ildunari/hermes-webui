@@ -1825,8 +1825,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const normalized=String(text||'').replace(/\s+/g,' ').trim();
     if(!normalized) return false;
     const systemRecovery=/^\[System:/i.test(normalized)
-      && /previous response was cut off by a network error/i.test(normalized)
-      && /continue exactly where you left off/i.test(normalized);
+      && (/continue exactly where you left off/i.test(normalized)
+        || /do not retry the same tool call/i.test(normalized));
     const backendRecovery=/^the live worker stopped before this run finished\.?$/i.test(normalized);
     return !!(systemRecovery || backendRecovery);
   }
@@ -2551,29 +2551,77 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!byIdx.has(idx)) byIdx.set(idx,[]);
       byIdx.get(idx).push(row);
     };
-    let order=0;
+    // Pre-index S.toolCalls by assistant_msg_idx for O(m+n) lookup
+    const toolsByIdx=new Map();
+    if(S.toolCalls) for(const tc of S.toolCalls){
+      const ti=typeof tc.toolIdx==='number'? tc.toolIdx : parseInt(tc.assistant_msg_idx,10);
+      if(Number.isFinite(ti)){
+        if(!toolsByIdx.has(ti)) toolsByIdx.set(ti,[]);
+        toolsByIdx.get(ti).push(tc);
+      }
+    }
+    let encounter=0;
     for(let idx=turnStart+1;idx<lastAsstIndex;idx+=1){
       const message=messages[idx];
       if(!message||message.role!=='assistant') continue;
+      const pool=[];
       const text=_anchorSceneMessageText(message);
-      if(_anchorSceneCleanText(text)) add(idx,_anchorSceneProseRow(text,order++,idx));
+      if(_anchorSceneCleanText(text)){
+        pool.push({..._anchorSceneProseRow(text,0,idx),_phase:2,_encounter:encounter++});
+      }
       const reasoning=_anchorSceneMessageReasoningText(message);
       if(_anchorSceneCleanText(reasoning)&&_anchorSceneTextKey(reasoning)!==_anchorSceneTextKey(text)){
-        add(idx,_anchorSceneThinkingRow(reasoning,order++,idx));
+        pool.push({..._anchorSceneThinkingRow(reasoning,0,idx),_phase:0,_encounter:encounter++});
       }
       const messageTools=[];
       if(Array.isArray(message.tool_calls)) messageTools.push(...message.tool_calls);
       if(Array.isArray(message._partial_tool_calls)) messageTools.push(...message._partial_tool_calls);
+      const seenToolIds=new Set();
       for(const tool of messageTools){
-        add(idx,_anchorSceneToolRowFromCall(tool,order++,idx));
+        const row=_anchorSceneToolRowFromCall(tool,0,idx);
+        pool.push({...row,_phase:1,_encounter:encounter++});
+        const tid=row.tool_call_id||(row.tool&&row.tool.id);
+        if(tid) seenToolIds.add(tid);
       }
-    }
-    const toolCalls=Array.isArray(S.toolCalls)?S.toolCalls:[];
-    for(const tool of toolCalls){
-      if(!tool||typeof tool!=='object') continue;
-      const idx=Number(tool.assistant_msg_idx);
-      if(!Number.isFinite(idx)||idx<=turnStart||idx>=lastAsstIndex) continue;
-      add(idx,_anchorSceneToolRowFromCall(tool,order++,idx));
+      // Merge S.toolCalls for this index, dedup by tool id
+      for(const tool of (toolsByIdx.get(idx)||[])){
+        if(!tool||typeof tool!=='object') continue;
+        const toolIdx=Number(tool.assistant_msg_idx);
+        if(!Number.isFinite(toolIdx)||toolIdx!==idx) continue;
+        const row=_anchorSceneToolRowFromCall(tool,0,idx);
+        const tid=row.tool_call_id||(row.tool&&row.tool.id);
+        if(tid&&seenToolIds.has(tid)) continue;
+        if(tid) seenToolIds.add(tid);
+        pool.push({...row,_phase:1,_encounter:encounter++});
+      }
+      // Stable sort by (phase, started_at, encounter)
+      pool.sort((a,b)=>{
+        if(a._phase!==b._phase) return a._phase-b._phase;
+        const aTime=(a.tool&&a.tool.started_at!=null)?a.tool.started_at:Infinity;
+        const bTime=(b.tool&&b.tool.started_at!=null)?b.tool.started_at:Infinity;
+        if(aTime!==bTime) return aTime-bTime;
+        return a._encounter-b._encounter;
+      });
+      // Emit with sequential order_index values, strip temp props.
+      // Rows were built with orderIndex=0, so their row_id/seq still encode 0.
+      // Rewrite order_index AND regenerate the index-derived identity fields
+      // (row_id/seq) from the final per-bucket position, so two anonymous rows
+      // (no tool id) at the same message index don't collide on the same row_id
+      // and get silently deduped by _completeSettledAnchorSceneForTurn().
+      for(const row of pool){
+        const {_phase,_encounter,...clean}=row;
+        const oi=byIdx.has(idx)?byIdx.get(idx).length:0;
+        clean.order_index=oi;
+        clean.seq=oi;
+        if(clean.identity&&typeof clean.identity==='object') clean.identity={...clean.identity,seq:oi};
+        // Tool rows with a tool id carry a tid-based row_id (already unique) —
+        // only regenerate the default index-based row_id form.
+        const indexRowId=`settled:${activeSid||'session'}:${streamId||'stream'}:${clean.role}:${idx}:0`;
+        if(clean.row_id===indexRowId){
+          clean.row_id=`settled:${activeSid||'session'}:${streamId||'stream'}:${clean.role}:${idx}:${oi}`;
+        }
+        add(idx,clean);
+      }
     }
     return byIdx;
   }
@@ -3844,6 +3892,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _renderPending=false;
       // Guard: a pending setTimeout+rAF can outlive stream finalization.
       if(_streamFinalized) return;
+      // Mobile scroll-jank guard: temporarily disable overflow-anchor before DOM
+      // writes to suppress Chromium scroll re-anchoring during streaming growth.
+      if(typeof window._fixMobileScrollJank==='function') window._fixMobileScrollJank();
       _lastRenderMs=performance.now();
       const parsed=_cachedParsed&&_cachedParsedText===assistantText&&_cachedParsedReasoning===liveReasoningText ? _cachedParsed : _parseStreamState();
       _cachedParsed=null;
@@ -5252,6 +5303,45 @@ let _approvalSessionId = null;
 let _approvalCurrentId = null;  // approval_id of the card currently shown
 let _approvalPendingBySession = new Map();
 
+const _DISMISSED_APPROVALS_KEY = 'hermes_dismissed_approvals';
+
+// Dismissed approvals are namespaced by session so that two sessions carrying
+// the SAME approval_id (e.g. a gateway/run source that reuses externally
+// supplied IDs across sessions) can't have a dismissal in one session hide the
+// other's still-pending approval. Stored value is "<sid>\u0000<approval_id>".
+function _approvalDismissKey(sid, approvalId) {
+  if (!approvalId) return '';
+  return String(sid || '') + '\u0000' + String(approvalId);
+}
+
+function _getDismissedApprovals() {
+  try { return JSON.parse(localStorage.getItem(_DISMISSED_APPROVALS_KEY) || '[]'); }
+  catch (_) { return []; }
+}
+
+function _isApprovalDismissed(sid, approvalId) {
+  const key = _approvalDismissKey(sid, approvalId);
+  if (!key) return false;
+  return _getDismissedApprovals().includes(key);
+}
+
+function _markApprovalDismissed(sid, approvalId) {
+  const key = _approvalDismissKey(sid, approvalId);
+  if (!key) return;
+  const set = _getDismissedApprovals().filter(k => k !== key);
+  set.push(key);
+  try { localStorage.setItem(_DISMISSED_APPROVALS_KEY, JSON.stringify(set.slice(-100))); }
+  catch (_) {}
+}
+
+function _unmarkApprovalDismissed(sid, approvalId) {
+  const key = _approvalDismissKey(sid, approvalId);
+  if (!key) return;
+  const set = _getDismissedApprovals().filter(k => k !== key);
+  try { localStorage.setItem(_DISMISSED_APPROVALS_KEY, JSON.stringify(set)); }
+  catch (_) {}
+}
+
 function _promptActiveSessionId() {
   return (S.session && S.session.session_id) || null;
 }
@@ -5309,6 +5399,7 @@ function showApprovalForSession(sid, pending, pendingCount) {
 function showApprovalCard(pending, pendingCount) {
   const sid = _rememberApprovalPending(pending, pendingCount);
   if (!_approvalPromptBelongsToActiveSession(sid)) return;
+  if (pending && pending.approval_id && _isApprovalDismissed(sid, pending.approval_id)) return;
   const keys = pending.pattern_keys || (pending.pattern_key ? [pending.pattern_key] : []);
   const desc = (pending.description || "") + (keys.length ? " [" + keys.join(", ") + "]" : "");
   const cmd = pending.command || "";
@@ -5350,6 +5441,13 @@ function showApprovalCard(pending, pendingCount) {
     setTimeout(() => onceBtn.focus({preventScroll: true}), 50);
   }
   if (typeof syncTopbar === 'function') syncTopbar();
+}
+
+function dismissApprovalCard() {
+  const sid = _approvalSessionId;
+  if (_approvalCurrentId) _markApprovalDismissed(sid, _approvalCurrentId);
+  hideApprovalCard(true);
+  if (sid) _clearApprovalPendingForSession(sid);
 }
 
 function _syncApprovalCollapseButton(card) {
@@ -5415,6 +5513,7 @@ async function respondApproval(choice) {
   const sid = _approvalSessionId || (S.session && S.session.session_id);
   if (!sid) return;
   const approvalId = _approvalCurrentId;
+  _unmarkApprovalDismissed(sid, approvalId);
   // Disable all buttons immediately to prevent double-submit
   ["approvalBtnOnce","approvalBtnSession","approvalBtnAlways","approvalBtnDeny"].forEach(id => {
     const b = $(id);
@@ -5468,7 +5567,10 @@ function _startApprovalFallbackPoll(sid) {
       const data = await api("/api/approval/pending?session_id=" + encodeURIComponent(sid),{timeoutToast:false});
       if (data.pending) { showApprovalForSession(sid, data.pending, data.pending_count||1); }
       else if (!_approvalPollingSessionMissingOrMismatched(sid)) {
+        const _resolvedEntry = _approvalPendingBySession.get(sid);
         _clearApprovalPendingForSession(sid);
+        const _resolvedId = _resolvedEntry && _resolvedEntry.pending && _resolvedEntry.pending.approval_id;
+        if (_resolvedId) _unmarkApprovalDismissed(sid, _resolvedId);
         _hideApprovalCardIfOwner(sid);
         if (!S.busy) {
           stopApprovalPollingForSession(sid);

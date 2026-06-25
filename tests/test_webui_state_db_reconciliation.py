@@ -152,6 +152,27 @@ def test_historical_cancelled_partial_does_not_disable_later_state_db_merge():
     ]
 
 
+def test_state_db_duplicate_backfills_turn_duration():
+    from api.models import merge_session_messages_append_only
+
+    sidecar = [
+        {"role": "assistant", "content": "final answer", "timestamp": 1001.0},
+    ]
+    state = [
+        {
+            "role": "assistant",
+            "content": "final answer",
+            "timestamp": 1001.0,
+            "_turnDuration": 42.5,
+        },
+    ]
+
+    merged = merge_session_messages_append_only(sidecar, state)
+
+    assert len(merged) == 1
+    assert merged[0]["_turnDuration"] == 42.5
+
+
 def test_api_session_includes_state_db_messages_newer_than_webui_sidecar(monkeypatch, tmp_path):
     import api.routes as routes
 
