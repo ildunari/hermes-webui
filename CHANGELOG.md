@@ -9,7 +9,7 @@
 
 ### Fixed
 
-- **Async `delegate_task` subagent completions now re-enter WebUI sessions.** Background subagents complete successfully in Hermes Agent but WebUI's completion drains only understood terminal `completion` events, so `async_delegation` queue events were skipped/requeued and never woke the chat. The WebUI drain now routes async delegation events by `session_key`, dedupes by `delegation_id`, formats the agent's self-contained subagent result block, and starts the same server-side wakeup turn used for terminal `notify_on_complete` completions.
+- **Async `delegate_task` subagent completions now re-enter WebUI sessions.** Background subagents complete successfully in Hermes Agent but WebUI's completion drains only understood terminal `completion` events, so `async_delegation` queue events were skipped/requeued and never woke the chat. The WebUI drain now routes async delegation events by `session_key`, dedupes by `delegation_id`, formats the agent's self-contained subagent result block, and starts the same server-side wakeup turn used for terminal `notify_on_complete` completions. The raw wakeup block stays internal to the model context instead of rendering as a visible user bubble; only the assistant's follow-up appears in chat.
 
 ## [v0.51.684] — 2026-06-26 — Release YN (copying a rendered table no longer drags its sort/filter chrome — or eats surrounding text)
 

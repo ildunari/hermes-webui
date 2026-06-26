@@ -16577,7 +16577,7 @@ def _prepare_chat_start_session_for_stream(
         provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
         if provisional_title and not _is_default_or_empty_session_title(provisional_title):
             s.title = provisional_title
-    if get_webui_session_save_mode() == "eager":
+    if get_webui_session_save_mode() == "eager" and source != "process_wakeup":
         _checkpoint_user_message_for_eager_session_save(
             s,
             msg,
