@@ -7,6 +7,10 @@
 
 - **Generated conversation titles now get a second look as local sessions develop.** Adaptive title refresh is enabled by default every 5 exchanges for non-messaging WebUI/CLI-style sessions, using both the opening exchange and latest turn so the title can improve after the conversation's real topic becomes clear. Manual titles remain protected, and messaging-sourced sessions such as Telegram/Discord imports are skipped.
 
+### Fixed
+
+- **Async `delegate_task` subagent completions now re-enter WebUI sessions.** Background subagents complete successfully in Hermes Agent but WebUI's completion drains only understood terminal `completion` events, so `async_delegation` queue events were skipped/requeued and never woke the chat. The WebUI drain now routes async delegation events by `session_key`, dedupes by `delegation_id`, formats the agent's self-contained subagent result block, and starts the same server-side wakeup turn used for terminal `notify_on_complete` completions.
+
 ## [v0.51.641] — 2026-06-25 — Release WV (disabled plugins read as disabled in dark mode, active ones sort first)
 
 ### Fixed

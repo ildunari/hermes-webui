@@ -613,6 +613,89 @@ def test_server_side_wakeup_when_idle_no_tab(monkeypatch):
         cfg.BG_TASK_COMPLETE_EVENTS_SEEN.pop(sid, None)
 
 
+
+def test_async_delegation_completion_wakes_idle_webui_session(monkeypatch):
+    """delegate_task(background=true) completions are not ProcessSession-backed.
+
+    They arrive on the shared completion queue with type=async_delegation,
+    delegation_id, and session_key==webui_session_id. The WebUI drain must route
+    them by session_key and wake the session with the agent formatter's
+    self-contained subagent result block.
+    """
+    from api import background_process as bp, config as cfg
+
+    sid = "sess-async-delegation-idle"
+    deleg_id = "deleg-webui-idle-1"
+
+    holder = _install_fake_start_session_turn(monkeypatch)
+    bp.register_process_session(sid, sid)
+    try:
+        evt = {
+            "type": "async_delegation",
+            "delegation_id": deleg_id,
+            "session_key": sid,
+            "status": "completed",
+            "goal": "smoke test delegate re-entry",
+            "summary": "DELEGATE_REENTRY_SMOKE_OK 2026-06-26T00:00:00Z",
+            "api_calls": 1,
+            "duration_seconds": 2.5,
+            "completed_at": time.time(),
+        }
+        bp._process_one(evt)
+
+        assert _wait_for_wakeup(holder), "async delegate completion did not wake WebUI session"
+        call = holder["calls"][0]
+        assert call["session_id"] == sid
+        assert call["source"] == "process_wakeup"
+        assert "[ASYNC DELEGATION COMPLETE" in call["message"]
+        assert deleg_id in call["message"]
+        assert "DELEGATE_REENTRY_SMOKE_OK" in call["message"]
+        assert deleg_id in cfg.BG_TASK_COMPLETE_EVENTS_SEEN.get(sid, set())
+    finally:
+        bp.unregister_process_session(sid)
+        cfg.PENDING_BG_TASK_COMPLETIONS.discard(sid)
+        cfg.BG_TASK_COMPLETE_EVENTS_SEEN.pop(sid, None)
+
+
+def test_async_delegation_completion_live_view_uses_delegation_id(monkeypatch):
+    """Open tabs should see async delegation completions on the persistent
+    session channel with task_id set to delegation_id, not an empty process id.
+    """
+    from api import background_process as bp, config as cfg
+
+    sid = "sess-async-delegation-live"
+    deleg_id = "deleg-webui-live-1"
+
+    holder = _install_fake_start_session_turn(monkeypatch)
+    ch = bp.get_or_create_session_channel(sid)
+    q = ch.subscribe()
+    bp.register_process_session(sid, sid)
+    try:
+        evt = {
+            "type": "async_delegation",
+            "delegation_id": deleg_id,
+            "session_key": sid,
+            "status": "completed",
+            "goal": "smoke test live-view payload",
+            "summary": "DELEGATE_REENTRY_SMOKE_OK live",
+            "completed_at": time.time(),
+        }
+        bp._process_one(evt)
+
+        event_name, data = q.get(timeout=2.0)
+        assert event_name == "bg_task_complete"
+        assert data["session_id"] == sid
+        assert data["task_id"] == deleg_id
+        assert "ASYNC DELEGATION COMPLETE" in data.get("summary", "")
+        assert _wait_for_wakeup(holder)
+    finally:
+        ch.unsubscribe(q)
+        with bp.SESSION_CHANNELS_LOCK:
+            bp.SESSION_CHANNELS.pop(sid, None)
+        bp.unregister_process_session(sid)
+        cfg.PENDING_BG_TASK_COMPLETIONS.discard(sid)
+        cfg.BG_TASK_COMPLETE_EVENTS_SEEN.pop(sid, None)
+
 def test_server_side_wakeup_deferred_when_turn_active(monkeypatch):
     """A foreground turn is active (ACTIVE_RUNS has a row for the session) →
     the drain must NOT start a second turn. The PENDING_BG_TASK_COMPLETIONS

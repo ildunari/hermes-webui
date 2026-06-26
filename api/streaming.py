@@ -1656,9 +1656,17 @@ def _stale_completion_max_age_seconds() -> float:
 
 
 def _format_process_notification(evt: dict) -> str:
-    """Format a completed background process notification for agent input."""
+    """Format a completed background-process or async-delegation notification."""
     if not isinstance(evt, dict):
         return ''
+    if evt.get('type') == 'async_delegation':
+        try:
+            from tools.process_registry import format_process_notification
+
+            return str(format_process_notification(evt) or '')
+        except Exception:
+            logger.debug("Failed to format async delegation notification", exc_info=True)
+            return ''
     if evt.get('type') != 'completion':
         return ''
     _sid = evt.get('session_id', '')
@@ -1716,17 +1724,24 @@ def _drain_webui_process_notifications(session_id: str) -> list[str]:
             logger.debug("Failed to drain process completion queue", exc_info=True)
             break
 
+        evt_type = str(evt.get('type') or 'completion') if isinstance(evt, dict) else ''
         evt_sid = str(evt.get('session_id') or '') if isinstance(evt, dict) else ''
-        if not evt_sid:
+        evt_delegation_id = str(evt.get('delegation_id') or '') if isinstance(evt, dict) else ''
+        evt_key = evt_delegation_id if evt_type == 'async_delegation' else evt_sid
+        if not evt_key:
             skipped_events.append(evt)
             continue
         try:
-            if process_registry.is_completion_consumed(evt_sid):
+            if process_registry.is_completion_consumed(evt_key):
                 continue
-            proc = process_registry.get(evt_sid)
+            proc = None if evt_type == 'async_delegation' else process_registry.get(evt_sid)
         except Exception:
             proc = None
-        if getattr(proc, 'session_key', None) != session_id:
+        if evt_type == 'async_delegation':
+            if str(evt.get('session_key') or '') != session_id:
+                skipped_events.append(evt)
+                continue
+        elif getattr(proc, 'session_key', None) != session_id:
             skipped_events.append(evt)
             continue
 
@@ -1746,13 +1761,13 @@ def _drain_webui_process_notifications(session_id: str) -> list[str]:
                         "session %s (age %.0fs > cap %.0fs)",
                         evt_sid, age, stale_completion_max_age,
                     )
-                    _mark_process_completion_consumed(process_registry, evt_sid)
+                    _mark_process_completion_consumed(process_registry, evt_key)
                     continue
 
         notification = _format_process_notification(evt)
         if notification:
             notifications.append(notification)
-            _mark_process_completion_consumed(process_registry, evt_sid)
+            _mark_process_completion_consumed(process_registry, evt_key)
 
     for evt in skipped_events:
         try:

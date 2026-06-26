@@ -351,15 +351,26 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def format_wakeup_prompt(evt: object) -> str | None:
-    """Build the synthetic [IMPORTANT: …] message the agent will see.
+    """Build the synthetic wakeup message the agent will see.
 
-    Mirrors ``cli._format_process_notification`` so wakeup payloads look the
-    same in CLI and WebUI sessions.
+    Mirrors the Hermes Agent process-registry formatter where possible so
+    terminal completions and async delegate completions re-enter WebUI sessions
+    with the same self-contained payload they use in CLI/gateway hosts.
     """
     if not isinstance(evt, dict) or not evt:
         return None
 
     evt_type = evt.get("type", "completion")
+    if evt_type == "async_delegation":
+        try:
+            from tools.process_registry import format_process_notification
+
+            formatted = format_process_notification(evt)
+            return str(formatted or "").strip() or None
+        except Exception:
+            logger.debug("async delegation formatter unavailable", exc_info=True)
+            return None
+
     sid = str(evt.get("session_id") or "").strip()
     cmd = str(evt.get("command") or "").strip()
     # The current server-side wakeup drain drops global watch-overflow events
@@ -422,12 +433,13 @@ def _build_payload(evt: dict, session_id: str) -> dict:
       ``(session_id, event_id)`` to dedupe across reconnects.
     """
     # ProcessRegistry completion events use the field name ``session_id`` for
-    # the process id. Alias it locally before exposing it as payload ``task_id``
-    # to avoid confusing that wire-format name with the WebUI session id.
-    process_id = str(evt.get("session_id") or "")
+    # the process id. Async delegate completions instead carry
+    # ``delegation_id`` and route by ``session_key``. Alias both to payload
+    # ``task_id`` so the browser/live-view layer can dedupe them uniformly.
+    task_id = str(evt.get("delegation_id") or evt.get("session_id") or "")
     payload: dict[str, Any] = {
         "session_id": str(session_id),
-        "task_id": process_id,
+        "task_id": task_id,
         "completed_at": time.time(),
         "event_id": uuid.uuid4().hex,
     }
@@ -768,7 +780,11 @@ def _process_one(evt: dict) -> None:
     except Exception:
         _process_registry = None
 
+    evt_type = str(evt.get("type") or "completion") if isinstance(evt, dict) else "completion"
+    is_async_delegation = evt_type == "async_delegation"
     process_id = str(evt.get("session_id") or "")
+    delegation_id = str(evt.get("delegation_id") or "")
+    event_id = delegation_id if is_async_delegation else process_id
     session_key = str(evt.get("session_key") or "")
     # Root-cause fix (t_0f447014): the notify_on_complete completion event
     # enqueued by ProcessRegistry._move_to_finished() carries NO "session_key"
@@ -779,9 +795,10 @@ def _process_one(evt: dict) -> None:
     # every wakeup was silently dropped here and the frontend never POSTed an
     # ack. Recover the spawn-time session_key from the process registry's
     # ProcessSession: the terminal tool captured it synchronously at spawn
-    # (while the turn's env was active), so it survives the turn-end env
-    # restore and is the WebUI session_id for WebUI-spawned processes.
-    if not session_key and process_id:
+    # (while the turn env was live), so it survives the turn-end env restore.
+    # Async delegation completions are not ProcessSession-backed; they carry the
+    # originating WebUI session key directly and use delegation_id for dedupe.
+    if not session_key and process_id and not is_async_delegation:
         try:
             if _process_registry is not None:
                 _ps = _process_registry.get(process_id)
@@ -795,12 +812,17 @@ def _process_one(evt: dict) -> None:
             )
     if not session_key:
         logger.debug(
-            "process_complete drop: no recoverable session_key for process_id=%r",
-            process_id,
+            "process_complete drop: no recoverable session_key for event_id=%r",
+            event_id or process_id,
         )
         return
     with _cfg.PROCESS_SESSION_INDEX_LOCK:
         session_id = _cfg.PROCESS_SESSION_INDEX.get(session_key)
+    if not session_id and is_async_delegation:
+        # delegate_task background completions are not tied to a ProcessSession;
+        # the async delegation registry stores the WebUI session id directly in
+        # session_key. Use it as a safe fallback so a closed tab can still wake.
+        session_id = session_key
     if not session_id:
         # No mapping — could be a cron/gateway process that uses the same
         # registry but a non-WebUI session_key. Ignore.
@@ -818,7 +840,11 @@ def _process_one(evt: dict) -> None:
     # Pure pass-through when no env-immune owner is available (today's core,
     # cron/CLI procs, pre-Option-1 spawns) — never suppresses a valid wakeup.
     try:
-        _ps_xs = _process_registry.get(process_id) if (_process_registry is not None and process_id) else None
+        _ps_xs = (
+            _process_registry.get(process_id)
+            if (_process_registry is not None and process_id and not is_async_delegation)
+            else None
+        )
     except Exception:
         _ps_xs = None
     session_id = _resolve_wakeup_target(
@@ -837,9 +863,9 @@ def _process_one(evt: dict) -> None:
     # order), it marked _completion_consumed; B must early-return here or it
     # would double-fire a wakeup. This guard aligns our B-drain to the real
     # upstream key (verified against origin/master streaming.py).
-    if process_id:
+    if event_id:
         try:
-            if _process_registry is not None and _process_registry.is_completion_consumed(process_id):
+            if _process_registry is not None and _process_registry.is_completion_consumed(event_id):
                 return
         except Exception:
             logger.debug(
@@ -853,10 +879,10 @@ def _process_one(evt: dict) -> None:
     # occasionally enqueue twice despite the process_registry guard.
     with _cfg.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
         seen = _cfg.BG_TASK_COMPLETE_EVENTS_SEEN.setdefault(session_id, set())
-        if process_id and process_id in seen:
+        if event_id and event_id in seen:
             return
-        if process_id:
-            seen.add(process_id)
+        if event_id:
+            seen.add(event_id)
     payload = _build_payload(evt, session_id)
     _emit_bg_task_complete_events_coalesced(session_id, payload)
     _cfg.PENDING_BG_TASK_COMPLETIONS.add(session_id)
@@ -866,8 +892,8 @@ def _process_one(evt: dict) -> None:
     # as already-delivered and does not re-fire a wakeup (B-first order).
     # This is the SHARED upstream dedupe key (see _mark_registry_completion_
     # consumed for the coupling contract + why a future rename now fails loud).
-    if process_id:
-        _mark_registry_completion_consumed(process_id)
+    if event_id:
+        _mark_registry_completion_consumed(event_id)
 
     # ── Option Z (PRIMARY): server-side wakeup, NO browser round-trip ──────
     # The SSE emit above is now demoted to a pure live-view layer (an open tab
@@ -908,28 +934,23 @@ def _process_one(evt: dict) -> None:
                 # discarded and the next-turn drain reads completion_queue
                 # (already emptied by THIS drain thread), so for an
                 # autonomous agent with no next user turn the wakeup was
-                # lost forever. process_id is already in
+                # lost forever. event_id is already in
                 # BG_TASK_COMPLETE_EVENTS_SEEN + the registry
                 # _completion_consumed marker (set above), so persisting it
                 # here cannot cause a double-fire — the atomic claim in
                 # ``claim_deferred_wakeups`` guarantees exactly one delivery.
-                record_deferred_wakeup(session_id, process_id, wakeup_prompt)
+                record_deferred_wakeup(session_id, event_id, wakeup_prompt)
                 logger.debug(
                     "server-side wakeup deferred: turn active for session %s "
                     "(persisted for turn-teardown idle-hook redelivery)",
                     session_id,
                 )
             else:
-                # Idle-path sibling of the F1 (409/teardown) fix: pass
-                # ``process_id`` so that if this idle wakeup's daemon thread
-                # loses the per-session lock race and 409s, the re-defer in
-                # ``_start_server_side_wakeup_turn`` records the entry WITH its
-                # process_id — keeping the ``record_deferred_wakeup`` dedup
-                # guard (``if process_id and any(...)``) live on that re-defer
-                # path so a second 409 race cannot accumulate a duplicate
-                # deferred entry (which would deliver the same wakeup twice).
+                # Idle-path sibling of the F1 (409/teardown) fix: pass the
+                # event id so terminal processes and async delegations share
+                # one deferred-wakeup dedupe key.
                 _start_server_side_wakeup_turn(
-                    session_id, wakeup_prompt, process_id=process_id
+                    session_id, wakeup_prompt, process_id=event_id
                 )
     except Exception:
         logger.warning(
