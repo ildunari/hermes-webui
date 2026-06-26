@@ -205,6 +205,24 @@ def _queue_generated_title_for_imported_session(session, cli_meta: dict | None) 
 def _on_session_list_changed(profile: str | None = None) -> None:
     """Invalidate in-process /api/sessions cache when sidebar state mutates."""
     _clear_session_list_cache(profile)
+    # #4842: also drop the inner CLI/cron projection cache. While a turn streams
+    # that cache is frozen on a stable streaming marker (so per-token message
+    # writes don't bust it), which means it no longer self-invalidates via the
+    # state.db content fingerprint mid-stream. In-app structural mutations
+    # (session create/rename/archive/delete/branch/pin/move/import, attention)
+    # fire this listener — and never fire per streamed token — so clearing here
+    # restores prompt freshness for those without reintroducing the per-poll
+    # rebuild the freeze removed. Note: externally-driven changes that do NOT go
+    # through this listener (a scheduled cron job completing, or an external CLI
+    # writing rows directly) are not cleared here mid-stream; for those the 30s
+    # streaming TTL is the backstop — they surface within one streaming-TTL
+    # window (≤30s) rather than instantly. That bound is the deliberate
+    # latency/CPU trade-off of the freeze.
+    try:
+        from api.models import clear_cli_sessions_cache
+        clear_cli_sessions_cache()
+    except Exception:
+        logger.debug("Failed to clear CLI sessions cache on session list change", exc_info=True)
 
 
 try:
@@ -1687,6 +1705,9 @@ def _session_list_cache_get(
             return None, False
         ts, stamp, payload = entry
         if stamp != current_stamp:
+            if allow_stale:
+                _SESSIONS_CACHE.move_to_end(key)
+                return copy.deepcopy(payload), False
             _SESSIONS_CACHE.pop(key, None)
             return None, False
         # #4808: widen the freshness window while a turn is streaming so the fixed
@@ -1810,9 +1831,7 @@ def _session_list_cache_streaming_freeze_marker():
 
 
 def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int], object, int]:
-    _cache_profile, _cache_all_profiles, cache_show_cli_sessions, *_rest = key
-    if not cache_show_cli_sessions:
-        return ((0, 0), (0, 0), (0, 0), (0, 0), (0, 0), None, 0)
+    _cache_profile, _cache_all_profiles, _cache_show_cli_sessions, *_rest = key
     try:
         settings_file = SETTINGS_FILE
     except Exception:
@@ -1822,6 +1841,10 @@ def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple
         swv = _SETTINGS_WRITE_VERSION
     except Exception:
         swv = 0
+    # WebUI-origin sessions can also receive settled rows in state.db when the
+    # official Hermes Desktop App continues the same agent session.  The sidebar
+    # therefore watches state.db even when the CLI/external-session tab is hidden.
+    #
     # Streaming hold-down (#4672): while a turn is in flight, collapse the
     # volatile state.db-derived components (db/WAL stat, gateway metadata, index
     # stat, content fingerprint) to a marker that only changes when a stream
@@ -6083,6 +6106,18 @@ def _limited_webui_messages_for_display(session, state_db_messages) -> list:
     the sidecar yet.
     """
     sidecar_messages = _webui_sidecar_lineage_messages_for_display(session)
+    return _limited_webui_messages_for_display_with_sidecar(
+        session,
+        sidecar_messages,
+        state_db_messages,
+    )
+
+
+def _limited_webui_messages_for_display_with_sidecar(session, sidecar_messages, state_db_messages) -> list:
+    if sidecar_messages is None:
+        sidecar_messages = _webui_sidecar_lineage_messages_for_display(session)
+    else:
+        sidecar_messages = list(sidecar_messages or [])
     state_db_messages = list(state_db_messages or [])
     if not state_db_messages:
         return sidecar_messages
@@ -6100,6 +6135,54 @@ def _limited_webui_messages_for_display(session, state_db_messages) -> list:
         truncation_watermark=getattr(session, "truncation_watermark", None),
         truncation_boundary=getattr(session, "truncation_boundary", None),
     )
+
+
+def _state_db_since_timestamp_for_limited_display(session, msg_limit, msg_before=None):
+    """Return (timestamp floor, sidecar messages) for bounded state.db tail reads.
+
+    The display window limit counts visible transcript rows after WebUI sidecar
+    and state.db reconciliation, so this deliberately does not SQL ``LIMIT`` raw
+    rows.  Instead, for the common initial tail load, keep the full sidecar
+    coordinate space and read a conservative recent state.db superset.  Older
+    page loads and edit/truncation recovery shapes stay on the full state.db
+    path because their correctness depends on older reconciliation rows.
+    """
+    if msg_limit is None or msg_before is not None:
+        return None, None
+    if getattr(session, "truncation_watermark", None) not in (None, ""):
+        return None, None
+    if getattr(session, "truncation_boundary", None) not in (None, ""):
+        return None, None
+
+    sidecar_messages = _webui_sidecar_lineage_messages_for_display(session)
+    if not sidecar_messages:
+        return None, sidecar_messages
+    sidecar_timestamps = [_message_timestamp_as_float(msg) for msg in sidecar_messages]
+    if any(ts is None for ts in sidecar_timestamps):
+        return None, sidecar_messages
+
+    try:
+        limit = max(1, int(msg_limit))
+    except (TypeError, ValueError):
+        return None, sidecar_messages
+    raw_budget = max(300, limit * 10)
+    if len(sidecar_messages) <= raw_budget:
+        return None, sidecar_messages
+
+    floor = min(sidecar_timestamps[-raw_budget:])
+    sidecar_before_keys = [
+        _session_message_visible_key(msg)
+        for msg, ts in zip(sidecar_messages, sidecar_timestamps, strict=True)
+        if ts < floor
+    ]
+    state_before_keys = get_state_db_session_message_keys_before_timestamp(
+        getattr(session, "session_id", None),
+        floor,
+        profile=getattr(session, "profile", None) or None,
+    )
+    if state_before_keys is None or state_before_keys != sidecar_before_keys:
+        return None, sidecar_messages
+    return floor, sidecar_messages
 
 
 def _messages_start_with_visible_prefix(messages, prefix) -> bool:
@@ -6688,6 +6771,7 @@ from api.models import (
     get_cli_sessions,
     get_cli_session_messages,
     get_state_db_session_messages,
+    get_state_db_session_message_keys_before_timestamp,
     get_state_db_session_summary,
     merge_session_messages_append_only,
     _enrich_sidebar_lineage_metadata,
@@ -6695,6 +6779,7 @@ from api.models import (
     _merge_session_display_metadata,
     _session_message_merge_key,
     _session_message_visible_key,
+    _message_timestamp_as_float,
     _is_empty_partial_activity_message,
     _hide_from_default_sidebar,
     prune_session_from_index,
@@ -6728,9 +6813,8 @@ def _pre_compression_continuation_session_id(session) -> str | None:
     # snapshot's profile and reject any child that isn't profile-matched.
     snapshot_profile = getattr(session, "profile", None)
 
-    def _child_rows() -> list:
+    def _child_rows_from_memory(seen_ids: set[str]) -> list:
         rows = []
-        seen_ids = set()
         try:
             with LOCK:
                 memory_sessions = list(SESSIONS.values())
@@ -6742,6 +6826,51 @@ def _pre_compression_continuation_session_id(session) -> str | None:
                 rows.append(child)
         except Exception:
             pass
+        return rows
+
+    def _child_rows_from_index(seen_ids: set[str]) -> list | None:
+        if not SESSION_INDEX_FILE.exists():
+            return None
+        try:
+            entries = json.loads(SESSION_INDEX_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(entries, list):
+            return None
+        try:
+            persisted_sidecar_ids = {
+                path.stem
+                for path in SESSION_DIR.glob("*.json")
+                if not path.name.startswith("_") and is_safe_session_id(path.stem)
+            }
+        except Exception:
+            return None
+        indexed_ids: set[str] = set()
+        row_seen_ids = set(seen_ids)
+        rows = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            child_sid = _safe_first(entry.get("session_id"))
+            if not child_sid or not is_safe_session_id(child_sid):
+                continue
+            indexed_ids.add(child_sid)
+            if child_sid in row_seen_ids or not _safe_first(entry.get("parent_session_id")):
+                continue
+            row_seen_ids.add(child_sid)
+            rows.append(entry)
+        # Guarantee here is index MEMBERSHIP-completeness, not per-entry content
+        # freshness: if any persisted continuation sidecar is absent from the index
+        # we bail to the full scan. A sidecar that IS in the index but whose entry is
+        # content-stale (mid-write) still yields a valid continuation of the same
+        # snapshot; proving freshness would require reading every sidecar, defeating
+        # the optimization, so membership-completeness is the intended bar.
+        if persisted_sidecar_ids - indexed_ids - seen_ids:
+            return None
+        return rows
+
+    def _child_rows_from_sidecars(seen_ids: set[str]) -> list:
+        rows = []
         try:
             for path in SESSION_DIR.glob("*.json"):
                 if path.name.startswith("_"):
@@ -6757,51 +6886,79 @@ def _pre_compression_continuation_session_id(session) -> str | None:
             pass
         return rows
 
-    children_by_parent: dict[str, list] = {}
-    for child in _child_rows():
-        parent_sid = _safe_first(getattr(child, "parent_session_id", None))
-        child_sid = _safe_first(getattr(child, "session_id", None))
-        if not parent_sid or not child_sid or child_sid == sid:
-            continue
-        # Cross-profile guard: only follow continuations within the snapshot's profile.
-        if not _profiles_match(getattr(child, "profile", None), snapshot_profile):
-            continue
-        children_by_parent.setdefault(parent_sid, []).append(child)
+    def _row_value(row, key, default=None):
+        return row.get(key, default) if isinstance(row, dict) else getattr(row, key, default)
 
-    candidates = []
-    frontier = [sid]
-    seen = {sid}
-    for _ in range(20):
-        if not frontier:
-            break
-        parent_sid = frontier.pop(0)
-        for child in children_by_parent.get(parent_sid, []):
-            child_sid = _safe_first(getattr(child, "session_id", None))
-            if not child_sid or child_sid in seen:
+    def _row_has_backing_state(row) -> bool:
+        child_sid = _safe_first(_row_value(row, "session_id"))
+        if not child_sid or not is_safe_session_id(child_sid):
+            return False
+        if not isinstance(row, dict):
+            return True
+        return (SESSION_DIR / f"{child_sid}.json").exists()
+
+    def _resolve_from_rows(rows: list) -> str | None:
+        children_by_parent: dict[str, list] = {}
+        for child in rows:
+            parent_sid = _safe_first(_row_value(child, "parent_session_id"))
+            child_sid = _safe_first(_row_value(child, "session_id"))
+            if not parent_sid or not child_sid or child_sid == sid:
                 continue
-            seen.add(child_sid)
-            if getattr(child, "pre_compression_snapshot", False):
-                frontier.append(child_sid)
-            else:
-                candidates.append(child)
+            # Cross-profile guard: only follow continuations within the snapshot's profile.
+            if not _profiles_match(_row_value(child, "profile"), snapshot_profile):
+                continue
+            children_by_parent.setdefault(parent_sid, []).append(child)
 
-    if not candidates:
-        return None
-    latest = max(
-        candidates,
-        key=lambda child: float(
-            _safe_first(
-                getattr(child, "updated_at", None),
-                getattr(child, "created_at", None),
-                0,
-            ) or 0
-        ),
-    )
-    latest_sid = getattr(latest, "session_id", None) or None
-    # Only hand the client a well-formed session id (it gets written to URL/localStorage).
-    if latest_sid and not is_safe_session_id(latest_sid):
-        return None
-    return latest_sid
+        candidates = []
+        frontier = [sid]
+        seen = {sid}
+        for _ in range(20):
+            if not frontier:
+                break
+            parent_sid = frontier.pop(0)
+            for child in children_by_parent.get(parent_sid, []):
+                child_sid = _safe_first(_row_value(child, "session_id"))
+                if not child_sid or child_sid in seen or not _row_has_backing_state(child):
+                    continue
+                seen.add(child_sid)
+                if _row_value(child, "pre_compression_snapshot", False):
+                    frontier.append(child_sid)
+                else:
+                    candidates.append(child)
+
+        if not candidates:
+            return None
+        latest = max(
+            candidates,
+            key=lambda child: (
+                float(
+                    _safe_first(
+                        _row_value(child, "updated_at"),
+                        _row_value(child, "created_at"),
+                        0,
+                    ) or 0
+                ),
+                # Secondary tiebreaker so the index-fast-path and the sidecar-scan
+                # path resolve byte-identically on an updated_at/created_at tie
+                # (otherwise the chosen sid could differ by iteration order).
+                str(_safe_first(_row_value(child, "session_id"), "") or ""),
+            ),
+        )
+        latest_sid = _safe_first(_row_value(latest, "session_id", None)) or None
+        # Only hand the client a well-formed session id (it gets written to URL/localStorage).
+        if latest_sid and not is_safe_session_id(latest_sid):
+            return None
+        return latest_sid
+
+    memory_seen_ids: set[str] = set()
+    rows = _child_rows_from_memory(memory_seen_ids)
+    index_rows = _child_rows_from_index(memory_seen_ids)
+    if index_rows is not None:
+        return _resolve_from_rows(rows + index_rows)
+
+    rows.extend(_child_rows_from_sidecars(memory_seen_ids))
+    return _resolve_from_rows(rows)
+
 from api.workspace import (
     load_workspaces,
     save_workspaces,
@@ -6892,6 +7049,7 @@ from api.route_approvals import (  # noqa: F401 — re-exports for backward comp
     _approval_sse_unsubscribe,
     _approval_sse_notify_locked,
     _approval_sse_notify,
+    _GATEWAY_MIRROR_FLAG,
     reconcile_gateway_pending_mirror_locked,
     submit_gateway_pending_mirror,
     submit_pending,
@@ -9479,6 +9637,11 @@ def handle_get(handler, parsed) -> bool:
 
         return j(handler, get_extension_status())
 
+    if parsed.path == "/api/extensions/registry":
+        from api.extensions import get_extension_registry
+
+        return j(handler, get_extension_registry())
+
     if parsed.path.startswith("/extensions/"):
         from api.extensions import serve_extension_static
 
@@ -9562,10 +9725,27 @@ def handle_get(handler, parsed) -> bool:
             cli_messages = []
             state_db_messages = []
             metadata_summary = None
+            limited_sidecar_messages = None
+            state_db_since_timestamp = None
             if is_messaging_session:
                 cli_messages = get_cli_session_messages(sid)
             elif load_messages:
-                state_db_messages = get_state_db_session_messages(sid, profile=_session_profile)
+                if msg_limit is not None:
+                    (
+                        state_db_since_timestamp,
+                        limited_sidecar_messages,
+                    ) = _state_db_since_timestamp_for_limited_display(
+                        s,
+                        msg_limit,
+                        msg_before=msg_before,
+                    )
+                _state_db_reader_kwargs = {"profile": _session_profile}
+                if state_db_since_timestamp is not None:
+                    _state_db_reader_kwargs["since_timestamp"] = state_db_since_timestamp
+                state_db_messages = get_state_db_session_messages(
+                    sid,
+                    **_state_db_reader_kwargs,
+                )
             elif not is_messaging_session:
                 # Metadata-only callers still need the same append-only
                 # reconciliation contract as full loads so stale/replayed
@@ -9596,7 +9776,11 @@ def handle_get(handler, parsed) -> bool:
                     # them chronologically and dedupe exact repeats.
                     _all_msgs = _merged_session_messages_for_display(s, cli_messages)
                 elif msg_limit is not None:
-                    _all_msgs = _limited_webui_messages_for_display(s, state_db_messages)
+                    _all_msgs = _limited_webui_messages_for_display_with_sidecar(
+                        s,
+                        limited_sidecar_messages,
+                        state_db_messages,
+                    )
                 else:
                     _all_msgs = merge_session_messages_append_only(
                         _webui_sidecar_lineage_messages_for_display(s),
@@ -10800,6 +10984,34 @@ def handle_post(handler, parsed) -> bool:
         except Exception:
             logger.exception("extension toggle failed")
             return bad(handler, "Failed to update extension state", status=500)
+
+    if parsed.path == "/api/extensions/install":
+        from api.extensions import ExtensionInstallError, install_extension
+
+        try:
+            return j(
+                handler,
+                install_extension(body.get("id"), body.get("download_url"), body.get("sha256")),
+            )
+        except ExtensionInstallError as exc:
+            return bad(handler, str(exc), status=exc.status)
+        except Exception:
+            logger.exception("extension install failed")
+            return bad(handler, "Failed to install extension", status=500)
+
+    if parsed.path == "/api/extensions/uninstall":
+        from api.extensions import ExtensionInstallError, uninstall_extension
+
+        try:
+            return j(
+                handler,
+                uninstall_extension(body.get("id")),
+            )
+        except ExtensionInstallError as exc:
+            return bad(handler, str(exc), status=exc.status)
+        except Exception:
+            logger.exception("extension uninstall failed")
+            return bad(handler, "Failed to uninstall extension", status=500)
 
     if parsed.path == "/api/session/recovery/repair-safe":
         from api.session_recovery import repair_safe_session_recovery
@@ -18665,6 +18877,53 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str) -> bool:
     return resolved
 
 
+_GATEWAY_APPROVAL_RELAY_UNAVAILABLE = (
+    "Gateway approval could not be relayed because the active run is unavailable. "
+    "Reopen the session or retry after it reconnects."
+)
+
+
+def _gateway_pending_approval_without_run_id(sid: str, approval_id: str) -> bool:
+    with _lock:
+        reconcile_gateway_pending_mirror_locked(sid)
+        queue = _pending.get(sid)
+        if isinstance(queue, list):
+            entries = queue
+        elif queue:
+            entries = [queue]
+        else:
+            entries = []
+        if approval_id:
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("approval_id") == approval_id:
+                    return bool(entry.get(_GATEWAY_MIRROR_FLAG))
+            return False
+        if not entries or not isinstance(entries[0], dict):
+            return False
+        return bool(entries[0].get(_GATEWAY_MIRROR_FLAG))
+
+
+def _session_has_pending_approval(sid: str) -> bool:
+    """True when the session still has any live pending approval to act on.
+
+    Used to tell a benign STALE-CARD click (the card's approval already
+    resolved or its stream ended, so nothing is pending) apart from a stale
+    explicit-id click made WHILE a different approval is still live (which must
+    stay unresolved so it can't accidentally approve the wrong command — #527).
+    Reconciles the gateway mirror first so a purged orphan is not counted.
+    """
+    with _lock:
+        reconcile_gateway_pending_mirror_locked(sid)
+        queue = _pending.get(sid)
+        if isinstance(queue, list):
+            if queue:
+                return True
+        elif queue:
+            return True
+        gw_queue = _gateway_queues.get(sid)
+        return bool(gw_queue)
+
+
 def _handle_approval_respond(handler, body):
     sid = body.get("session_id", "")
     if not sid:
@@ -18676,7 +18935,12 @@ def _handle_approval_respond(handler, body):
 
     # Gateway relay: forward choice to the runs API when session has an active run.
     try:
-        from api.gateway_chat import _STREAM_RUN_IDS, _gateway_base_url, _gateway_api_key
+        from api.gateway_chat import (
+            _STREAM_RUN_IDS,
+            _gateway_base_url,
+            _gateway_api_key,
+            webui_gateway_chat_enabled,
+        )
         from api.config import get_config as _get_config
         s = get_session(sid)
         _run_id = None
@@ -18696,6 +18960,34 @@ def _handle_approval_respond(handler, body):
             except (RunnerClientError, ValueError) as exc:
                 return j(handler, {"ok": False, "choice": choice, "relayed": True, "error": str(exc)}, status=502)
             return j(handler, {"ok": True, "choice": choice, "relayed": True})
+        # #4771 surfaces an explicit relay-failure 409 when a gateway approval
+        # is pending but its run is gone (so the card stays actionable instead
+        # of silently failing). That signal is ONLY meaningful on a
+        # gateway-backed deployment. On the default local in-process backend,
+        # every guarded command parks an entry in tools.approval._gateway_queues
+        # (via _await_gateway_decision), which the WebUI mirrors into _pending
+        # with _GATEWAY_MIRROR_FLAG set — but there is no gateway run and no
+        # _STREAM_RUN_IDS entry by design. Without the backend-mode gate below,
+        # _gateway_pending_approval_without_run_id() returns True for that purely
+        # local approval and the handler 409s ("active run unavailable"),
+        # refusing to resolve an approval that resolves perfectly well locally.
+        # Gate on gateway mode so local approvals fall through to the local
+        # resolution path; gateway behaviour is unchanged. (#4771 regression;
+        # also reported as #4948)
+        if webui_gateway_chat_enabled(_get_config()) and _gateway_pending_approval_without_run_id(
+            sid, approval_id
+        ):
+            return j(
+                handler,
+                {
+                    "ok": False,
+                    "choice": choice,
+                    "relayed": False,
+                    "code": "gateway_run_unavailable",
+                    "error": _GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
+                },
+                status=409,
+            )
     except Exception:
         pass  # fall through to local approval path
 
@@ -18706,6 +18998,28 @@ def _handle_approval_respond(handler, body):
         ok = adapter.respond_approval(sid, approval_id, choice).accepted
     else:
         ok = _resolve_approval_legacy(sid, approval_id, choice)
+    if not ok and not _session_has_pending_approval(sid):
+        # The local resolution path returns False when an explicit approval_id
+        # was sent but no matching pending entry exists. There are two distinct
+        # causes, and only one is an error:
+        #   (a) a STALE CARD — the approval the card was rendered from already
+        #       resolved or its stream ended (cancel / fork / provider error /
+        #       completion while pending), so the agent's gateway entry was
+        #       dropped and reconcile purged the mirror. Nothing is pending for
+        #       this session anymore. Before #4771 the frontend was
+        #       fire-and-forget and this silently cleared the card; #4771 began
+        #       surfacing the bare {ok:false} as "Approval response not
+        #       accepted." with a STUCK card (reported by Jamie on .666 / b3nw;
+        #       the local-backend variant of #4948).
+        #   (b) a STALE EXPLICIT ID while a DIFFERENT approval IS live — that
+        #       MUST stay ok:false so a stale click on resolved approval A can
+        #       never resolve the unrelated live approval B (#527 guard).
+        # Distinguish them: when the session has NO pending approval at all,
+        # the click is benign — report it resolved so the UI clears the orphan
+        # card instead of dead-ending. When something IS still pending, keep
+        # the protective ok:false. `stale_cleared` lets the frontend log/branch
+        # without showing an error toast.
+        return j(handler, {"ok": True, "choice": choice, "stale_cleared": True})
     return j(handler, {"ok": ok, "choice": choice})
 
 

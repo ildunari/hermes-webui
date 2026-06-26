@@ -464,6 +464,185 @@ function enhanceMarkdownTables(root){
   });
 }
 
+function _sanitizeMarkdownTableCellText(cell){
+  if(!cell) return '';
+  const sortButton=cell.querySelector?cell.querySelector('.markdown-table-sort'):null;
+  if(sortButton){
+    const sortLabel=sortButton.querySelector?sortButton.querySelector('.markdown-table-sort-label'):null;
+    if(sortLabel) return _markdownTableCellText(sortLabel);
+    return _markdownTableCellText(sortButton);
+  }
+  return _markdownTableCellText(cell);
+}
+
+function _markdownTableCopyHtmlEscape(value){
+  return String(value||'')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;');
+}
+
+function _markdownTableCopyPayloadForTable(table){
+  if(!table||!table.rows) return null;
+  const rows=Array.from(table.rows||[]);
+  if(!rows.length) return null;
+  let headerRowCount=0;
+  while(headerRowCount<rows.length){
+    const cells=Array.from(rows[headerRowCount].cells||[]);
+    if(!cells.length||!cells.every((cell)=>cell&&cell.tagName==='TH')) break;
+    headerRowCount++;
+  }
+
+  const renderRows=(rowSet)=>rowSet.map((row)=>{
+    const cellTag=(cell)=>String(cell&&cell.tagName?cell.tagName.toLowerCase():'td');
+    const cells=Array.from(row.cells||[])
+      .filter((cell)=>cell&&cell.nodeType===1)
+      .map((cell)=>{
+        const tag=cellTag(cell);
+        const text=_sanitizeMarkdownTableCellText(cell);
+        return `<${tag}>${_markdownTableCopyHtmlEscape(text)}</${tag}>`;
+      })
+      .join('');
+    return `<tr>${cells}</tr>`;
+  }).join('');
+  const headerRows=headerRowCount?renderRows(rows.slice(0, headerRowCount)):'';
+  const bodyRows=renderRows(rows.slice(headerRowCount));
+  const tableSections=[
+    headerRows?`<thead>${headerRows}</thead>`:'',
+    bodyRows?`<tbody>${bodyRows}</tbody>`:'',
+  ].join('');
+
+  const plainRows=rows.map((row)=>{
+    return Array.from(row.cells||[])
+      .map(_sanitizeMarkdownTableCellText)
+      .join('\t');
+  }).join('\n');
+
+  return {html:`<table>${tableSections}</table>`, plain:plainRows};
+}
+
+function _findEnhancedMarkdownTable(node){
+  let current=node&&node.nodeType===3?node.parentElement:node;
+  while(current){
+    if(current.matches&&current.matches('table[data-markdown-table-enhanced]')) return current;
+    current=current.parentElement||current.parentNode;
+  }
+  return null;
+}
+
+function _findMarkdownTableCell(node){
+  let current=node&&node.nodeType===3?node.parentElement:node;
+  while(current){
+    if(current.matches&&current.matches('th,td')) return current;
+    current=current.parentElement||current.parentNode;
+  }
+  return null;
+}
+
+function _markdownTableNodeChildren(node){
+  if(!node) return [];
+  if(node.childNodes&&typeof node.childNodes.length==='number') return Array.from(node.childNodes);
+  if(node.children&&typeof node.children.length==='number') return Array.from(node.children);
+  return [];
+}
+
+function _markdownTableNodeBoundaryLength(node){
+  if(!node) return 0;
+  if(node.nodeType===3) return String(node.textContent||'').length;
+  return _markdownTableNodeChildren(node).length;
+}
+
+function _markdownTableBoundaryWithinCell(container, offset, cell, edge){
+  if(!container||!cell||typeof offset!=='number') return false;
+  const atStart=edge==='start';
+  let current=container;
+  let currentOffset=offset;
+  while(current){
+    const boundaryLength=_markdownTableNodeBoundaryLength(current);
+    if(atStart){
+      if(currentOffset!==0) return false;
+    }else if(currentOffset!==boundaryLength){
+      return false;
+    }
+    if(current===cell) return true;
+    const parent=current.parentElement||current.parentNode;
+    if(!parent) return false;
+    const siblings=_markdownTableNodeChildren(parent);
+    const index=siblings.indexOf(current);
+    if(index===-1) return false;
+    currentOffset=atStart?index:index+1;
+    current=parent;
+  }
+  return false;
+}
+
+function _markdownTableEdgeCell(table, edge){
+  const rows=Array.from(table&&table.rows||[]);
+  if(!rows.length) return null;
+  const row=edge==='start'?rows[0]:rows[rows.length-1];
+  const cells=Array.from(row&&row.cells||[]);
+  if(!cells.length) return null;
+  return edge==='start'?cells[0]:cells[cells.length-1];
+}
+
+function _isFullEnhancedMarkdownTableSelection(range, table){
+  if(!range||!table) return false;
+  const firstCell=_markdownTableEdgeCell(table,'start');
+  const lastCell=_markdownTableEdgeCell(table,'end');
+  if(!firstCell||!lastCell) return false;
+  const startCell=_findMarkdownTableCell(range.startContainer);
+  const endCell=_findMarkdownTableCell(range.endContainer);
+  if(startCell!==firstCell||endCell!==lastCell) return false;
+  return _markdownTableBoundaryWithinCell(range.startContainer, range.startOffset, firstCell, 'start')
+    && _markdownTableBoundaryWithinCell(range.endContainer, range.endOffset, lastCell, 'end');
+}
+
+function _findEnhancedMarkdownTableFromRange(range){
+  if(!range) return null;
+  const found=_findEnhancedMarkdownTable(range.startContainer)
+    || _findEnhancedMarkdownTable(range.endContainer)
+    || _findEnhancedMarkdownTable(range.commonAncestorContainer);
+  if(found) return found;
+  const container=range.commonAncestorContainer&&range.commonAncestorContainer.nodeType===3
+    ? range.commonAncestorContainer.parentElement
+    : range.commonAncestorContainer;
+  if(!container||!container.querySelectorAll||typeof range.intersectsNode!=='function') return null;
+  for(const table of container.querySelectorAll('table[data-markdown-table-enhanced]')){
+    try{
+      if(range.intersectsNode(table)) return table;
+    }catch(_){}
+  }
+  return null;
+}
+
+function _handleMarkdownTableCopy(event){
+  if(!event) return;
+  if(!window.getSelection)return;
+  const selection=window.getSelection();
+  if(!selection||selection.isCollapsed||!selection.rangeCount) return;
+  const range=selection.getRangeAt(0);
+  if(!range) return;
+  const startCell=_findMarkdownTableCell(range.startContainer);
+  const endCell=_findMarkdownTableCell(range.endContainer);
+  if(startCell&&endCell&&startCell===endCell) return;
+  const table=_findEnhancedMarkdownTableFromRange(range);
+  if(!table||!table.matches||!table.matches('table[data-markdown-table-enhanced]')) return;
+  if(!_isFullEnhancedMarkdownTableSelection(range, table)) return;
+  const payload=_markdownTableCopyPayloadForTable(table);
+  if(!payload) return;
+  const clipboardData=event.clipboardData||event.originalEvent&&event.originalEvent.clipboardData;
+  if(!clipboardData||typeof clipboardData.setData!=='function') return;
+  if(typeof event.preventDefault==='function') event.preventDefault();
+  clipboardData.setData('text/html', payload.html);
+  clipboardData.setData('text/plain', payload.plain);
+}
+
+function _wireMarkdownTableCopyHandler(root){
+  if(!root||!root.addEventListener||root.__markdownTableCopyHandlerInstalled) return;
+  root.addEventListener('copy', _handleMarkdownTableCopy);
+  root.__markdownTableCopyHandlerInstalled=true;
+}
+
 function _markdownTableText(value){
   return String(value||'').replace(/\s+/g,' ').trim();
 }
@@ -481,6 +660,7 @@ window.enhanceMarkdownTables=enhanceMarkdownTables;
     const result=baseRenderMessages.apply(this,args);
     const inner=typeof $==='function'?$('msgInner'):document.getElementById('msgInner');
     enhanceMarkdownTables(inner);
+    _wireMarkdownTableCopyHandler(inner);
     return result;
   };
   window.renderMessages._markdownTablesEnhanced=true;
@@ -2545,6 +2725,56 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(!message||typeof message!=='object') return '';
     return String(message.reasoning||message._reasoning||message.reasoning_content||message.thinking||'');
   }
+  // #4622: a settled tool row built from messages[].tool_calls (state.db/sidecar)
+  // can lack the result body — terminal stdout, or the diff/output that a
+  // patch/edit card renders — because the persisted row carries only a short
+  // preview (or, on a cold/paginated load, nothing). The full body lives on the
+  // live S.toolCalls entry at settle time. When a settled row and a live call
+  // match by tool id, restore the missing body fields from the live call onto
+  // the settled row's tool+payload (only when the settled value is empty — never
+  // clobber a genuine persisted body), so the rebuilt card shows full output +
+  // the Show-more expander + the rendered diff. Returns true if it enriched.
+  function _enrichSettledToolRowBodyFromLive(row, live){
+    if(!row||typeof row!=='object'||!live||typeof live!=='object') return false;
+    const tool=(row.tool&&typeof row.tool==='object')?row.tool:(row.tool={});
+    const payload=(row.payload&&typeof row.payload==='object')?row.payload:(row.payload={});
+    let enriched=false;
+    const _empty=v=>v===undefined||v===null||v==='';
+    // Result body: _anchorSceneToolCallFromRow renders tool.snippet||payload.snippet
+    // (||payload.result||payload.output) as the card output + diff source, so
+    // restore the snippet onto both tool+payload when the settled row has none.
+    const liveSnippet=_anchorSceneStringPayload(live.snippet||live.result||live.output);
+    // Restore the live body when the settled snippet is missing OR is a bounded
+    // preview of the live one. The backend persists a capped preview
+    // (_TOOL_RESULT_SNIPPET_MAX = 4000 chars in api/streaming.py), so a long
+    // terminal/tool output settles to that 4000-char prefix, not to empty —
+    // #4622's actual symptom. Treat a settled snippet as restorable when the
+    // live snippet is strictly longer AND the settled value is a prefix of it
+    // AND the settled value is at/over the persistence cap (i.e. it's a
+    // truncated preview, not a genuinely short real value we must not clobber).
+    const _SETTLED_SNIPPET_CAP=4000;
+    const _isBoundedPreview=(settled,full)=>(
+      typeof settled==='string'&&typeof full==='string'&&
+      full.length>settled.length&&settled.length>=_SETTLED_SNIPPET_CAP&&
+      full.startsWith(settled)
+    );
+    const _settledSnippet=(!_empty(tool.snippet)?tool.snippet:(!_empty(payload.snippet)?payload.snippet:''));
+    const _snippetRestorable=(_empty(tool.snippet)&&_empty(payload.snippet))||_isBoundedPreview(_settledSnippet,liveSnippet);
+    if(liveSnippet&&_snippetRestorable){
+      tool.snippet=liveSnippet; payload.snippet=liveSnippet; enriched=true;
+    }
+    // Command (shell detail-lead) + args (diff/input reconstruction, the "Full" tab).
+    const liveCommand=_anchorSceneStringPayload(live.command||live.raw_command);
+    if(liveCommand&&_empty(tool.command)&&_empty(payload.command)){
+      tool.command=liveCommand; payload.command=liveCommand; enriched=true;
+    }
+    const liveArgs=(live.args&&typeof live.args==='object')?live.args:null;
+    const argsEmpty=o=>!o||typeof o!=='object'||Object.keys(o).length===0;
+    if(liveArgs&&argsEmpty(tool.args)&&argsEmpty(payload.args)){
+      tool.args={...liveArgs}; payload.args={...liveArgs}; enriched=true;
+    }
+    return enriched;
+  }
   function _anchorSceneRowsByMessageIndex(messages, turnStart, lastAsstIndex){
     const byIdx=new Map();
     const add=(idx,row)=>{
@@ -2577,21 +2807,30 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(Array.isArray(message.tool_calls)) messageTools.push(...message.tool_calls);
       if(Array.isArray(message._partial_tool_calls)) messageTools.push(...message._partial_tool_calls);
       const seenToolIds=new Set();
+      const rowByToolId=new Map();
       for(const tool of messageTools){
         const row=_anchorSceneToolRowFromCall(tool,0,idx);
         pool.push({...row,_phase:1,_encounter:encounter++});
         const tid=row.tool_call_id||(row.tool&&row.tool.id);
-        if(tid) seenToolIds.add(tid);
+        if(tid){ seenToolIds.add(tid); rowByToolId.set(tid,row); }
       }
-      // Merge S.toolCalls for this index, dedup by tool id
+      // Merge S.toolCalls for this index, dedup by tool id. When a live call
+      // matches a settled row already in the pool, don't just skip it —
+      // restore any result body the settled row is missing (#4622): the live
+      // S.toolCalls entry carries the full terminal output / patch diff that the
+      // persisted state.db row may have dropped to a short preview or nothing.
       for(const tool of (toolsByIdx.get(idx)||[])){
         if(!tool||typeof tool!=='object') continue;
         const toolIdx=Number(tool.assistant_msg_idx);
         if(!Number.isFinite(toolIdx)||toolIdx!==idx) continue;
         const row=_anchorSceneToolRowFromCall(tool,0,idx);
         const tid=row.tool_call_id||(row.tool&&row.tool.id);
-        if(tid&&seenToolIds.has(tid)) continue;
-        if(tid) seenToolIds.add(tid);
+        if(tid&&seenToolIds.has(tid)){
+          const existing=rowByToolId.get(tid);
+          if(existing) _enrichSettledToolRowBodyFromLive(existing, tool);
+          continue;
+        }
+        if(tid){ seenToolIds.add(tid); rowByToolId.set(tid,row); }
         pool.push({...row,_phase:1,_encounter:encounter++});
       }
       // Stable sort by (phase, started_at, encounter)
@@ -2682,6 +2921,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(lastAsst&&lastAsst._turnDuration!==undefined&&lastAsst._turnDuration!==null) return lastAsst._turnDuration;
     if(base&&base.turn_duration!==undefined&&base.turn_duration!==null) return base.turn_duration;
     const session=(typeof S!=='undefined'&&S&&S.session)?S.session:null;
+    // The `pending_started_at` fallback below is the START of an IN-FLIGHT turn.
+    // For a SETTLED turn that recorded no live duration, computing
+    // `now - pending_started_at` is wrong: pending_started_at is either stale
+    // (left over from an earlier turn / a session that sat idle) or belongs to a
+    // different, still-pending turn — which rendered a bogus "Processed 15h 32m"
+    // on fresh conversations (#4930). Only use it while a turn is actually in
+    // flight; otherwise show no duration rather than a fabricated one.
+    const turnInFlight=!!(session&&(session.active_stream_id||session.pending_user_message));
+    if(!turnInFlight) return undefined;
     const candidates=[
       session&&session.pending_started_at,
       session&&session.active_started_at,
@@ -5302,6 +5550,7 @@ function hideApprovalCard(force=false) {
 let _approvalSessionId = null;
 let _approvalCurrentId = null;  // approval_id of the card currently shown
 let _approvalPendingBySession = new Map();
+let _approvalResponding = null;
 
 const _DISMISSED_APPROVALS_KEY = 'hermes_dismissed_approvals';
 
@@ -5390,6 +5639,27 @@ function _renderPendingApprovalForActiveSession() {
   if (entry) showApprovalCard(entry.pending, entry.pendingCount);
 }
 
+function _approvalResponseMatches(sid, approvalId) {
+  return !!(
+    _approvalResponding &&
+    _approvalResponding.sid === sid &&
+    (_approvalResponding.approvalId || null) === (approvalId || null)
+  );
+}
+
+function _setApprovalControlsDisabled(choice, disabled) {
+  ["approvalBtnOnce","approvalBtnSession","approvalBtnAlways","approvalBtnDeny"].forEach(id => {
+    const b = $(id);
+    if (!b) return;
+    b.disabled = !!disabled;
+    if (disabled && choice && b.id === "approvalBtn" + choice.charAt(0).toUpperCase() + choice.slice(1)) {
+      b.classList.add("loading");
+    } else {
+      b.classList.remove("loading");
+    }
+  });
+}
+
 function showApprovalForSession(sid, pending, pendingCount) {
   if (!pending) return;
   pending._session_id = sid;
@@ -5428,10 +5698,11 @@ function showApprovalCard(pending, pendingCount) {
     // approval's collapsed state, which would hide its command + action buttons. (#3515)
     card.classList.remove("collapsed");
   }
-  // Re-enable buttons in case a previous approval disabled them
-  ["approvalBtnOnce","approvalBtnSession","approvalBtnAlways","approvalBtnDeny"].forEach(id => {
-    const b = $(id); if (b) { b.disabled = false; b.classList.remove("loading"); }
-  });
+  const responding = _approvalResponseMatches(sid, _approvalCurrentId);
+  _setApprovalControlsDisabled(
+    responding ? _approvalResponding.choice : null,
+    responding,
+  );
   card.classList.add("visible");
   _syncApprovalCollapseButton(card);
   _syncApprovalTranscriptSpace(card, {immediate: true});
@@ -5500,6 +5771,14 @@ function _syncApprovalTranscriptSpace(card, opts) {
   setTimeout(measure, 420);
 }
 
+function _restoreFailedApprovalResponse(sid, errMsg) {
+  _approvalResponding = null;
+  _setApprovalControlsDisabled(null, false);
+  if (_approvalPromptBelongsToActiveSession(sid)) _renderPendingApprovalForActiveSession();
+  if (typeof showToast === "function") showToast(errMsg, 5000);
+  if (typeof setStatus === "function") setStatus(errMsg);
+}
+
 function toggleApprovalCardCollapsed(forceCollapsed) {
   const card = $("approvalCard");
   if (!card) return;
@@ -5513,22 +5792,56 @@ async function respondApproval(choice) {
   const sid = _approvalSessionId || (S.session && S.session.session_id);
   if (!sid) return;
   const approvalId = _approvalCurrentId;
+  if (_approvalResponseMatches(sid, approvalId)) return;
   _unmarkApprovalDismissed(sid, approvalId);
-  // Disable all buttons immediately to prevent double-submit
-  ["approvalBtnOnce","approvalBtnSession","approvalBtnAlways","approvalBtnDeny"].forEach(id => {
-    const b = $(id);
-    if (b) { b.disabled = true; if (b.id === "approvalBtn" + choice.charAt(0).toUpperCase() + choice.slice(1)) b.classList.add("loading"); }
-  });
-  _approvalSessionId = null;
-  _approvalCurrentId = null;
-  _clearApprovalPendingForSession(sid);
-  hideApprovalCard(true);
+  _approvalResponding = {sid, approvalId: approvalId || null, choice};
+  _setApprovalControlsDisabled(choice, true);
   try {
-    await api("/api/approval/respond", {
+    const result = await api("/api/approval/respond", {
       method: "POST",
       body: JSON.stringify({ session_id: sid, choice, approval_id: approvalId })
     });
-  } catch(e) { setStatus(t("approval_responding") + " " + e.message); }
+    if (result && result.ok) {
+      _approvalResponding = null;
+      const pendingEntry = _approvalPendingBySession.get(sid);
+      const samePending = !!(pendingEntry && pendingEntry.pending && (pendingEntry.pending.approval_id || null) === (approvalId || null));
+      // `stale_cleared` means the server found nothing pending for this session
+      // (the approval already resolved or its stream ended while the card was
+      // up). The orphan card must be cleared unconditionally so it can never
+      // get stuck — even if the displayed id has since drifted. (#4948 local
+      // variant: previously surfaced as a stuck "Approval response not
+      // accepted." toast.)
+      if (result.stale_cleared || (_approvalSessionId === sid && _approvalCurrentId === approvalId)) {
+        _approvalSessionId = null;
+        _approvalCurrentId = null;
+        hideApprovalCard(true);
+      }
+      if (samePending || result.stale_cleared) _clearApprovalPendingForSession(sid);
+      // Hardening for the narrow stale-clear race: a brand-new approval could
+      // have been parked server-side after the server's empty-check but before
+      // we processed this stale response. The unconditional clear above would
+      // hide that fresh card. Re-query the authoritative server pending state
+      // (same endpoint the fallback poll uses) so any approval that arrived in
+      // the window re-surfaces immediately instead of waiting for the next
+      // SSE/poll tick. Best-effort; poll/SSE remain the backstop. (Opus review
+      // nit on the #4948 fix.)
+      if (result.stale_cleared) {
+        api("/api/approval/pending?session_id=" + encodeURIComponent(sid), {timeoutToast: false})
+          .then(data => {
+            if (data && data.pending && _approvalPromptBelongsToActiveSession(sid)) {
+              showApprovalForSession(sid, data.pending, data.pending_count || 1);
+            }
+          })
+          .catch(() => {});
+      }
+      return;
+    }
+    const errMsg = (result && result.error) || "Approval response not accepted.";
+    _restoreFailedApprovalResponse(sid, errMsg);
+  } catch(e) {
+    const errMsg = (e && e.message) || (t("approval_responding") + " failed");
+    _restoreFailedApprovalResponse(sid, errMsg);
+  }
 }
 
 function startApprovalPolling(sid) {
