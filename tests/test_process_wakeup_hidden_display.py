@@ -57,6 +57,30 @@ def test_process_wakeup_context_backfill_does_not_surface_internal_user_row():
     assert [m["content"] for m in merged[-2:]] == ["next normal turn", "normal answer"]
 
 
+
+def test_api_visible_messages_filter_existing_process_wakeup_rows():
+    from api.routes import _visible_messages_for_client
+
+    leaked = {
+        "role": "user",
+        "_source": "process_wakeup",
+        "content": "[IMPORTANT: Background process proc_3e2cfd521406 completed (exit_code=1).\nCommand: ssh ...",
+    }
+    visible = [
+        {"role": "assistant", "content": "Same stale Cairo failure, already bypassed."},
+        leaked,
+        {"role": "assistant", "content": "I handled the background result."},
+    ]
+
+    filtered = _visible_messages_for_client(visible)
+
+    assert leaked not in filtered
+    assert [m["content"] for m in filtered] == [
+        "Same stale Cairo failure, already bypassed.",
+        "I handled the background result.",
+    ]
+
+
 def test_process_wakeup_pending_prompt_not_materialized_on_error():
     from api.streaming import _materialize_pending_user_turn_before_error
 

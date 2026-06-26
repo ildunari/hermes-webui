@@ -47,6 +47,21 @@ from api.session_events import (
 logger = logging.getLogger(__name__)
 
 
+def _is_internal_wakeup_message_for_display(msg) -> bool:
+    """Return True for server-internal wakeup prompts that clients must not render."""
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return False
+    if str(msg.get("_source") or "").strip() == "process_wakeup":
+        return True
+    text = str(msg.get("content") or "").lstrip()
+    return text.startswith("[IMPORTANT: Background process") or text.startswith("[ASYNC DELEGATION")
+
+
+def _visible_messages_for_client(messages) -> list:
+    """Filter internal process/subagent wakeup rows out of API-visible transcripts."""
+    return [m for m in list(messages or []) if not _is_internal_wakeup_message_for_display(m)]
+
+
 def _publish_session_list_changed(
     reason: str,
     *,
@@ -9911,7 +9926,14 @@ def handle_get(handler, parsed) -> bool:
                     _messages_offset,
                     len(_truncated_msgs),
                 )
-            _merged_message_count = _summary_message_count if _summary_message_count is not None else len(_all_msgs)
+            _visible_all_msgs = _visible_messages_for_client(_all_msgs)
+            _visible_truncated_msgs = _visible_messages_for_client(_truncated_msgs)
+            _summary_count_value = locals().get("_summary_message_count")
+            _merged_message_count = (
+                len(_visible_all_msgs)
+                if _visible_all_msgs or _all_msgs
+                else (_summary_count_value if _summary_count_value is not None else 0)
+            )
             _merged_last_message_at = _summary_last_message_at if _summary_last_message_at is not None else 0
             if _summary_last_message_at is None and _all_msgs:
                 try:
@@ -9931,7 +9953,7 @@ def handle_get(handler, parsed) -> bool:
             except TypeError:
                 compact_session = s.compact()
             raw = compact_session | {
-                "messages": _truncated_msgs,
+                "messages": _visible_truncated_msgs,
                 "message_count": _merged_message_count,
                 "tool_calls": _session_tool_calls,
                 "active_stream_id": getattr(s, "active_stream_id", None),
@@ -11114,7 +11136,7 @@ def handle_post(handler, parsed) -> bool:
                 profile=getattr(s, "profile", None),
                 session_id=getattr(s, "session_id", None),
             )
-        return j(handler, {"session": s.compact() | {"messages": s.messages}})
+        return j(handler, {"session": s.compact() | {"messages": _visible_messages_for_client(s.messages)}})
 
     if parsed.path == "/api/session/duplicate":
         try:
@@ -11202,7 +11224,7 @@ def handle_post(handler, parsed) -> bool:
                 session_id=getattr(copied_session, "session_id", None),
             )
 
-            return j(handler, {"session": copied_session.compact() | {"messages": copied_session.messages}})
+            return j(handler, {"session": copied_session.compact() | {"messages": _visible_messages_for_client(copied_session.messages)}})
         except Exception as e:
             return bad(handler, str(e))
 
@@ -11563,7 +11585,7 @@ def handle_post(handler, parsed) -> bool:
             except Exception:
                 logger.debug("Failed to close workspace terminal after workspace update")
         set_last_workspace(new_ws)
-        return j(handler, {"session": s.compact() | {"messages": s.messages}})
+        return j(handler, {"session": s.compact() | {"messages": _visible_messages_for_client(s.messages)}})
     if parsed.path == "/api/session/worktree/remove":
         sid = body.get("session_id", "")
         if not sid or not isinstance(sid, str) or not sid.strip():
@@ -11747,7 +11769,7 @@ def handle_post(handler, parsed) -> bool:
                 s.truncation_watermark or 0,
             )
         return j(
-            handler, {"ok": True, "session": s.compact() | {"messages": s.messages}}
+            handler, {"ok": True, "session": s.compact() | {"messages": _visible_messages_for_client(s.messages)}}
         )
 
     if parsed.path == "/api/session/branch":
@@ -17638,7 +17660,7 @@ def _handle_chat_sync(handler, body):
         {
             "answer": result.get("final_response") or "",
             "status": "done" if result.get("completed", True) else "partial",
-            "session": s.compact() | {"messages": s.messages},
+            "session": s.compact() | {"messages": _visible_messages_for_client(s.messages)},
             "result": {k: v for k, v in result.items() if k != "messages"},
         },
     )
@@ -19521,7 +19543,7 @@ def _handle_session_compress(handler, body):
 
         session_payload = redact_session_data(
             s.compact() | {
-                "messages": s.messages,
+                "messages": _visible_messages_for_client(s.messages),
                 "tool_calls": s.tool_calls,
                 "active_stream_id": s.active_stream_id,
                 "pending_user_message": s.pending_user_message,
@@ -20695,7 +20717,7 @@ def _handle_session_import(handler, body):
             SESSIONS.popitem(last=False)
     s.save()
     publish_session_list_changed("session_import")
-    return j(handler, {"ok": True, "session": s.compact() | {"messages": s.messages}})
+    return j(handler, {"ok": True, "session": s.compact() | {"messages": _visible_messages_for_client(s.messages)}})
 
 
 # ── MCP Server helpers ──
