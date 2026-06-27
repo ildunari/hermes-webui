@@ -586,3 +586,102 @@ console.log(JSON.stringify({ prevented: event.preventDefaultCalled, data: clipbo
     )
     assert out["prevented"] is False
     assert out["data"] == {}
+
+
+def test_table_element_anchored_selection_leaves_native_copy_unmodified():
+    """#5013: a drag/selection anchored on the <table> element itself (rather than
+    inside corner cells) must fall through to native copy — sanitization only fires
+    for a true full-cell-span selection."""
+    out = _run_js(
+        """
+const {table} = buildEnhancedTableFixture(true);
+
+// Selection anchored on the <table> node itself (a real-browser whole-table drag
+// can land start/end on the table/tr rather than inside the corner text nodes).
+const range = {
+  startContainer: table,
+  startOffset: 0,
+  endContainer: table,
+  endOffset: table.rows.length,
+  commonAncestorContainer: table,
+};
+
+window.getSelection = () => ({
+  isCollapsed: false,
+  rangeCount: 1,
+  getRangeAt: () => range,
+});
+
+const clipboard = {
+  data: {},
+  setData(type, value) {
+    this.data[type] = value;
+  }
+};
+
+const event = {
+  preventDefaultCalled: false,
+  preventDefault() {
+    this.preventDefaultCalled = true;
+  },
+  clipboardData: clipboard,
+};
+
+_handleMarkdownTableCopy(event);
+console.log(JSON.stringify({ prevented: event.preventDefaultCalled, data: clipboard.data }));
+"""
+    )
+    assert out["prevented"] is False
+    assert out["data"] == {}
+
+
+def test_cell_to_prose_selection_leaves_native_copy_unmodified():
+    """#5013: a selection that starts inside a table cell and ends in surrounding
+    prose must fall through to native copy (it is not a full-table selection, and
+    capturing it would clobber the trailing prose)."""
+    out = _run_js(
+        """
+const {root, table, body} = buildEnhancedTableFixture(true);
+const after = makeElement('p');
+after.appendChild(new FakeText('trailing prose'));
+root.appendChild(after);
+
+// Start inside a body cell's text, end in the trailing prose paragraph.
+const range = {
+  startContainer: body.cells[0].children[0],
+  startOffset: 0,
+  endContainer: after.children[0],
+  endOffset: after.children[0].textContent.length,
+  commonAncestorContainer: root,
+  intersectsNode(node) {
+    return node === table;
+  },
+};
+
+window.getSelection = () => ({
+  isCollapsed: false,
+  rangeCount: 1,
+  getRangeAt: () => range,
+});
+
+const clipboard = {
+  data: {},
+  setData(type, value) {
+    this.data[type] = value;
+  }
+};
+
+const event = {
+  preventDefaultCalled: false,
+  preventDefault() {
+    this.preventDefaultCalled = true;
+  },
+  clipboardData: clipboard,
+};
+
+_handleMarkdownTableCopy(event);
+console.log(JSON.stringify({ prevented: event.preventDefaultCalled, data: clipboard.data }));
+"""
+    )
+    assert out["prevented"] is False
+    assert out["data"] == {}

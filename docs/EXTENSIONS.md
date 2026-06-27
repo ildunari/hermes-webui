@@ -58,6 +58,13 @@ applies — installed extension code runs with full session authority — so onl
 install extensions from the vetted gallery or sources you trust as much as the
 WebUI source itself.
 
+Some gallery entries need more than WebUI assets. If an extension declares
+post-install guidance or lifecycle requirements such as a loopback sidecar or a
+native host, Settings -> Extensions shows a **Next step** note on the card after
+install. For example, Desktop Companion can install the WebUI bridge from the
+gallery, but the desktop pet is only visible after the local Desktop Companion
+app is started.
+
 ### Manual / advanced configuration (optional)
 
 `HERMES_WEBUI_EXTENSION_DIR` is **optional** and overrides the managed default.
@@ -414,4 +421,9 @@ directly with `fetch(..., { credentials: 'omit', cache: 'no-store' })` and a
 short timeout. WebUI does **not** proxy sidecar requests and does not send WebUI
 cookies to sidecars. A successful HTTP response is shown as healthy, a non-OK
 HTTP response as unhealthy, and CORS/network/timeouts as unreachable or blocked;
-health response bodies are never rendered.
+raw health response bodies are never rendered. If a healthy response includes an
+optional top-level `runtime` object, the panel may parse it and render only
+allowlisted scalar fields such as `sidecar`, `native_host`, `bridge`,
+`last_seen_at`, and `webui_origin`. This keeps sidecar-specific diagnostics
+machine-readable without making WebUI depend on any one extension's private
+payload shape.

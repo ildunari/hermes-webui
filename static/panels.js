@@ -4624,6 +4624,15 @@ function _memorySectionMtime(key) {
   return _memoryData.memory_mtime || 0;
 }
 
+function _memorySectionPath(key) {
+  if (!_memoryData) return '';
+  if (key === 'user') return _memoryData.user_path || '';
+  if (key === 'soul') return _memoryData.soul_path || '';
+  if (key === 'project_context') return _memoryData.project_context_path || '';
+  if (key === 'memory') return _memoryData.memory_path || '';
+  return '';
+}
+
 function _setMemoryHeaderButtons(mode) {
   const header = $('mainMemory') && $('mainMemory').querySelector('.main-view-header');
   const show = b => b && (b.style.display = '');
@@ -4727,8 +4736,10 @@ function _renderMemoryDetail(section) {
   const mtime = _memorySectionMtime(section);
   const mtimeStr = mtime ? new Date(mtime * 1000).toLocaleString() : '';
   const mtimeHtml = mtimeStr ? `<div class="memory-detail-mtime">${esc(mtimeStr)}</div>` : '';
-  const path = section === 'project_context' && _memoryData ? (_memoryData.project_context_path || '') : '';
-  const fileName = section === 'project_context' && _memoryData ? (_memoryData.project_context_name || (path.split(/[\\/]/).pop() || '')) : '';
+  const path = _memorySectionPath(section);
+  const fileName = section === 'project_context' && _memoryData
+    ? (_memoryData.project_context_name || (path.split(/[\\/]/).pop() || ''))
+    : (path.split(/[\\/]/).pop() || '');
   const pathHtml = path ? `<div class="memory-detail-mtime">${esc(fileName)} · ${esc(path)}</div>` : '';
   const shadowed = section === 'project_context' && _memoryData && Array.isArray(_memoryData.project_context_shadowed)
     ? _memoryData.project_context_shadowed
@@ -6472,6 +6483,8 @@ async function loadMemory(force) {
         el.className = 'side-menu-item';
         if (_currentMemorySection === s.key) el.classList.add('active');
         el.innerHTML = `${li(s.iconKey,16)}<span>${esc(_memorySectionLabel(s))}</span>`;
+        const sectionPath = _memorySectionPath(s.key);
+        if (sectionPath) el.title = sectionPath;
         el.onclick = () => openMemorySection(s.key, el);
         panel.appendChild(el);
       }
@@ -8090,6 +8103,74 @@ function _extensionSidecarHealthBadge(status,label){
   return `<span class="extension-sidecar-status-badge extension-sidecar-status-${safeStatus}">${esc(label||safeStatus)}</span>`;
 }
 
+function _extensionRuntimeStatusValue(value){
+  const normalized=String(value||'').trim().toLowerCase();
+  return ['running','connected','waiting','stale','unloaded','stopped','not_registered','unknown'].includes(normalized)
+    ? normalized
+    : 'unknown';
+}
+
+function _extensionRuntimeStatusLabel(value){
+  const normalized=_extensionRuntimeStatusValue(value);
+  if(normalized==='not_registered') return 'not registered';
+  return normalized.replace(/_/g,' ');
+}
+
+function _extensionRuntimeLastSeen(value){
+  const text=String(value??'').trim();
+  if(!/^\d+(?:\.\d+)?$/.test(text)) return '';
+  const raw=Number(text);
+  if(!Number.isFinite(raw)||raw<=0) return '';
+  const seconds=raw>1000000000000?raw/1000:raw;
+  const now=Math.floor(Date.now()/1000);
+  if(seconds>now+300) return '';
+  const age=Math.max(0,Math.floor(now-seconds));
+  if(age<5) return 'just now';
+  if(age<60) return `${age}s ago`;
+  const minutes=Math.floor(age/60);
+  if(minutes<60) return `${minutes}m ago`;
+  const hours=Math.floor(minutes/60);
+  if(hours<24) return `${hours}h ago`;
+  return `${Math.floor(hours/24)}d ago`;
+}
+
+function _extensionRuntimeOrigin(value){
+  const text=String(value||'').trim();
+  if(!text) return '';
+  try{
+    const parsed=new URL(text);
+    if(parsed.protocol==='http:'&&(parsed.hostname==='127.0.0.1'||parsed.hostname==='localhost')){
+      return parsed.origin;
+    }
+  }catch(_e){}
+  return '';
+}
+
+function _extensionRuntimeRows(runtime){
+  if(!runtime||typeof runtime!=='object') return [];
+  const rows=[];
+  if(Object.prototype.hasOwnProperty.call(runtime,'sidecar')){
+    rows.push(['Sidecar',_extensionRuntimeStatusLabel(runtime.sidecar)]);
+  }
+  if(Object.prototype.hasOwnProperty.call(runtime,'native_host')){
+    rows.push(['Native host',_extensionRuntimeStatusLabel(runtime.native_host)]);
+  }
+  if(Object.prototype.hasOwnProperty.call(runtime,'bridge')){
+    rows.push(['Bridge',_extensionRuntimeStatusLabel(runtime.bridge)]);
+  }
+  const lastSeen=_extensionRuntimeLastSeen(runtime.last_seen_at);
+  if(lastSeen) rows.push(['Last update',lastSeen]);
+  const origin=_extensionRuntimeOrigin(runtime.webui_origin);
+  if(origin) rows.push(['WebUI origin',origin]);
+  return rows;
+}
+
+function _extensionRuntimeDetails(runtime){
+  const rows=_extensionRuntimeRows(runtime);
+  if(!rows.length) return '';
+  return rows.map(([label,value])=>`<div><span>${esc(label)}</span><code>${esc(value)}</code></div>`).join('');
+}
+
 function _extensionSidecarCard(sidecars){
   const list=Array.isArray(sidecars)?sidecars:[];
   const body=list.length?`<div class="extension-sidecar-list">${list.map((sidecar,index)=>{
@@ -8111,6 +8192,7 @@ function _extensionSidecarCard(sidecars){
         <div><span>Health path</span><code>${esc(healthPath)}</code></div>
         <div><span>Health URL</span><code>${esc(healthUrl)}</code></div>
       </div>
+      <div class="extension-sidecar-runtime" data-sidecar-runtime-index="${index}" hidden></div>
     </div>`;
   }).join('')}</div>`:'<div class="extension-url-empty">No loopback sidecars declared.</div>';
   return `
@@ -8132,10 +8214,24 @@ function _setExtensionSidecarHealth(index,status,label){
   if(el) el.innerHTML=_extensionSidecarHealthBadge(status,label);
 }
 
+function _setExtensionSidecarRuntime(index,runtime){
+  const el=document.querySelector(`[data-sidecar-runtime-index="${index}"]`);
+  if(!el) return;
+  const details=_extensionRuntimeDetails(runtime);
+  if(!details){
+    el.hidden=true;
+    el.innerHTML='';
+    return;
+  }
+  el.hidden=false;
+  el.innerHTML=details;
+}
+
 async function _checkExtensionSidecarHealth(sidecar,index,seq){
   const healthUrl=sidecar&&sidecar.health_url;
   if(!healthUrl){
     _setExtensionSidecarHealth(index,'blocked','unreachable / blocked');
+    _setExtensionSidecarRuntime(index,null);
     return;
   }
   let controller=null;
@@ -8147,11 +8243,22 @@ async function _checkExtensionSidecarHealth(sidecar,index,seq){
     }
     const res=await fetch(healthUrl,{credentials:'omit',cache:'no-store',signal:controller?controller.signal:undefined});
     if(seq!==_extensionsSidecarMonitorSeq) return;
-    if(res.ok) _setExtensionSidecarHealth(index,'healthy','healthy');
-    else _setExtensionSidecarHealth(index,'unhealthy','unhealthy');
+    if(res.ok){
+      _setExtensionSidecarHealth(index,'healthy','healthy');
+      let body=null;
+      try{
+        body=await res.json();
+      }catch(_e){}
+      if(seq!==_extensionsSidecarMonitorSeq) return;
+      _setExtensionSidecarRuntime(index,body&&typeof body==='object'?body.runtime:null);
+    }else{
+      _setExtensionSidecarHealth(index,'unhealthy','unhealthy');
+      _setExtensionSidecarRuntime(index,null);
+    }
   }catch(_e){
     if(seq!==_extensionsSidecarMonitorSeq) return;
     _setExtensionSidecarHealth(index,'blocked','unreachable / blocked');
+    _setExtensionSidecarRuntime(index,null);
   }finally{
     if(timeoutId) clearTimeout(timeoutId);
   }
@@ -8276,18 +8383,27 @@ async function handleExtensionToggle(btn){
   }
 }
 
-async function loadExtensionsPanel(){
+async function loadExtensionsPanel(opts){
   const target=$('extensionsDiagnostics');
   const copyBtn=$('extensionsCopyDiagnosticsBtn');
   if(!target) return;
-  if(copyBtn) copyBtn.disabled=true;
+  // Only preserve REAL rendered diagnostics across a refresh — never the
+  // "Loading…" / error placeholders, or a failed refresh would leave the panel
+  // stuck on "Loading extension diagnostics…" instead of rendering the error.
+  const preserveExisting=!!(
+    opts&&opts.preserveExisting&&target.innerHTML.trim()
+    &&!target.querySelector('.extensions-loading,.extensions-error')
+  );
+  if(copyBtn&&!preserveExisting) copyBtn.disabled=true;
   const seq=++_extensionsSidecarMonitorSeq;
-  target.innerHTML='<div class="extensions-loading">Loading extension diagnostics…</div>';
+  if(!preserveExisting) target.innerHTML='<div class="extensions-loading">Loading extension diagnostics…</div>';
   try{
     const data=await api('/api/extensions/status');
     if(seq!==_extensionsSidecarMonitorSeq) return;
     _renderExtensionsPanel(data,seq);
   }catch(e){
+    if(seq!==_extensionsSidecarMonitorSeq) return;
+    if(preserveExisting&&target.innerHTML.trim()) return;
     _extensionsStatusData=null;
     if(copyBtn) copyBtn.disabled=true;
     target.innerHTML='<div class="extensions-error">Failed to load extension diagnostics: '+esc(e.message||String(e))+'</div>';
@@ -8303,7 +8419,52 @@ function switchExtensionsTab(tab){
   document.querySelectorAll('[data-extensions-pane]').forEach(pane=>{
     pane.hidden=pane.dataset.extensionsPane!==tab;
   });
+  if(tab==='diagnostics') loadExtensionsPanel({preserveExisting:true});
   if(tab==='gallery'&&!_extensionsGalleryLoaded) loadExtensionsGallery();
+}
+
+function _extensionSafeHttpUrl(value){
+  if(!value) return '';
+  const raw=String(value).trim();
+  if(!/^https?:\/\//i.test(raw)) return '';
+  try{
+    const url=new URL(raw);
+    if(url.username||url.password) return '';
+    return (url.protocol==='http:'||url.protocol==='https:')?url.href:'';
+  }catch(_){
+    return '';
+  }
+}
+
+function _extensionPostInstallNote(entry,isInstalled){
+  const lifecycle=(entry&&entry.lifecycle&&typeof entry.lifecycle==='object')?entry.lifecycle:{};
+  const post=(entry&&entry.post_install&&typeof entry.post_install==='object')?entry.post_install:null;
+  const needsSidecar=!!lifecycle.sidecar_start_required;
+  const needsNative=!!lifecycle.native_host_start_required;
+  const summary=post&&post.summary?String(post.summary):(
+    (needsSidecar||needsNative)
+      ? t('ext_gallery_local_component_required')
+      : ''
+  );
+  if(!summary) return '';
+  const docsUrl=_extensionSafeHttpUrl(post&&post.docs_url);
+  const localAppLabel=post&&post.local_app_label?String(post.local_app_label):t('ext_gallery_local_app_label');
+  const chips=[];
+  if(post&&post.requires_local_app===true) chips.push(t('ext_gallery_required_suffix',localAppLabel));
+  if(needsSidecar) chips.push(t('ext_gallery_sidecar_required'));
+  if(needsNative) chips.push(t('ext_gallery_native_host_required'));
+  const chipHtml=chips.length
+    ? '<div class="extension-gallery-next-chips">'+chips.map(item=>`<span>${esc(item)}</span>`).join('')+'</div>'
+    : '';
+  const docsHtml=docsUrl
+    ? `<a class="extension-gallery-next-link" href="${esc(docsUrl)}" target="_blank" rel="noopener noreferrer">${esc(t('ext_gallery_open_setup_guide'))}</a>`
+    : '';
+  return `<div class="extension-gallery-next-step">
+    <div class="extension-gallery-next-label">${esc(t(isInstalled?'ext_gallery_next_step':'ext_gallery_after_install'))}</div>
+    <div class="extension-gallery-next-summary">${esc(summary)}</div>
+    ${chipHtml}
+    ${docsHtml}
+  </div>`;
 }
 
 async function loadExtensionsGallery(){
@@ -8353,9 +8514,10 @@ function _renderExtensionsGallery(entries,statusData){
     const caps=Array.isArray(entry.capabilities)?entry.capabilities:[];
     const perms=entry.permissions||null;
     const isInstalled=installedIds.has(String(entry.id||''));
-    const restartRequired=!!(entry.lifecycle&&entry.lifecycle.restart_required);
+    const restartRequired=!!(entry.lifecycle&&(entry.lifecycle.restart_required||entry.lifecycle.webui_restart_required));
     const badgesHtml=caps.map(c=>`<span class="extension-gallery-badge">${esc(String(c))}</span>`).join('');
     const permsHtml=perms?`<details class="extension-gallery-perms"><summary data-i18n="ext_gallery_permissions_show">Permissions</summary><pre>${esc(JSON.stringify(perms,null,2))}</pre></details>`:'';
+    const postInstallHtml=_extensionPostInstallNote(entry,isInstalled);
     const actionBtn=isInstalled
       ?`<button class="extension-gallery-uninstall-btn" data-ext-uninstall-id="${id}" type="button" data-i18n="ext_gallery_uninstall">Uninstall</button>`
       :`<button class="extension-gallery-install-btn" data-ext-install-id="${id}" type="button" data-i18n="ext_gallery_install">Install</button>`;
@@ -8369,6 +8531,7 @@ function _renderExtensionsGallery(entries,statusData){
       </div>
       <div class="extension-gallery-desc">${desc}</div>
       ${badgesHtml?'<div class="extension-gallery-badge-row">'+badgesHtml+'</div>':''}
+      ${postInstallHtml}
       ${permsHtml}
       <div class="extension-gallery-actions">${actionBtn}</div>
     </div>`;
@@ -8396,15 +8559,18 @@ async function handleExtensionInstall(btn,entry){
   if(!btn||btn.disabled) return;
   const previousText=btn.textContent;
   btn.disabled=true;
-  btn.textContent='Installing…';
+  btn.textContent=t('ext_gallery_installing');
   try{
     const result=await api('/api/extensions/install',{method:'POST',body:JSON.stringify({
       id:entry.id,
       download_url:entry.download_url||entry.download,
       sha256:entry.sha256,
     })});
-    const restart=!!(entry.lifecycle&&entry.lifecycle.restart_required);
-    showToast(restart?'Extension installed. Restart required to apply.':'Extension installed successfully.');
+    const restart=!!(entry.lifecycle&&(entry.lifecycle.restart_required||entry.lifecycle.webui_restart_required));
+    const hasPostInstall=!!(entry.post_install||(entry.lifecycle&&(entry.lifecycle.sidecar_start_required||entry.lifecycle.native_host_start_required)));
+    showToast(restart
+      ? t('ext_gallery_install_restart_required')
+      : (hasPostInstall?t('ext_gallery_install_followup'):t('ext_gallery_install_ok')));
     _extensionsGalleryLoaded=false;
     await loadExtensionsGallery();
   }catch(e){
