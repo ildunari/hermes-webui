@@ -21786,6 +21786,16 @@ def _handle_goal_command(handler, body):
     return j(handler, payload)
 
 
+def _webui_moa_command_prompt(message: str) -> tuple[bool, str]:
+    """Return (is_moa_command, prompt) for WebUI-typed /moa turns."""
+    text = str(message or "").strip()
+    if text == "/moa":
+        return True, ""
+    if text.startswith("/moa ") or text.startswith("/moa\n"):
+        return True, text[4:].strip()
+    return False, text
+
+
 def _handle_chat_start(handler, body, diag=None):
     try:
         diag.stage("validate_session_id") if diag else None
@@ -21895,7 +21905,10 @@ def _handle_chat_start(handler, body, diag=None):
                 return bad(handler, "Session not found", 404)
         diag.stage("normalize_message") if diag else None
         msg = str(body.get("message", "")).strip()
+        force_moa_turn, msg = _webui_moa_command_prompt(msg)
         if not msg:
+            if force_moa_turn:
+                return bad(handler, "message is required after /moa")
             return bad(handler, "message is required")
         diag.stage("normalize_attachments") if diag else None
         attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
@@ -21917,14 +21930,18 @@ def _handle_chat_start(handler, body, diag=None):
             workspace = _resolve_chat_workspace_with_recovery(s, body.get("workspace"))
         except ValueError as e:
             return bad(handler, str(e))
-        requested_model = body.get("model") or s.model
+        requested_model = "default" if force_moa_turn else (body.get("model") or s.model)
         requested_provider = (
-            body.get("model_provider")
-            if "model_provider" in body
-            else getattr(s, "model_provider", None)
+            "moa"
+            if force_moa_turn
+            else (
+                body.get("model_provider")
+                if "model_provider" in body
+                else getattr(s, "model_provider", None)
+            )
         )
         _pp_provider, _pp_default, _pp_cfg = _read_profile_model_config(s, requested_provider)
-        explicit_model_pick = bool(body.get("explicit_model_pick"))
+        explicit_model_pick = True if force_moa_turn else bool(body.get("explicit_model_pick"))
         moa_config = None
         gateway_chat_enabled = webui_gateway_chat_enabled(get_config())
         if body.get("moa_config"):
@@ -22101,8 +22118,9 @@ def _handle_chat_sync(handler, body):
         return bad(handler, "Subagent sessions are view-only and cannot be written from WebUI", 400)
     s = get_session(body["session_id"])
     msg = str(body.get("message", "")).strip()
+    force_moa_turn, msg = _webui_moa_command_prompt(msg)
     if not msg:
-        return j(handler, {"error": "empty message"}, status=400)
+        return j(handler, {"error": "message is required after /moa" if force_moa_turn else "empty message"}, status=400)
     try:
         workspace = str(resolve_trusted_workspace(body.get("workspace") or s.workspace))
     except ValueError as e:
@@ -22110,11 +22128,18 @@ def _handle_chat_sync(handler, body):
     with _get_session_agent_lock(s.session_id):
         s.workspace = workspace
         _sync_requested_provider = (
-            body.get("model_provider") if "model_provider" in body else getattr(s, "model_provider", None)
+            "moa"
+            if force_moa_turn
+            else (
+                body.get("model_provider")
+                if "model_provider" in body
+                else getattr(s, "model_provider", None)
+            )
         )
+        _sync_requested_model = "default" if force_moa_turn else (body.get("model") or s.model)
         _pp_provider, _pp_default, _pp_cfg = _read_profile_model_config(s, _sync_requested_provider)
         model, model_provider = _resolve_compatible_session_model_state(
-            body.get("model") or s.model,
+            _sync_requested_model,
             _sync_requested_provider,
             profile_provider=_pp_provider,
             profile_default_model=_pp_default,
