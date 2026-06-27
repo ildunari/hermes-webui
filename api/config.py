@@ -3992,6 +3992,37 @@ def _invoke_models_rebuild(builder):
     return builder()
 
 
+def _append_moa_virtual_group(groups: list[dict], config: dict | None) -> None:
+    """Expose configured MoA presets as a virtual model-picker provider."""
+    if any(str(group.get("provider_id") or "").lower() == "moa" for group in groups):
+        return
+    if not isinstance(config, dict):
+        return
+    moa_cfg = config.get("moa")
+    if not isinstance(moa_cfg, dict):
+        return
+    presets = moa_cfg.get("presets")
+    if not isinstance(presets, dict) or not presets:
+        return
+
+    default_preset = str(moa_cfg.get("default_preset") or "").strip()
+    names = [str(name).strip() for name in presets if str(name).strip()]
+    if default_preset in names:
+        names = [default_preset] + [name for name in names if name != default_preset]
+    if not names:
+        return
+
+    groups.append(
+        {
+            "provider": "Mixture of Agents",
+            "provider_id": "moa",
+            "models": [{"id": name, "label": name} for name in names],
+            "source": "virtual",
+            "authenticated": True,
+        }
+    )
+
+
 def _configured_model_badges_from_static_catalog(
     groups: list[dict],
     *,
@@ -4464,6 +4495,7 @@ def _static_models_catalog_without_live_probes() -> dict:
                         }
                     )
 
+        _append_moa_virtual_group(groups, cfg)
         _deduplicate_model_ids(groups)
         groups = [
             group
@@ -6795,6 +6827,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # Post-process: ensure model IDs are globally unique across groups.
         # When multiple providers expose the same bare model ID, prefix
         # collisions with @provider_id: so the frontend can distinguish them.
+        _append_moa_virtual_group(groups, cfg)
         _deduplicate_model_ids(groups)
 
         # Defense-in-depth: drop any optgroup that ended up with zero models
