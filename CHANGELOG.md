@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **iPhone HEIC screenshots uploaded through chat now reach vision models even when Safari labels them as `.jpg`.** `/api/upload` now detects HEIC-family magic bytes at the attachment boundary and, when the platform converter is available, stores a PNG copy with `image/png` metadata before the agent sees it. This fixes the case where a WebUI attachment looked like `image_...jpg` in chat but contained `ftypheic` bytes, causing native vision/`vision_analyze` to reject it as "not a normal image file."
 - **Async `delegate_task` subagent completions now re-enter WebUI sessions.** Background subagents complete successfully in Hermes Agent but WebUI's completion drains only understood terminal `completion` events, so `async_delegation` queue events were skipped/requeued and never woke the chat. The WebUI drain now routes async delegation events by `session_key`, dedupes by `delegation_id`, formats the agent's self-contained subagent result block, and starts the same server-side wakeup turn used for terminal `notify_on_complete` completions. The raw wakeup block stays internal to the model context instead of rendering as a visible user bubble; only the assistant's follow-up appears in chat. Already-persisted `process_wakeup` rows are also filtered out of API-visible session payloads, so mobile/WebUI clients do not render stale raw backend blocks from older sessions.
 
 ## [v0.51.684] — 2026-06-26 — Release YN (copying a rendered table no longer drags its sort/filter chrome — or eats surrounding text)

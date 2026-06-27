@@ -5,6 +5,8 @@ import mimetypes
 import os
 import re as _re
 import email.parser
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -110,6 +112,79 @@ def _sanitize_upload_name(filename: str) -> str:
     return safe_name
 
 
+_HEIC_COMPATIBLE_BRANDS = {
+    b'heic',
+    b'heix',
+    b'hevc',
+    b'hevx',
+    b'heim',
+    b'heis',
+    b'hevm',
+    b'hevs',
+}
+
+
+def _is_heic_like_image(file_bytes: bytes) -> bool:
+    """Return True for HEIC-family image bytes, regardless of filename."""
+    if len(file_bytes) < 16 or file_bytes[4:8] != b'ftyp':
+        return False
+    box_size = int.from_bytes(file_bytes[:4], 'big')
+    if box_size < 16 or box_size > len(file_bytes):
+        return False
+    ftyp_end = min(len(file_bytes), box_size)
+    brands = {file_bytes[8:12]}
+    compat = file_bytes[16:ftyp_end]
+    brands.update(compat[i:i + 4] for i in range(0, len(compat) - 3, 4))
+    return any(brand in _HEIC_COMPATIBLE_BRANDS for brand in brands)
+
+
+def _png_name_for_upload(safe_name: str) -> str:
+    stem = Path(safe_name).stem or 'image'
+    return f'{stem}.png'
+
+
+def _convert_heic_upload_to_png(file_bytes: bytes) -> bytes | None:
+    """Convert HEIC/HEIF upload bytes to PNG when a local converter is available."""
+    sips = shutil.which('sips')
+    if not sips:
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix='webui-heic-') as tmpdir:
+            src = Path(tmpdir) / 'upload.heic'
+            dst = Path(tmpdir) / 'upload.png'
+            src.write_bytes(file_bytes)
+            result = subprocess.run(
+                [sips, '-s', 'format', 'png', str(src), '--out', str(dst)],
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode != 0 or not dst.exists():
+                return None
+            if dst.stat().st_size > MAX_UPLOAD_BYTES:
+                return None
+            png = dst.read_bytes()
+            return png if png.startswith(b'\x89PNG\r\n\x1a\n') else None
+    except Exception:
+        return None
+
+
+def _normalize_upload_image_bytes(safe_name: str, file_bytes: bytes) -> tuple[str, bytes, str, bool, str | None]:
+    """Return upload name/bytes/mime/is_image, converting HEIC-family images to PNG.
+
+    iOS/Safari can send HEIC bytes under a misleading .jpg filename. Downstream
+    native-vision paths validate actual image magic bytes, so storing the original
+    mislabeled bytes makes attached screenshots unusable. Normalize these uploads
+    at the inbox boundary when conversion is available.
+    """
+    if _is_heic_like_image(file_bytes):
+        png = _convert_heic_upload_to_png(file_bytes)
+        if png and len(png) <= MAX_UPLOAD_BYTES:
+            return _png_name_for_upload(safe_name), png, 'image/png', True, 'image/heic'
+        return safe_name, file_bytes, 'image/heic', False, None
+    mime = mimetypes.guess_type(safe_name)[0] or 'application/octet-stream'
+    return safe_name, file_bytes, mime, mime.startswith('image/'), None
+
+
 def _attachment_root() -> Path:
     """Return the configured upload inbox root.
 
@@ -129,17 +204,30 @@ def _upload_destination(session_id: str, safe_name: str) -> Path:
     dest = (dest_dir / safe_name).resolve()
     if not dest.is_relative_to(dest_dir):
         raise ValueError('Invalid upload destination')
-    if dest.exists():
+    if dest.exists() or dest.is_symlink():
         stem = dest.stem
         suffix = dest.suffix
         for idx in range(1, 1000):
             candidate = (dest_dir / f'{stem}-{idx}{suffix}').resolve()
             if not candidate.is_relative_to(dest_dir):
                 raise ValueError('Invalid upload destination')
-            if not candidate.exists():
+            if not candidate.exists() and not candidate.is_symlink():
                 return candidate
         raise ValueError('Too many uploads with the same filename')
     return dest
+
+
+def _write_upload_bytes(dest: Path, file_bytes: bytes) -> None:
+    """Create an upload file without following raced/pre-existing symlinks."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, 'O_NOFOLLOW'):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(dest, flags, 0o600)
+    except FileExistsError:
+        raise ValueError('Upload destination already exists') from None
+    with os.fdopen(fd, 'wb') as fh:
+        fh.write(file_bytes)
 
 
 def _session_attachment_dir(session_id: str, *, root: Path | None = None) -> Path:
@@ -169,16 +257,19 @@ def handle_upload(handler):
         except KeyError:
             return j(handler, {'error': 'Session not found'}, status=404)
         safe_name = _sanitize_upload_name(filename)
+        safe_name, file_bytes, mime, is_image, converted_from = _normalize_upload_image_bytes(safe_name, file_bytes)
         dest = _upload_destination(session_id, safe_name)
-        dest.write_bytes(file_bytes)
-        mime = mimetypes.guess_type(safe_name)[0] or 'application/octet-stream'
-        return j(handler, {
+        _write_upload_bytes(dest, file_bytes)
+        payload = {
             'filename': dest.name,
             'path': str(dest),
             'size': dest.stat().st_size,
             'mime': mime,
-            'is_image': mime.startswith('image/'),
-        })
+            'is_image': is_image,
+        }
+        if converted_from:
+            payload['converted_from'] = converted_from
+        return j(handler, payload)
     except ValueError as e:
         return j(handler, {'error': str(e)}, status=400)
     except Exception:

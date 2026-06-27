@@ -7878,9 +7878,20 @@ function _pendingCurrentTailUserMessage(messages){
   return null;
 }
 
+function _isInternalWakeupPendingSession(session,text){
+  const source=String(session?.pending_user_source||'').trim();
+  if(source==='process_wakeup') return true;
+  const value=String(text||'').trimStart();
+  return value.startsWith('[IMPORTANT: Background process')||
+    value.startsWith('[IMPORTANT: Watch-pattern')||
+    value.startsWith('[IMPORTANT: Watch patterns')||
+    value.startsWith('[ASYNC DELEGATION');
+}
+
 function getPendingSessionMessage(session, messagesOverride=null){
   const text=String(session?.pending_user_message||'').trim();
   if(!text) return null;
+  if(_isInternalWakeupPendingSession(session,text)) return null;
   const attachments=Array.isArray(session?.pending_attachments)?session.pending_attachments.filter(Boolean):[];
   const sourceMessages=Array.isArray(messagesOverride)?messagesOverride:session?.messages;
   const messages=Array.isArray(sourceMessages)?sourceMessages:[];

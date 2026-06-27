@@ -47,19 +47,53 @@ from api.session_events import (
 logger = logging.getLogger(__name__)
 
 
+def _is_internal_wakeup_source(source) -> bool:
+    """Return True for server-internal wakeup prompts, not human-authored chat."""
+    return str(source or "").strip() == "process_wakeup"
+
+
+def _is_internal_wakeup_text(text) -> bool:
+    """Return True for legacy wakeup prompts that were persisted before _source tags."""
+    value = str(text or "").lstrip()
+    return (
+        value.startswith("[IMPORTANT: Background process")
+        or value.startswith("[IMPORTANT: Watch-pattern")
+        or value.startswith("[IMPORTANT: Watch patterns")
+        or value.startswith("[ASYNC DELEGATION")
+    )
+
+
 def _is_internal_wakeup_message_for_display(msg) -> bool:
     """Return True for server-internal wakeup prompts that clients must not render."""
     if not isinstance(msg, dict) or msg.get("role") != "user":
         return False
-    if str(msg.get("_source") or "").strip() == "process_wakeup":
+    if _is_internal_wakeup_source(msg.get("_source")):
         return True
-    text = str(msg.get("content") or "").lstrip()
-    return text.startswith("[IMPORTANT: Background process") or text.startswith("[ASYNC DELEGATION")
+    return _is_internal_wakeup_text(msg.get("content"))
 
 
 def _visible_messages_for_client(messages) -> list:
     """Filter internal process/subagent wakeup rows out of API-visible transcripts."""
     return [m for m in list(messages or []) if not _is_internal_wakeup_message_for_display(m)]
+
+
+def _pending_user_message_for_client(session):
+    """Hide server-internal wakeup prompts while preserving active stream metadata."""
+    pending = getattr(session, "pending_user_message", None)
+    if not pending:
+        return pending
+    if _is_internal_wakeup_source(getattr(session, "pending_user_source", None)):
+        return None
+    if _is_internal_wakeup_text(pending):
+        return None
+    return pending
+
+
+def _pending_user_source_for_client(session):
+    """Hide the source tag when the pending message itself is hidden."""
+    if _pending_user_message_for_client(session) is None:
+        return None
+    return getattr(session, "pending_user_source", None)
 
 
 def _publish_session_list_changed(
@@ -9834,8 +9868,9 @@ def handle_get(handler, parsed) -> bool:
                 _summary_message_count = None
                 _summary_last_message_at = None
             if load_messages:
+                _display_all_msgs = _visible_messages_for_client(_all_msgs)
                 _truncated_msgs, _messages_offset = _message_window_for_display(
-                    _all_msgs,
+                    _display_all_msgs,
                     msg_limit=msg_limit,
                     msg_before=msg_before,
                     expand_renderable=expand_renderable,
@@ -9849,6 +9884,7 @@ def handle_get(handler, parsed) -> bool:
                     tool_calls=getattr(s, "tool_calls", None),
                 )
             else:
+                _display_all_msgs = []
                 _truncated_msgs = []
                 _messages_offset = 0
             # Index of the first returned message in the full message array.
@@ -9926,8 +9962,8 @@ def handle_get(handler, parsed) -> bool:
                     _messages_offset,
                     len(_truncated_msgs),
                 )
-            _visible_all_msgs = _visible_messages_for_client(_all_msgs)
-            _visible_truncated_msgs = _visible_messages_for_client(_truncated_msgs)
+            _visible_all_msgs = _display_all_msgs if load_messages else _visible_messages_for_client(_all_msgs)
+            _visible_truncated_msgs = _truncated_msgs
             _summary_count_value = locals().get("_summary_message_count")
             _merged_message_count = (
                 len(_visible_all_msgs)
@@ -9957,10 +9993,10 @@ def handle_get(handler, parsed) -> bool:
                 "message_count": _merged_message_count,
                 "tool_calls": _session_tool_calls,
                 "active_stream_id": getattr(s, "active_stream_id", None),
-                "pending_user_message": getattr(s, "pending_user_message", None),
+                "pending_user_message": _pending_user_message_for_client(s),
                 "pending_attachments": getattr(s, "pending_attachments", []) if load_messages else [],
                 "pending_started_at": getattr(s, "pending_started_at", None),
-                "pending_user_source": getattr(s, "pending_user_source", None),
+                "pending_user_source": _pending_user_source_for_client(s),
                 "context_length": _persisted_cl,
                 "threshold_tokens": _threshold_tokens,
                 "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
@@ -16595,7 +16631,7 @@ def _prepare_chat_start_session_for_stream(
     s.pending_started_at = started_at if started_at is not None else time.time()
     s.pending_user_source = source
     current_title = getattr(s, "title", None)
-    if _is_default_or_empty_session_title(current_title):
+    if source != "process_wakeup" and _is_default_or_empty_session_title(current_title):
         provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
         if provisional_title and not _is_default_or_empty_session_title(provisional_title):
             s.title = provisional_title
@@ -20564,7 +20600,7 @@ def _handle_session_import_cli(handler, body):
             {
                 "session": existing.compact()
                 | {
-                    "messages": existing.messages,
+                    "messages": _visible_messages_for_client(existing.messages),
                     "is_cli_session": True,
                     "read_only": bool((cli_meta or {}).get("read_only")),
                 },
