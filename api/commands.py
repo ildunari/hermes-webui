@@ -6,9 +6,12 @@ so the frontend can still load with WEBUI_ONLY commands.
 """
 from __future__ import annotations
 from contextlib import nullcontext
+import json
 import logging
+from pathlib import Path
 import threading
 from typing import Any
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +30,45 @@ _AGENT_COMMAND_ALIASES = {
     'reload_mcp': 'reload-mcp',
     'reload_skills': 'reload-skills',
     'codex_runtime': 'codex-runtime',
+    'restart_gateways': 'restart-gateways',
+    'restart_hermes': 'restart-hermes',
+    'update_smart': 'update-smart',
 }
-_ALLOWED_AGENT_COMMANDS = frozenset({'reload-mcp', 'reload-skills', 'codex-runtime', 'credits'})
+_ALLOWED_AGENT_COMMANDS = frozenset({
+    'reload-mcp',
+    'reload-skills',
+    'codex-runtime',
+    'credits',
+    'restart-gateways',
+    'restart-hermes',
+})
 _RELOAD_MCP_LOCK = threading.Lock()
 _RELOAD_SKILLS_LOCK = threading.Lock()
 _CODEX_RUNTIME_LOCK = threading.Lock()
+_RESTART_STATUS_DIR = Path.home() / ".hermes" / "webui-command-status"
+
+
+def _restart_status_path(status_id: str) -> Path:
+    safe = str(status_id or "").strip()
+    if not safe or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for ch in safe):
+        raise ValueError("invalid restart status id")
+    return _RESTART_STATUS_DIR / f"{safe}.json"
+
+
+def read_restart_status(status_id: str) -> dict[str, Any]:
+    """Read a WebUI restart completion marker."""
+
+    path = _restart_status_path(status_id)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"status": "pending", "id": status_id}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Restart status marker is invalid") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Restart status marker is invalid")
+    payload.setdefault("id", status_id)
+    return payload
 
 
 def _parse_agent_command(command: str) -> tuple[str, str]:
@@ -204,7 +241,7 @@ def resolve_bundle_command(command: str) -> dict[str, Any]:
     }
 
 
-def execute_agent_command(command: str) -> str:
+def execute_agent_command(command: str) -> str | dict[str, Any]:
     """Execute a narrow allowlist of agent-side runtime commands."""
 
     canonical, arg_string = _parse_agent_command(command)
@@ -219,8 +256,77 @@ def execute_agent_command(command: str) -> str:
         return _run_codex_runtime_command(arg_string)
     if canonical == 'credits':
         return _run_credits_command()
+    if canonical in {'restart-gateways', 'restart-hermes'}:
+        return _run_restart_surfaces_command(canonical, arg_string)
 
     raise KeyError(canonical)
+
+
+def resolve_skill_command(command: str) -> dict[str, Any]:
+    """Expand a skill slash command into the prompt the agent should run."""
+
+    command_name, user_instruction = _parse_slash_command(command)
+    command_key = f"/{_AGENT_COMMAND_ALIASES.get(command_name, command_name)}"
+    try:
+        from agent.skill_commands import (
+            build_skill_invocation_message,
+            scan_skill_commands,
+        )
+    except ImportError as exc:
+        logger.warning("Skill command runtime unavailable", exc_info=True)
+        raise RuntimeError("Skill command runtime unavailable") from exc
+
+    try:
+        with _bundle_profile_context("/api/commands/skills/resolve"):
+            commands = scan_skill_commands()
+            if command_key not in commands:
+                raise KeyError(command_key)
+            message = build_skill_invocation_message(command_key, user_instruction)
+    except (KeyError, ValueError, RuntimeError):
+        raise
+    except Exception as exc:
+        logger.warning("Failed to resolve skill command", exc_info=True)
+        raise RuntimeError("Skill command unavailable") from exc
+
+    resolved_message = str(message or "").strip()
+    if not resolved_message:
+        raise RuntimeError("Skill command returned no invocation text")
+
+    info = commands.get(command_key) or {}
+    return {
+        "name": str(info.get("name") or command_key.lstrip('/')),
+        "source": "skill",
+        "message": resolved_message,
+    }
+
+
+def _run_restart_surfaces_command(canonical: str, arg_string: str) -> dict[str, Any]:
+    """Queue a detached Hermes surface restart from WebUI."""
+
+    try:
+        from hermes_cli.restart_surfaces import enqueue_detached_restart
+    except Exception as exc:
+        logger.warning("Restart surfaces helper unavailable", exc_info=True)
+        raise RuntimeError("Restart helper unavailable") from exc
+
+    args = str(arg_string or "").split()
+    dry_run = any(
+        arg.lower() in {"--dry-run", "dry-run", "smoke", "test", "plan"}
+        for arg in args
+    )
+    scope = "gateways" if canonical == "restart-gateways" else "hermes"
+    status_id = "" if dry_run else uuid4().hex
+    marker = "" if dry_run else str(_restart_status_path(status_id))
+    output = enqueue_detached_restart(
+        scope,
+        delay=1.0,
+        dry_run=dry_run,
+        completion_marker=marker or None,
+    )
+    result: dict[str, Any] = {"output": output}
+    if status_id:
+        result["restart_status_id"] = status_id
+    return result
 
 
 def _run_codex_runtime_command(arg_string: str) -> str:

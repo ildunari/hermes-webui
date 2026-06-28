@@ -1127,7 +1127,8 @@ const _sessionTitleProvisionalBySid = new Map();
 // their canonical command is registered on the backend (for example
 // /reload-mcp). Keep this intentionally narrow and include underscore variants
 // observed by users so typing either form still routes through executeAgentCommand.
-const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set(['reload-mcp', 'reload_mcp', 'reload-skills', 'reload_skills', 'codex-runtime', 'codex_runtime', 'credits']);
+const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set(['reload-mcp', 'reload_mcp', 'reload-skills', 'reload_skills', 'codex-runtime', 'codex_runtime', 'credits', 'restart-gateways', 'restart_gateways', 'restart-hermes', 'restart_hermes']);
+const _AGENT_COMMANDS_RESOLVE_AS_SKILL = new Set(['update-smart', 'update_smart']);
 
 function _clearStaleBusyStateBeforeSend({compressionRunning=false}={}){
   if(!S||!S.busy||compressionRunning) return false;
@@ -1361,7 +1362,23 @@ async function send(){
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
       const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'').trim().toLowerCase();
-      if(_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)){
+      if(_AGENT_COMMANDS_RESOLVE_AS_SKILL.has(_agentCmdName)){
+        try{
+          const _skillResolved=typeof resolveSkillCommand==='function'
+            ? await resolveSkillCommand(text,_agentCmd||{name:_agentCmdName})
+            : null;
+          const _skillMessage=String(_skillResolved&&_skillResolved.message||'').trim();
+          if(!_skillMessage) throw new Error('Skill command runtime returned no invocation text.');
+          _slashDisplayTextOverride=text;
+          text=_skillMessage;
+        }catch(e){
+          if(!S.session){await newSession();await renderSessionList();}
+          S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+          S.messages.push({role:'assistant',content:`Skill command error: ${e&&e.message||e}`,_ts:Date.now()/1000});
+          renderMessages();
+          $('msg').value='';autoResize();hideCmdDropdown();return;
+        }
+      } else if(_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)){
         if(!S.session){await newSession();await renderSessionList();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         let _agentOutput='(no output)';

@@ -303,17 +303,60 @@ async function executeAgentPluginCommand(text,_meta){
 async function _runAgentCommandTransport(text,_meta){
   const command=String(text||'').trim();
   if(!command) throw new Error('command is required');
+  const body={command};
+  const initiatingSessionId=(typeof S==='object'&&S&&S.session&&S.session.session_id)?S.session.session_id:'';
+  if(initiatingSessionId) body.session_id=initiatingSessionId;
   const data=await api('/api/commands/exec',{
     method:'POST',
-    body:JSON.stringify({command})
+    body:JSON.stringify(body)
   });
+  if(data&&data.restart_status_id&&typeof monitorAgentCommandRestartStatus==='function') {
+    monitorAgentCommandRestartStatus(data.restart_status_id, initiatingSessionId);
+  }
   return String(data&&data.output||'(no output)');
+}
+
+async function monitorAgentCommandRestartStatus(statusId, sessionId){
+  const id=String(statusId||'').trim();
+  const targetSessionId=String(sessionId||'').trim();
+  if(!id)return;
+  const started=Date.now();
+  const timeoutMs=45*60*1000;
+  let delay=1500;
+  while(Date.now()-started<timeoutMs){
+    await new Promise(r=>setTimeout(r,delay));
+    delay=Math.min(5000,Math.round(delay*1.25));
+    let data=null;
+    try{
+      data=await api('/api/commands/restart-status?id='+encodeURIComponent(id));
+    }catch(_e){
+      continue;
+    }
+    if(!data||data.status!=='complete')continue;
+    const msg=String(data.message||'Hermes restart finished.').trim();
+    const activeSessionId=(typeof S==='object'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
+    if((!targetSessionId||targetSessionId===activeSessionId)&&typeof S==='object'&&S&&Array.isArray(S.messages)){
+      S.messages.push({role:'assistant',content:msg,_ts:Date.now()/1000});
+      if(typeof renderMessages==='function')renderMessages();
+    }
+    if(typeof showToast==='function')showToast(msg,3500,data.exit_code===0?'success':'error');
+    return;
+  }
 }
 
 async function resolveBundleCommand(text,_meta){
   const command=String(text||'').trim();
   if(!command) throw new Error('command is required');
   return api('/api/commands/bundles/resolve',{
+    method:'POST',
+    body:JSON.stringify({command})
+  });
+}
+
+async function resolveSkillCommand(text,_meta){
+  const command=String(text||'').trim();
+  if(!command) throw new Error('command is required');
+  return api('/api/commands/skills/resolve',{
     method:'POST',
     body:JSON.stringify({command})
   });

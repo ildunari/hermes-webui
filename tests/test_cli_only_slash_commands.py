@@ -7,7 +7,7 @@ import tempfile
 import textwrap
 from types import SimpleNamespace
 
-from api.commands import list_commands
+from api.commands import execute_agent_command, list_commands, resolve_skill_command
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -419,6 +419,19 @@ def test_send_intercepts_cli_only_commands_before_agent_round_trip():
     assert "return;" in intercept
 
 
+def test_send_intercepts_update_smart_skill_command_before_agent_round_trip():
+    intercept_idx = MESSAGES_JS.find("Slash command intercept")
+    normal_send_idx = MESSAGES_JS.find("const activeSid=S.session.session_id", intercept_idx)
+    assert normal_send_idx != -1
+    intercept = MESSAGES_JS[intercept_idx:normal_send_idx]
+
+    assert "const _AGENT_COMMANDS_RESOLVE_AS_SKILL" in MESSAGES_JS
+    assert "'update-smart'" in MESSAGES_JS
+    assert "'update_smart'" in MESSAGES_JS
+    assert "await resolveSkillCommand(text,_agentCmd||{name:_agentCmdName})" in intercept
+    assert "text=_skillMessage;" in intercept
+
+
 def test_send_intercepts_bundle_commands_before_agent_round_trip():
     intercept_idx = MESSAGES_JS.find("Slash command intercept")
     normal_send_idx = MESSAGES_JS.find("const activeSid=S.session.session_id", intercept_idx)
@@ -453,6 +466,15 @@ def test_send_intercepts_reload_mcp_agent_command_before_agent_round_trip():
     assert "const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'')" in intercept
     assert "if(_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName))" in intercept
     assert "executeAgentCommand(text,_agentCmd||{name:_agentCmdName})" in intercept
+
+
+def test_restart_gateways_webui_intercept_aliases_are_defined_in_js_whitelist():
+    assert "'restart-gateways'" in MESSAGES_JS
+    assert "'restart_gateways'" in MESSAGES_JS
+    assert "'restart-hermes'" in MESSAGES_JS
+    assert "'restart_hermes'" in MESSAGES_JS
+    assert "monitorAgentCommandRestartStatus" in COMMANDS_JS
+    assert "/api/commands/restart-status?id=" in COMMANDS_JS
 
 
 def test_reload_mcp_reload_skills_and_codex_runtime_webui_intercept_aliases_are_defined_in_js_whitelist():
@@ -514,12 +536,13 @@ def test_unknown_slash_commands_still_fall_through_to_agent():
 
     assert "if(_bundleCmd){" in intercept
     assert "if(_agentCmd&&_agentCmd.cli_only)" in intercept
-    assert "if(_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName))" in intercept
+    assert "_AGENT_COMMANDS_RESOLVE_AS_SKILL.has(_agentCmdName)" in intercept
+    assert "_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)" in intercept
     assert "if(_agentCmd&&_agentCmd.category==='Plugin')" in intercept
     assert "if(_parsedCmd&&!_cmd)" in intercept
     assert "if(!_agentCmd" not in intercept
     assert "if(_agentCmd){" not in intercept
-    assert "else" not in intercept[intercept.find("if(_agentCmd&&_agentCmd.cli_only)") :]
+    assert "executeAgentCommand(text,_agentCmd||{name:_agentCmdName})" in intercept
 
 
 def test_builtin_command_opt_outs_do_not_hit_agent_metadata_lookup():
@@ -533,3 +556,44 @@ def test_builtin_command_opt_outs_do_not_hit_agent_metadata_lookup():
     assert optout_idx != -1
     assert metadata_idx != -1
     assert "if(_parsedCmd&&!_cmd)" in intercept[optout_idx:metadata_idx + 120]
+
+
+def test_restart_gateway_command_api_returns_status_id(monkeypatch, tmp_path):
+    import api.commands as commands
+
+    monkeypatch.setattr(commands, "_RESTART_STATUS_DIR", tmp_path)
+
+    called = {}
+
+    def fake_enqueue(scope, **kwargs):
+        called["scope"] = scope
+        called["kwargs"] = kwargs
+        return "queued restart"
+
+    monkeypatch.setattr("hermes_cli.restart_surfaces.enqueue_detached_restart", fake_enqueue)
+
+    result = execute_agent_command("/restart_gateways")
+
+    assert result["output"] == "queued restart"
+    assert result["restart_status_id"]
+    assert called["scope"] == "gateways"
+    assert called["kwargs"]["completion_marker"].endswith(f"{result['restart_status_id']}.json")
+
+
+def test_update_smart_skill_command_resolves_via_skill_runtime(monkeypatch):
+    import types
+
+    skill_commands = types.ModuleType("agent.skill_commands")
+    skill_commands.scan_skill_commands = lambda: {
+        "/update-smart": {"name": "update-smart"},
+    }
+    skill_commands.build_skill_invocation_message = lambda key, args: f"invoke {key} with {args}"
+    monkeypatch.setitem(__import__("sys").modules, "agent.skill_commands", skill_commands)
+
+    result = resolve_skill_command("/update_smart carefully")
+
+    assert result == {
+        "name": "update-smart",
+        "source": "skill",
+        "message": "invoke /update-smart with carefully",
+    }
