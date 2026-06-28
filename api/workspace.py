@@ -373,6 +373,29 @@ def save_workspaces(workspaces: list) -> None:
     ws_file.write_text(json.dumps(workspaces, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
+def _remember_workspace_in_picker(path: str) -> None:
+    """Best-effort sync from last-used workspace into the saved picker list.
+
+    Session switching and chat start already validate/trust the workspace before
+    calling ``set_last_workspace``.  Keep the picker list aligned with that
+    accepted state so ``last_workspace.txt`` cannot point at a path missing from
+    ``workspaces.json`` after refresh/reload.
+    """
+    raw = str(path or '').strip()
+    if not raw:
+        return
+    try:
+        candidate = _remote_terminal_workspace_candidate(raw) or _resolve_path(raw)
+        path_str = str(candidate)
+        workspaces = load_workspaces()
+        if any(str(w.get('path') or '') == path_str for w in workspaces):
+            return
+        workspaces.append({'path': path_str, 'name': candidate.name or path_str})
+        save_workspaces(workspaces)
+    except Exception:
+        logger.debug("Failed to remember last workspace in picker", exc_info=True)
+
+
 def get_last_workspace() -> str:
     remote_cwd = _remote_terminal_cwd()
 
@@ -416,6 +439,7 @@ def set_last_workspace(path: str) -> None:
         lw_file.write_text(str(path), encoding='utf-8')
     except Exception:
         logger.debug("Failed to set last workspace")
+    _remember_workspace_in_picker(path)
 
 
 def _safe_resolve(p: Path) -> Path:

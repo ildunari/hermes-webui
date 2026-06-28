@@ -37,6 +37,30 @@ def test_clean_workspace_list_still_renames_default_without_dropping_missing(tmp
     assert cleaned == [{"path": str(missing.resolve()), "name": "Home"}]
 
 
+def test_set_last_workspace_also_remembers_picker_entry(tmp_path, monkeypatch):
+    """Accepted session workspaces must not disappear from the picker list."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    existing = tmp_path / "existing"
+    selected = tmp_path / "Hermes-iPadOS"
+    existing.mkdir()
+    selected.mkdir()
+    ws_file = state_dir / "workspaces.json"
+    lw_file = state_dir / "last_workspace.txt"
+    ws_file.write_text(json.dumps([{"path": str(existing), "name": "Existing"}]), encoding="utf-8")
+    monkeypatch.setattr(workspace, "_workspaces_file", lambda: ws_file)
+    monkeypatch.setattr(workspace, "_last_workspace_file", lambda: lw_file)
+
+    workspace.set_last_workspace(str(selected))
+
+    assert lw_file.read_text(encoding="utf-8") == str(selected)
+    saved = json.loads(ws_file.read_text(encoding="utf-8"))
+    assert saved == [
+        {"path": str(existing.resolve()), "name": "Existing"},
+        {"path": str(selected.resolve()), "name": "Hermes-iPadOS"},
+    ]
+
+
 def test_validate_workspace_to_add_distinguishes_permission_denied(monkeypatch, tmp_path):
     candidate = tmp_path / "Documents"
     candidate.mkdir()
