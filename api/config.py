@@ -17,6 +17,7 @@ import logging
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -3480,6 +3481,83 @@ def get_reasoning_status(
         "supported_efforts": supported_efforts,
         "supports_reasoning_effort": bool(supported_efforts),
     }
+
+
+def _parse_positive_int_config_value(raw) -> int | None:
+    if raw is None:
+        return None
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def get_max_tokens_status() -> dict[str, int | None]:
+    """Return the Settings-facing max_tokens state from the active profile config.
+
+    ``max_tokens`` is the root override the Settings field owns directly.
+    ``max_tokens_fallback`` is the agent-level fallback when the root config
+    resolves to ``None``, matching the streaming path exactly.
+    ``max_tokens_effective`` is the runtime cap a new streaming turn would
+    currently use.
+    """
+    config_data = _load_yaml_config_file(_get_config_path())
+    if not isinstance(config_data, dict):
+        return {
+            "max_tokens": None,
+            "max_tokens_effective": None,
+            "max_tokens_fallback": None,
+        }
+
+    raw_root_value = config_data.get("max_tokens")
+    root_value = _parse_positive_int_config_value(raw_root_value)
+
+    fallback_value = None
+    if raw_root_value is None:
+        agent_cfg = config_data.get("agent")
+        if isinstance(agent_cfg, dict):
+            fallback_value = _parse_positive_int_config_value(agent_cfg.get("max_tokens"))
+
+    effective_value = root_value if root_value is not None else fallback_value
+    return {
+        "max_tokens": root_value,
+        "max_tokens_effective": effective_value,
+        "max_tokens_fallback": fallback_value,
+    }
+
+
+def set_max_tokens(max_tokens) -> dict[str, int | None]:
+    """Persist a root-level ``max_tokens`` override to the active profile config.
+
+    Blank/``None`` clears the root override so ``agent.max_tokens`` can resume.
+    Positive integers are written to the active profile's ``config.yaml``.
+    Unrelated YAML keys are preserved verbatim.
+    """
+    if isinstance(max_tokens, str):
+        max_tokens = max_tokens.strip()
+    clear_root = max_tokens in (None, "")
+    parsed_max_tokens = _parse_positive_int_config_value(max_tokens)
+    if not clear_root and parsed_max_tokens is None:
+        return get_max_tokens_status()
+
+    config_path = _get_config_path()
+    should_save = True
+    with _cfg_lock:
+        config_data = _load_yaml_config_file_raw(config_path)
+        if clear_root:
+            if "max_tokens" not in config_data:
+                should_save = False
+            else:
+                config_data.pop("max_tokens", None)
+        elif parsed_max_tokens is not None:
+            config_data["max_tokens"] = parsed_max_tokens
+        if should_save:
+            _save_yaml_config_file(config_path, config_data)
+    if not should_save:
+        return get_max_tokens_status()
+    reload_config()
+    return get_max_tokens_status()
 
 
 def set_reasoning_display(show: bool) -> dict:
@@ -7389,6 +7467,15 @@ _GATEWAY_CAPS_LOCK = threading.Lock()
 _GATEWAY_CAPS_TTL_S: float = 60.0
 
 
+def _gateway_caps_probe_timed_out(exc: BaseException) -> bool:
+    """Keep slow capability probes on the legacy reachable-but-unsupported path."""
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return True
+    reason_text = str(reason).lower()
+    return "timed out" in reason_text or "timeout" in reason_text
+
+
 def get_gateway_caps(base_url: str, api_key: str = "") -> dict:
     """Return cached gateway capability flags, probing /v1/capabilities if stale."""
     base_url = str(base_url or "").rstrip("/")
@@ -7399,21 +7486,40 @@ def get_gateway_caps(base_url: str, api_key: str = "") -> dict:
         cached = _GATEWAY_CAPS_CACHE.get(cache_key)
         if cached and now - cached.get("fetched_at", 0) < _GATEWAY_CAPS_TTL_S:
             return cached
-    caps = {"approval_events": False, "run_approval_response": False, "fetched_at": 0.0}
+    caps = {
+        "approval_events": False,
+        "run_approval_response": False,
+        "capabilities_reachable": False,
+        "probe_error": None,
+        "fetched_at": 0.0,
+    }
     try:
         headers = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         req = urllib.request.Request(f"{base_url}/v1/capabilities", headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=3) as resp:
+            caps["capabilities_reachable"] = True
             body = json.loads(resp.read(65536))
         features = body.get("features") if isinstance(body, dict) else {}
         if not isinstance(features, dict):
             features = {}
         caps["approval_events"] = bool(features.get("approval_events"))
         caps["run_approval_response"] = bool(features.get("run_approval_response"))
-    except Exception:
-        pass
+    except urllib.error.HTTPError as exc:
+        caps["capabilities_reachable"] = True
+        caps["probe_error"] = f"{type(exc).__name__}: {exc}"
+    except urllib.error.URLError as exc:
+        if _gateway_caps_probe_timed_out(exc):
+            caps["capabilities_reachable"] = True
+        caps["probe_error"] = f"{type(exc).__name__}: {exc}"
+    except (TimeoutError, socket.timeout) as exc:
+        caps["capabilities_reachable"] = True
+        caps["probe_error"] = f"{type(exc).__name__}: {exc}"
+    except OSError as exc:
+        caps["probe_error"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        caps["probe_error"] = f"{type(exc).__name__}: {exc}"
     with _GATEWAY_CAPS_LOCK:
         current = _GATEWAY_CAPS_CACHE.get(cache_key)
         if current and current.get("fetched_at", 0) > probe_started_at:
@@ -7421,6 +7527,16 @@ def get_gateway_caps(base_url: str, api_key: str = "") -> dict:
         caps["fetched_at"] = time.time()
         _GATEWAY_CAPS_CACHE[cache_key] = caps
     return caps
+
+
+def gateway_approval_unavailable_reason(base_url: str, api_key: str = "") -> str | None:
+    """Return why approval support is unavailable, if it is unavailable."""
+    caps = get_gateway_caps(base_url, api_key)
+    if bool(caps.get("approval_events") and caps.get("run_approval_response")):
+        return None
+    if not caps.get("capabilities_reachable"):
+        return "unreachable"
+    return "unsupported"
 
 
 def gateway_supports_approval(base_url: str, api_key: str = "") -> bool:
@@ -7558,6 +7674,25 @@ def _evict_session_agent(session_id: str) -> None:
         if entry is not None:
             agent = entry[0] if isinstance(entry, tuple) else None
     if agent is None:
+        return
+    # A live run for this session may still hold this agent's _session_db (the
+    # worker assigns agent._session_db at run start). Never close it out from
+    # under an in-flight turn — ACTIVE_RUNS is the authoritative liveness signal
+    # (mirrors the worker's own LRU-eviction guard in streaming.py). When a run
+    # is live we still drop the cache handle above (harmless — the worker holds
+    # a local ref), but skip the lifecycle commit + _session_db.close() so the
+    # running turn can finish persisting. Hardens /clear + model-switch eviction
+    # too, not just truncate (#5096 Bug D).
+    _run_active = False
+    try:
+        with ACTIVE_RUNS_LOCK:
+            for _entry in (ACTIVE_RUNS or {}).values():
+                if (_entry or {}).get("session_id") == session_id:
+                    _run_active = True
+                    break
+    except Exception:
+        _run_active = False
+    if _run_active:
         return
     should_close = True
     try:

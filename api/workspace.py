@@ -396,6 +396,41 @@ def _remember_workspace_in_picker(path: str) -> None:
         logger.debug("Failed to remember last workspace in picker", exc_info=True)
 
 
+def get_profile_default_workspace() -> str:
+    """Resolve the ACTIVE PROFILE's default workspace, never the global file.
+
+    Like get_last_workspace() but WITHOUT the global ``_GLOBAL_LW_FILE``
+    fallback: for a named profile that has not yet written its own
+    profile-scoped ``last_workspace.txt``, that global fallback would leak the
+    *global* last-workspace instead of the profile's configured workspace.
+
+    Priority: profile-scoped ``last_workspace.txt`` -> profile ``config.yaml``
+    ``workspace``/``default_workspace`` -> ``terminal.cwd`` -> process default.
+    """
+    remote_cwd = _remote_terminal_cwd()
+
+    def _valid(raw: str) -> str | None:
+        if not raw:
+            return None
+        if remote_cwd:
+            if _remote_terminal_workspace_candidate(raw) is not None:
+                return raw
+            return None
+        if Path(raw).is_dir():
+            return raw
+        return None
+
+    lw_file = _last_workspace_file()
+    if lw_file.exists():
+        try:
+            p = _valid(lw_file.read_text(encoding='utf-8').strip())
+            if p:
+                return p
+        except Exception:
+            logger.debug("Failed to read profile last workspace from %s", lw_file)
+    return _profile_default_workspace()
+
+
 def get_last_workspace() -> str:
     remote_cwd = _remote_terminal_cwd()
 
