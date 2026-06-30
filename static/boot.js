@@ -926,12 +926,12 @@ window._micPendingSend=window._micPendingSend||false;
 // handles selection, the dropdown option, and playback. Mirrors registerHermesSkin.
 //
 //   window.registerHermesTtsEngine({
-//     id: 'voicevox',            // [a-z0-9_-], not a built-in (browser/edge/elevenlabs)
+//     id: 'voicevox',            // [a-z0-9_-], not a built-in (browser/edge/elevenlabs/openai)
 //     label: 'VOICEVOX (local)',
 //     synthesize(text, opts) { return Promise<ArrayBuffer|Blob>; }
 //   }) -> true on success, false if rejected
 var _HERMES_TTS_ENGINES = Object.create(null);
-var _HERMES_TTS_RESERVED = { browser:1, edge:1, elevenlabs:1 };
+var _HERMES_TTS_RESERVED = { browser:1, edge:1, elevenlabs:1, openai:1 };
 function _hermesTtsValidId(id){ return typeof id==='string' && /^[a-z0-9][a-z0-9_-]{0,31}$/.test(id); }
 function _hermesAddTtsOption(id, label){
   var sel=document.getElementById('settingsTtsEngine');
@@ -1284,6 +1284,46 @@ window._hermesTtsSynth=function(id, text, opts){
           if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
         };
         audio.play().catch(e => {
+          _ttsSpeaking=false;
+          if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
+          URL.revokeObjectURL(url);
+          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+        });
+      })
+      .catch(() => {
+        _ttsSpeaking=false;
+        if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+      });
+      return;
+    }
+    if(engine==="openai"){
+      _ttsSpeaking=true;
+      fetch(new URL('api/tts', document.baseURI || location.href).href, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text: clean, engine: 'openai'})
+      })
+      .then(r => {
+        if(!r.ok) throw new Error('TTS request failed: ' + r.status);
+        return r.blob();
+      })
+      .then(blob => {
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        _playingEdgeAudio=audio;
+        audio.onended = () => {
+          _ttsSpeaking=false;
+          if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
+          URL.revokeObjectURL(url);
+          if(_voiceModeActive) setTimeout(()=>_startListening(),500);
+        };
+        audio.onerror = () => {
+          _ttsSpeaking=false;
+          if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
+          URL.revokeObjectURL(url);
+          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+        };
+        audio.play().catch(() => {
           _ttsSpeaking=false;
           if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
           URL.revokeObjectURL(url);

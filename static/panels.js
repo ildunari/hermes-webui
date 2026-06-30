@@ -8293,6 +8293,8 @@ async function loadSettingsPanel(){
       const current=localStorage.getItem('hermes-tts-voice')||'';
       if(engine==='elevenlabs'){
         ttsVoiceSel.innerHTML='<option value="">Hermy — ElevenLabs (server-configured)</option>';
+      } else if(engine==='openai'){
+        ttsVoiceSel.innerHTML='<option value="">OpenAI voice (server-configured)</option>';
       } else if(engine==='edge'){
         const edgeVoices=[
           {value:'zh-CN-XiaoxiaoNeural',label:'Xiaoxiao (Chinese, Female)'},
