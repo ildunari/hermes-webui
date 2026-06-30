@@ -6407,7 +6407,7 @@ function renderSessionListFromCache(){
         clearTimeout(_lpTimer);_lpTimer=null;_lpHandled=false;
         chip.classList.remove('long-pressing');
       },{passive:true});
-      _attachProjectQuickCreateButton(chip,p);
+      if(window._projectQuickCreate) _attachProjectQuickCreateButton(chip,p);
       bar.appendChild(chip);
     }
     // Create button

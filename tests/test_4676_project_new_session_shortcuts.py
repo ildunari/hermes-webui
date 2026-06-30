@@ -56,6 +56,15 @@ def test_quick_create_button_attaches_filter_align_and_request_path():
     assert "btn.ontouchend" in helper
 
 
+def test_quick_create_button_render_is_gated_off_by_default():
+    """#4676 quick-create buttons must be opt-in: the chip render site only
+    attaches the per-project '+' button when window._projectQuickCreate is set."""
+    src = _read(SESSIONS_JS)
+    assert "if(window._projectQuickCreate) _attachProjectQuickCreateButton(chip,p);" in src
+    # The attach call must never run unconditionally at the render site.
+    assert "\n      _attachProjectQuickCreateButton(chip,p);" not in src
+
+
 def test_project_quick_create_styles_exist_and_are_discrete_to_pointer_layouts():
     css = _read(STYLE_CSS)
     assert ".project-chip-quick-create" in css

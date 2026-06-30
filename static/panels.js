@@ -7475,6 +7475,7 @@ function _appearancePayloadFromUi(){
     auto_scroll_follow: !!($('settingsAutoScrollFollow')||{}).checked,
     render_user_markdown: !!($('settingsRenderUserMarkdown')||{}).checked,
     large_text_paste_as_attachment: !!($('settingsLargeTextPasteAsAttachment')||{}).checked,
+    project_quick_create_buttons: !!($('settingsProjectQuickCreate')||{}).checked,
     ..._structuredCodeViewFromUi(),
     show_titlebar_profile: !!($('settingsShowTitlebarProfile')||{}).checked,
     worklog_details_expanded_default: worklogDetailsExpanded,
@@ -7565,6 +7566,7 @@ async function _autosaveAppearanceSettings(payload){
     window._sessionEndlessScrollEnabled=!!(saved&&saved.session_endless_scroll);
     window._autoScrollFollow=!saved||saved.auto_scroll_follow!==false;
     window._largeTextPasteAsAttachment=!saved||saved.large_text_paste_as_attachment!==false;
+    window._projectQuickCreate=!!(saved&&saved.project_quick_create_buttons);
     if(saved&&Object.prototype.hasOwnProperty.call(saved,'structured_code_default_view')){
       // Re-sync from the server-validated/clamped values so the UI and runtime
       // globals match exactly what was persisted.
@@ -7924,6 +7926,15 @@ async function loadSettingsPanel(){
       window._largeTextPasteAsAttachment=largeTextPasteCb.checked;
       largeTextPasteCb.onchange=function(){
         window._largeTextPasteAsAttachment=this.checked;
+        _scheduleAppearanceAutosave();
+      };
+    }
+    const pqcCb=$('settingsProjectQuickCreate');
+    if(pqcCb){
+      pqcCb.checked=!!(settings.project_quick_create_buttons);
+      window._projectQuickCreate=pqcCb.checked;
+      pqcCb.onchange=function(){
+        window._projectQuickCreate=this.checked;
         _scheduleAppearanceAutosave();
       };
     }
@@ -10255,6 +10266,7 @@ function _applySavedSettingsUi(saved, body, opts){
   window._sessionEndlessScrollEnabled=!!body.session_endless_scroll;
   window._autoScrollFollow=body.auto_scroll_follow!==false;
   window._largeTextPasteAsAttachment=body.large_text_paste_as_attachment!==false;
+  window._projectQuickCreate=!!body.project_quick_create_buttons;
   if(Object.prototype.hasOwnProperty.call(body,'structured_code_default_view')){
     _applyStructuredCodeViewSettings(body.structured_code_default_view,body.structured_code_auto_tree_lines,false);
   }
@@ -10825,6 +10837,7 @@ async function saveSettings(andClose){
   body.auto_scroll_follow=!!($('settingsAutoScrollFollow')||{}).checked;
   body.render_user_markdown=!!($('settingsRenderUserMarkdown')||{}).checked;
   body.large_text_paste_as_attachment=!!($('settingsLargeTextPasteAsAttachment')||{}).checked;
+  body.project_quick_create_buttons=!!($('settingsProjectQuickCreate')||{}).checked;
   Object.assign(body,_structuredCodeViewFromUi());
   body.language=language;
   body.show_token_usage=showTokenUsage;
