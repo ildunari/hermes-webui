@@ -7828,6 +7828,7 @@ _SETTINGS_DEFAULTS = {
     "show_token_usage": False,  # show input/output token badge below assistant messages
     "show_quota_chip": False,  # show ambient provider quota chip in composer footer (default off; wide desktop only when enabled, see style.css @media)
     "show_conversation_outline": False,  # show opt-in desktop jump-to-question outline panel
+    "show_busy_placeholder_hint": False,  # opt-in busy composer placeholder hint
     "hide_empty_state_suggestions": False,  # hide the default new-chat suggestion buttons
     "virtualize_transcript": False,  # #4343: virtualize long (>80 msg) transcripts. EXPERIMENTAL, opt-IN (default OFF). Was opt-out/default-on in #4325 but caused scroll-up flicker on long sessions with tall tool-call rows (variable-height anchor oscillation) — flipped off for everyone in #4343; re-enabling requires an explicit opt-in (see virtualize_transcript_optin migration in load_settings).
     "virtualize_transcript_optin": False,  # #4343 migration marker: True only once the user explicitly enables virtualize_transcript AFTER the default-off flip. A stored virtualize_transcript=True WITHOUT this marker is a stale pre-flip value and is reset to False on load (force-off-for-everyone migration).
@@ -8073,6 +8074,7 @@ _SETTINGS_BOOL_KEYS = {
     "show_token_usage",
     "show_quota_chip",
     "show_conversation_outline",
+    "show_busy_placeholder_hint",
     "hide_empty_state_suggestions",
     "virtualize_transcript",
     "virtualize_transcript_optin",

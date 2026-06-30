@@ -7434,6 +7434,8 @@ function _preferencesPayloadFromUi(){
   if(autoTitleRefreshSel) payload.auto_title_refresh_every=parseInt(autoTitleRefreshSel.value,10);
   const busyInputModeSel=$('settingsBusyInputMode');
   if(busyInputModeSel) payload.busy_input_mode=busyInputModeSel.value;
+  const showBusyPlaceholderHintCb=$('settingsShowBusyPlaceholderHint');
+  if(showBusyPlaceholderHintCb) payload.show_busy_placeholder_hint=showBusyPlaceholderHintCb.checked;
   const botNameField=$('settingsBotName');
   if(botNameField) payload.bot_name=botNameField.value;
   return payload;
@@ -7506,6 +7508,14 @@ async function _autosavePreferencesSettings(payload){
       window._showConversationOutline=!!(saved&&saved.show_conversation_outline);
       document.documentElement.dataset.conversationOutline=window._showConversationOutline?'enabled':'disabled';
       if(typeof applyConversationOutlinePreference==='function') applyConversationOutlinePreference();
+    }
+    if(payload&&payload.busy_input_mode!==undefined){
+      window._busyInputMode=(saved&&saved.busy_input_mode)||'queue';
+      if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
+    }
+    if(payload&&payload.show_busy_placeholder_hint!==undefined){
+      window._showBusyPlaceholderHint=!!(saved&&saved.show_busy_placeholder_hint);
+      if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
     }
     _settingsPreferencesAutosaveRetryPayload=null;
     _setPreferencesAutosaveStatus('saved');
@@ -8072,8 +8082,16 @@ async function loadSettingsPanel(){
     if(busyInputModeSel){
       const val=String(settings.busy_input_mode||'queue');
       busyInputModeSel.value=['queue','interrupt','steer'].includes(val)?val:'queue';
+      window._busyInputMode=busyInputModeSel.value;
       busyInputModeSel.addEventListener('change',_schedulePreferencesAutosave,{once:false});
     }
+    const showBusyPlaceholderHintCb=$('settingsShowBusyPlaceholderHint');
+    if(showBusyPlaceholderHintCb){
+      showBusyPlaceholderHintCb.checked=!!settings.show_busy_placeholder_hint;
+      window._showBusyPlaceholderHint=showBusyPlaceholderHintCb.checked;
+      showBusyPlaceholderHintCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
+    }
+    if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
     // Bot name — debounced autosave (text input)
     const botNameField=$('settingsBotName');
     if(botNameField){
@@ -9971,13 +9989,14 @@ async function deletePasskey(id){
 }
 
 function _applySavedSettingsUi(saved, body, opts){
-  const {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize}=opts;
+  const {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showBusyPlaceholderHint,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize}=opts;
   window._sendKey=sendKey||'enter';
   window._showTokenUsage=showTokenUsage;
   window._showQuotaChip=showQuotaChip===true;
   window._showConversationOutline=showConversationOutline===true;
   document.documentElement.dataset.conversationOutline=window._showConversationOutline?'enabled':'disabled';
   if(typeof applyConversationOutlinePreference==='function') applyConversationOutlinePreference();
+  window._showBusyPlaceholderHint=showBusyPlaceholderHint===true;
   window._showTps=showTps;
   window._fadeTextEffect=!!fadeTextEffect;
   window._showCliSessions=showCliSessions;
@@ -10003,6 +10022,7 @@ function _applySavedSettingsUi(saved, body, opts){
   }
   window._botName=body.bot_name||'Hermes';
   if(typeof applyBotName==='function') applyBotName();
+  else if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
   if(typeof setLocale==='function') setLocale(language);
   if(typeof applyLocaleToDOM==='function') applyLocaleToDOM();
   const maxTokensField=$('settingsMaxTokens');
@@ -10554,6 +10574,7 @@ async function saveSettings(andClose){
   const language=($('settingsLanguage')||{}).value||'en';
   const sidebarDensity=($('settingsSidebarDensity')||{}).value==='detailed'?'detailed':'compact';
   const busyInputMode=($('settingsBusyInputMode')||{}).value||'queue';
+  const showBusyPlaceholderHint=!!($('settingsShowBusyPlaceholderHint')||{}).checked;
   const body={};
 
   if(sendKey) body.send_key=sendKey;
@@ -10579,6 +10600,7 @@ async function saveSettings(andClose){
   }
   body.show_quota_chip=showQuotaChip===true;
   body.show_conversation_outline=showConversationOutline===true;
+  body.show_busy_placeholder_hint=showBusyPlaceholderHint===true;
   body.show_tps=showTps;
   body.fade_text_effect=fadeTextEffect;
   body.terminal_auto_expand_on_output=!!($('settingsTerminalAutoExpand')||{}).checked;
@@ -10626,7 +10648,7 @@ async function saveSettings(andClose){
           if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
         }
       }
-      _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
+      _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showBusyPlaceholderHint,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
       showToast(t(saved.auth_just_enabled?'settings_saved_pw':'settings_saved_pw_updated'));
       const cpField=$('settingsCurrentPassword'); if(cpField) cpField.value='';
       const pwField=$('settingsPassword'); if(pwField) pwField.value='';
@@ -10656,7 +10678,7 @@ async function saveSettings(andClose){
         if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
       }
     }
-    _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
+    _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showBusyPlaceholderHint,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
     showToast(t('settings_saved'));
     _settingsDirty=false;
     _resetSettingsPanelState();
