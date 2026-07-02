@@ -1218,9 +1218,9 @@ function applySessionTitleUpdate(sid, titleText, options={}){
 }
 
 async function send(){
-  // Static guards expect _busyInputMode to stay near send() while the actual
+  // Static guards expect _defaultMessageMode to stay near send() while the actual
   // read remains in the S.busy branch below.
-  // _busyInputMode
+  // _defaultMessageMode
   // Reject concurrent invocations early — before any await yields control.
   // If a send is already in-flight (e.g. queue drain), re-queue the message
   // instead of silently dropping it.
@@ -1256,12 +1256,12 @@ async function send(){
 
   const compressionRunning=typeof isCompressionUiRunning==='function'&&isCompressionUiRunning();
   _clearStaleBusyStateBeforeSend({compressionRunning});
-  // If busy or a manual compression is still running, handle based on busy_input_mode
+  // If busy or a manual compression is still running, handle based on default_message_mode
   if(S.busy||compressionRunning){
     if(text){
       if(!S.session){await newSession();await renderSessionList();}
       // Busy-control slash commands must be intercepted HERE, before the
-      // busyMode routing block, so the user can always type /steer, /interrupt,
+      // defaultMessageMode routing block, so the user can always type /steer, /interrupt,
       // /queue, /terminal, /goal, or /yolo while the agent is running and have
       // them execute immediately.
       // Without this intercept they fall through to the queue and execute after
@@ -1278,8 +1278,8 @@ async function send(){
           }
         }
       }
-      const busyMode=window._busyInputMode||'queue';
-      if(busyMode==='steer'&&S.activeStreamId&&typeof _trySteer==='function'){
+    const defaultMessageMode=window._defaultMessageMode||'steer';
+      if(defaultMessageMode==='steer'&&S.activeStreamId&&typeof _trySteer==='function'){
         // Real steer: clear the input first so the user gets immediate
         // feedback, then ship the steer payload via /api/chat/steer.
         // _trySteer restores the draft and leaves the active stream running if
@@ -1291,7 +1291,7 @@ async function send(){
         // After a delivered steer, clear any staged files because the text-only
         // steer payload has been handled. On failure, keep files staged.
         if(_steerDelivered){S.pendingFiles=[];renderTray();}
-      } else if(busyMode==='interrupt'){
+      } else if(defaultMessageMode==='interrupt'){
         // Queue the message, then cancel so drain re-sends it.
         const _modelState=_chatPayloadModelState();
         queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
@@ -1300,7 +1300,7 @@ async function send(){
         S.pendingFiles=[];renderTray();
         if(S.activeStreamId&&typeof cancelStream==='function'){
           showToast(t('busy_interrupt_confirm'),2000);
-          await cancelStream();
+          await cancelStream('busy-interrupt');
         } else {
           showToast(`Queued: "${text.slice(0,40)}${text.length>40?'…':''}"`,2000);
         }
@@ -1352,6 +1352,23 @@ async function send(){
       }
     }
     if(_parsedCmd&&!_cmd){
+      if(_parsedCmd.name==='pet'){
+        if(!S.session){await newSession();await renderSessionList();}
+        S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+        let _petOutput=null;
+        try{
+          _petOutput=typeof handlePetSlashCommand==='function'
+            ? await handlePetSlashCommand(text,{name:'pet'})
+            : {handled:false,message:'Desktop Companion is unavailable in WebUI.'};
+        }catch(e){
+          _petOutput={handled:false,message:`Desktop Companion command error: ${e&&e.message||e}`};
+        }
+        if(_petOutput&&_petOutput.message){
+          S.messages.push({role:'assistant',content:String(_petOutput.message),_ts:Date.now()/1000});
+        }
+        renderMessages();
+        $('msg').value='';autoResize();hideCmdDropdown();return;
+      }
       const _agentCmd=typeof getAgentCommandMetadata==='function'
         ? await getAgentCommandMetadata(_parsedCmd.name)
         : null;
@@ -5657,6 +5674,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         // The GET path guarantees it via the URL; the embedded path via the stream→session
         // binding — but reject a mismatched id so a stray payload can't overwrite the view.
         if(sessionPayload.session_id&&sessionPayload.session_id!==activeSid) return false;
+        // Capture follow-intent BEFORE replacing S.messages: a reader who was
+        // following the live stream when it got cancelled/reconnected must land at
+        // the bottom (where the cancellation notice renders), not be stranded at a
+        // stale mid-stream scrollTop by preserveScroll's restore path. Same
+        // jump-on-recovery class as the Connection-interrupted path below.
+        const _wasFollowingAtCancel=((typeof _isMessagePaneNearBottom==='function')
+            ? _isMessagePaneNearBottom(1200)
+            : true)
+          && !((typeof _isMessageReaderUnpinned==='function')
+            ? _isMessageReaderUnpinned()
+            : (typeof _messageUserUnpinned!=='undefined' && _messageUserUnpinned));
         S.session=sessionPayload;
         const _nextMsgs3018=(sessionPayload.messages||[]).filter(m=>m&&m.role);
         _attachProjectedAnchorSceneToLastAssistant(_nextMsgs3018);
@@ -5665,6 +5693,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         clearLiveToolCards();if(!assistantText)removeThinking();
         _markSessionViewed(activeSid, sessionPayload.message_count ?? S.messages.length);
         renderMessages({preserveScroll:true});
+        if(_wasFollowingAtCancel && typeof scrollToBottom==='function') scrollToBottom();
         return true;
       };
       // Prefer the canonical session snapshot embedded in the terminal cancel event.
@@ -5683,11 +5712,18 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         }catch(_){
           // Fallback to local cancel message if API fails
           if(S.session&&S.session.session_id===activeSid){
+            const _wasFollowingAtCancelFb=((typeof _isMessagePaneNearBottom==='function')
+                ? _isMessagePaneNearBottom(1200)
+                : true)
+              && !((typeof _isMessageReaderUnpinned==='function')
+                ? _isMessageReaderUnpinned()
+                : (typeof _messageUserUnpinned!=='undefined' && _messageUserUnpinned));
             clearLiveToolCards();if(!assistantText)removeThinking();
             const cancelAgentName=(assistantDisplayName()+'').trim()||'Hermes';
             S.messages.push({role:'assistant',content:`**Task cancelled:** Task cancelled.\n\n*The run was cancelled by the user before ${cancelAgentName} finished. No provider failure occurred.*`,provider_details:'Task cancelled.',provider_details_label:'Cancellation details',_error:true});
             _attachProjectedAnchorSceneToLastAssistant(S.messages);
             renderMessages({preserveScroll:true});
+            if(_wasFollowingAtCancelFb && typeof scrollToBottom==='function') scrollToBottom();
             _markSessionViewed(activeSid, S.messages.length);
           }
         }
@@ -5863,6 +5899,29 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _clearClarifyForOwner('terminal');
     if(S.session&&S.session.session_id===activeSid){
       S.activeStreamId=null;
+      // Capture the reader's follow-intent BEFORE mutating S.messages. If the SSE
+      // dropped while they were following the live stream (pinned / near the
+      // bottom), the disconnect-recovery render must land them at the bottom where
+      // the "Connection interrupted" notice appears — NOT restore a stale
+      // mid-stream scrollTop. preserveScroll's restore path keys on the pre-render
+      // snapshot's bottom-distance, which during a live stream can read large
+      // (content was still growing under a followed viewport), so it would yank a
+      // following reader up to a historical position on a process restart / SSE
+      // drop. This is the "restart/disconnect jump-back" report: the jump is the
+      // recovery render restoring an old position into a DOM whose height changed.
+      // Follow-intent must be STICKY-aware: a reader who manually scrolled up
+      // (sets _messageUserUnpinned, ui.js scroll listener) but stayed within
+      // 1200px of the bottom would read _isMessagePaneNearBottom(1200)===true,
+      // so a proximity-only check would re-follow them on recovery and clobber
+      // their position (maintainer-reproduced bounce). Require near-bottom AND
+      // not-unpinned. scrollToBottom() clears _messageUserUnpinned, so a genuine
+      // follower stays pinned; only a manually-unpinned reader is spared.
+      const _wasFollowingAtDisconnect=((typeof _isMessagePaneNearBottom==='function')
+          ? _isMessagePaneNearBottom(1200)
+          : true)
+        && !((typeof _isMessageReaderUnpinned==='function')
+          ? _isMessageReaderUnpinned()
+          : (typeof _messageUserUnpinned!=='undefined' && _messageUserUnpinned));
       _flushReasoningToAnchor();
       _applyToAnchor('error',{
         status:'connection_lost',
@@ -5873,6 +5932,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _ensureSingleTerminalStreamErrorMarker(S.messages);
       _attachProjectedAnchorSceneToLastAssistant(S.messages);
       renderMessages({preserveScroll:true});
+      // If they were following the stream, force the viewport to the bottom after
+      // the recovery render so they see the interruption notice in place instead
+      // of being thrown back into the transcript. Readers who had scrolled up to
+      // read history are left where they were (the near-bottom guard above is
+      // false for them).
+      if(_wasFollowingAtDisconnect && typeof scrollToBottom==='function') scrollToBottom();
       _markSessionViewed(activeSid, S.messages.length);
     }else{
       if(typeof trackBackgroundError==='function'){
@@ -5897,12 +5962,23 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           _clearApprovalForOwner();
           _clearClarifyForOwner('terminal');
           if(S.session&&S.session.session_id===activeSid){
+            // Follow-intent BEFORE removing live placeholders: a reader following
+            // the (now-dead) stream should stay pinned to the bottom as the
+            // thinking/tool placeholders are cleared, not be stranded mid-transcript
+            // by preserveScroll restoring a stale scrollTop after the height shrinks.
+            const _wasFollowingAtReconnectDead=((typeof _isMessagePaneNearBottom==='function')
+                ? _isMessagePaneNearBottom(1200)
+                : true)
+              && !((typeof _isMessageReaderUnpinned==='function')
+                ? _isMessageReaderUnpinned()
+                : (typeof _messageUserUnpinned!=='undefined' && _messageUserUnpinned));
             S.activeStreamId=null;
             clearLiveToolCards();
             removeThinking();
             if(_isActiveSession()) _queueDrainSid=activeSid;
             _setActivePaneIdleIfOwner();
             renderMessages({preserveScroll:true});
+            if(_wasFollowingAtReconnectDead && typeof scrollToBottom==='function') scrollToBottom();
             renderSessionList();
           }
           _scheduleAnchorRegistryCleanup(120000);
@@ -7469,13 +7545,65 @@ function _startClarifyFallbackPoll(sid) {
       else { _clearClarifyPendingForSession(sid); _hideClarifyCardIfOwner(sid, false, 'expired'); }
     } catch(e) {
       const msg = String((e && e.message) || "");
-      if (!_clarifyMissingEndpointWarned && /(^|\b)(404|not found)(\b|$)/i.test(msg)) {
-        _clarifyMissingEndpointWarned = true;
-        setComposerStatus("Clarify unavailable on current server build. Restart server.");
-        if (typeof showToast === "function") {
-          showToast("Clarify endpoint unavailable. Please restart server.", 5000);
+      // `api()` attaches the raw HTTP status on the thrown Error (err.status).
+      // Branch on that structured value instead of scraping the message string
+      // so an unrelated stale-session or lifecycle error can never masquerade as
+      // a missing clarify endpoint. (#5345)
+      const status = (e && typeof e.status === "number") ? e.status : null;
+      const currentSid = (S.session && S.session.session_id) || null;
+      const logDetails = {
+        path: "/api/clarify/pending",
+        status: status,
+        pollingSessionId: sid,
+        currentSessionId: currentSid,
+        message: msg,
+      };
+      // A 404 from the active session domain is a STALE-SESSION signal — e.g.
+      // the old profile's session still polling briefly after a profile switch,
+      // or a session deleted server-side — NOT a missing clarify endpoint. Stop
+      // this stale poll and hide its card silently instead of telling the user
+      // to restart the server. Keep this branch before any warn-level logging:
+      // routine profile switches must not fill DevTools with expected warnings.
+      // (#5343 / #5345)
+      const isSessionScoped404 = status === 404
+        && (/session/i.test(msg) || (currentSid !== null && currentSid !== sid));
+      if (isSessionScoped404) {
+        _clearClarifyPendingForSession(sid);
+        _hideClarifyCardIfOwner(sid, true, 'session');
+        stopClarifyPolling();
+        return;
+      }
+      // Only a GENUINE missing-endpoint 404 (the route-not-found fall-through,
+      // body {"error":"not found"}, from a server build that predates
+      // /api/clarify/pending) should surface the restart-server warning. The
+      // previous code matched arbitrary "404"/"not found" text in ANY caught
+      // error message, so an unrelated stale-session 404 or a transient network
+      // error produced a false "Clarify endpoint unavailable" toast even though
+      // the endpoint is present and returning HTTP 200 on every request. Gate
+      // strictly on the structured status + a route-not-found body that is not
+      // a session-scoped 404. (#5345)
+      const isMissingEndpoint = status === 404
+        && /(^|\b)not\s+found(\b|$)/i.test(msg)
+        && !isSessionScoped404;
+      if (isMissingEndpoint) {
+        if (!_clarifyMissingEndpointWarned) {
+          _clarifyMissingEndpointWarned = true;
+          setComposerStatus("Clarify unavailable on current server build. Restart server.");
+          if (typeof showToast === "function") {
+            showToast("Clarify endpoint unavailable. Please restart server.", 5000);
+          }
+          if (typeof console !== "undefined" && console.warn) {
+            console.warn("[clarify] pending poll endpoint unavailable", logDetails);
+          }
         }
         stopClarifyPolling();
+        return;
+      }
+      // Structured diagnostics: unexpected clarify poll failures should be
+      // inspectable without guessing from a toast. Expected stale-session 404s
+      // and the handled missing-endpoint route have already returned above.
+      if (typeof console !== "undefined" && console.warn) {
+        console.warn("[clarify] pending poll failed", logDetails);
       }
     } finally {
       _clarifyFallbackPollInFlight = false;

@@ -824,6 +824,46 @@ function _captureMessageViewportAnchor(){
   }
   return null;
 }
+// Temporarily suppress the browser's native overflow-anchor on a scroll
+// container so a JS scrollTop write is not double-compensated by the browser's
+// own scroll-anchoring in the same frame. Returns a release fn that restores the
+// prior inline value on the NEXT frame (after layout settles). No-op on desktop,
+// where the resting computed value is already `none` (CSS hover/fine-pointer
+// media query) — suppressing `none` changes nothing and the release restores the
+// same empty inline value. Only mobile (resting `auto`) is actually affected,
+// which is exactly where the double-compensation jump-back happens.
+//
+// Both this helper and _fixMobileScrollJank() gate on the SAME question — "is
+// the browser's native scroll-anchor layer currently active on this element?" —
+// routed through this one predicate so the two guards can't drift apart if the
+// CSS media query ever changes (maintainer review on #5338). The computed-value
+// test is more robust than a matchMedia('(hover:hover) and (pointer:fine)')
+// check because it reflects the real resting value, including any inline
+// override, not just the viewport media state.
+function _browserOverflowAnchorActive(el){
+  if(!el) return false;
+  try{ return getComputedStyle(el).overflowAnchor==='auto'; }catch(_){ return false; }
+}
+function _suppressBrowserOverflowAnchor(container){
+  if(!container||!container.style) return null;
+  // Only engage when the browser layer is actually active (auto). On desktop
+  // (none) there is nothing to suppress.
+  if(!_browserOverflowAnchorActive(container)) return null;
+  const prevInline=container.style.overflowAnchor||'';
+  container.style.overflowAnchor='none';
+  let released=false;
+  return function _release(){
+    if(released) return;
+    released=true;
+    const restore=()=>{
+      // Only restore if we still own the suppression (another render may have
+      // re-set it); compare against the value we wrote.
+      if(container.style.overflowAnchor==='none') container.style.overflowAnchor=prevInline;
+    };
+    if(typeof requestAnimationFrame==='function') requestAnimationFrame(restore);
+    else restore();
+  };
+}
 function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
   const container=$('messages');
   if(!container||!anchor) return false;
@@ -842,7 +882,19 @@ function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
   const rect=row.getBoundingClientRect();
   const targetTop=Number(anchor.topOffset)||0;
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
+  // Mobile-only jump fix: the resting overflow-anchor on .messages is `auto` on
+  // touch devices (CSS media query keeps it `none` only for hover+fine-pointer
+  // desktops). When we write scrollTop here to realign the anchor row, a mobile
+  // browser's OWN overflow-anchor machinery ALSO shifts scrollTop in the same
+  // frame if content height above the viewport changed — the two compensations
+  // stack and yank the reader to an unrelated turn (the mobile jump-back). This is why the
+  // bug is mobile-only and never reproduces on a desktop (none) browser. Suppress
+  // the browser layer for this write; _releaseAnchorSuppression restores it next
+  // frame. Desktop is already `none`, so this is a no-op there.
+  const _releaseAnchorSuppression=(typeof _suppressBrowserOverflowAnchor==='function')
+    ? _suppressBrowserOverflowAnchor(container) : null;
   container.scrollTop+=(rect.top-containerRect.top)-targetTop;
+  if(_releaseAnchorSuppression) _releaseAnchorSuppression();
   if(typeof _deferClearProgrammaticScroll==='function') _deferClearProgrammaticScroll();
   else requestAnimationFrame(()=>{ setTimeout(()=>{ _programmaticScroll=false; },0); });
   return true;
@@ -1343,6 +1395,274 @@ function _openImgLightbox(imgEl) {
   }
   _openImgLightboxWithNav(src, alt, allImages, startIndex);
 }
+
+const _MERMAID_VIEWER_MIN_SCALE = 0.25;
+const _MERMAID_VIEWER_MAX_SCALE = 8;
+const _MERMAID_VIEWER_ZOOM_STEP = 1.2;
+
+function _mermaidViewerIcon(kind) {
+  const icons = {
+    zoomIn: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"></circle><path d="M10 7v6M7 10h6"></path><path d="M15 15l4 4"></path></svg>',
+    zoomOut: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"></circle><path d="M7 10h6"></path><path d="M15 15l4 4"></path></svg>',
+    reset: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9V4H1"></path><path d="M1 4l4 4"></path><path d="M10 4a8 8 0 1 1-5.66 13.66"></path></svg>',
+    fit: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"></path></svg>',
+    fullscreen: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5"></path></svg>',
+  };
+  return icons[kind] || '';
+}
+
+function _createMermaidViewerButton(label, iconKind, onClick) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'mermaid-viewer-btn';
+  btn.setAttribute('aria-label', label);
+  btn.setAttribute('title', label);
+  btn.innerHTML = _mermaidViewerIcon(iconKind);
+  btn.onclick = e => {
+    e.preventDefault();
+    e.stopPropagation();
+    onClick(e);
+  };
+  return btn;
+}
+
+function _mermaidSvgBox(svgEl) {
+  const box = {x: 0, y: 0, width: 0, height: 0};
+  if(!svgEl) return box;
+  const viewBox = svgEl.viewBox && svgEl.viewBox.baseVal;
+  if(viewBox && viewBox.width && viewBox.height){
+    box.x = Number(viewBox.x) || 0;
+    box.y = Number(viewBox.y) || 0;
+    box.width = Number(viewBox.width) || 0;
+    box.height = Number(viewBox.height) || 0;
+    return box;
+  }
+  const rawViewBox = svgEl.getAttribute && svgEl.getAttribute('viewBox');
+  if(rawViewBox){
+    const parts = rawViewBox.trim().split(/[,\s]+/).map(Number);
+    if(parts.length >= 4 && parts.every(n => Number.isFinite(n))){
+      box.x = parts[0] || 0;
+      box.y = parts[1] || 0;
+      box.width = parts[2] || 0;
+      box.height = parts[3] || 0;
+      return box;
+    }
+  }
+  const width = Number.parseFloat(svgEl.getAttribute && svgEl.getAttribute('width')) || (svgEl.getBoundingClientRect ? svgEl.getBoundingClientRect().width : 0) || 0;
+  const height = Number.parseFloat(svgEl.getAttribute && svgEl.getAttribute('height')) || (svgEl.getBoundingClientRect ? svgEl.getBoundingClientRect().height : 0) || 0;
+  box.width = width || 800;
+  box.height = height || 450;
+  return box;
+}
+
+function _mountMermaidViewer(svgEl, options = {}) {
+  if(!svgEl) return null;
+  const mode = options.mode === 'lightbox' ? 'lightbox' : 'inline';
+  const openLightbox = typeof options.openLightbox === 'function' ? options.openLightbox : () => _openMermaidLightbox(svgEl);
+  const box = _mermaidSvgBox(svgEl);
+  const host = svgEl.parentNode;
+  const root = document.createElement('div');
+  root.className = 'mermaid-viewer mermaid-viewer--' + mode;
+  const toolbar = document.createElement('div');
+  toolbar.className = 'mermaid-viewer-toolbar';
+  const viewport = document.createElement('div');
+  viewport.className = 'mermaid-viewer-viewport';
+  const canvas = document.createElement('div');
+  canvas.className = 'mermaid-viewer-canvas';
+  canvas.style.width = Math.max(1, Math.round(box.width)) + 'px';
+  canvas.style.height = Math.max(1, Math.round(box.height)) + 'px';
+  svgEl.classList.add('mermaid-viewer-svg');
+  if(mode === 'lightbox') svgEl.classList.add('mermaid-lightbox-svg');
+  svgEl.style.width = '100%';
+  svgEl.style.height = '100%';
+  svgEl.style.display = 'block';
+  viewport.appendChild(canvas);
+  root.appendChild(toolbar);
+  root.appendChild(viewport);
+  if(host) host.replaceChild(root, svgEl);
+  canvas.appendChild(svgEl);
+
+  const state = {
+    box,
+    canvas,
+    dragging: false,
+    dragOriginX: 0,
+    dragOriginY: 0,
+    dragPointerId: null,
+    dragStartX: 0,
+    dragStartY: 0,
+    dragged: false,
+    mode,
+    root,
+    toolbar,
+    scale: 1,
+    svg: svgEl,
+    viewport,
+    x: 0,
+    y: 0,
+  };
+  root._mermaidViewer = state;
+
+  function _viewportSize(){
+    const rect = viewport.getBoundingClientRect ? viewport.getBoundingClientRect() : null;
+    const width = viewport.clientWidth || (rect && rect.width) || (mode === 'lightbox' ? Math.round((window.innerWidth || box.width) * 0.9) : Math.round(window.innerWidth || box.width));
+    const height = viewport.clientHeight || (rect && rect.height) || (mode === 'lightbox' ? Math.round((window.innerHeight || box.height) * 0.9) : Math.round((window.innerHeight || box.height) * 0.7));
+    return {
+      width: Math.max(1, Number(width) || box.width || 1),
+      height: Math.max(1, Number(height) || box.height || 1),
+    };
+  }
+
+  function _applyTransform(){
+    canvas.style.transform = `translate(${Math.round(state.x)}px, ${Math.round(state.y)}px) scale(${state.scale})`;
+    canvas.style.transformOrigin = '0 0';
+  }
+
+  function _centerForScale(nextScale){
+    const size = _viewportSize();
+    const scaledWidth = box.width * nextScale;
+    const scaledHeight = box.height * nextScale;
+    state.x = scaledWidth < size.width ? Math.round((size.width - scaledWidth) / 2) : 0;
+    state.y = scaledHeight < size.height ? Math.round((size.height - scaledHeight) / 2) : 0;
+  }
+
+  function _fitScale(){
+    const size = _viewportSize();
+    return Math.max(_MERMAID_VIEWER_MIN_SCALE, Math.min(_MERMAID_VIEWER_MAX_SCALE, Math.min(size.width / box.width, size.height / box.height)));
+  }
+
+  function _setScale(nextScale, anchorX, anchorY){
+    const bounded = Math.max(_MERMAID_VIEWER_MIN_SCALE, Math.min(_MERMAID_VIEWER_MAX_SCALE, nextScale));
+    if(!Number.isFinite(bounded) || !box.width || !box.height) return;
+    const focusX = Number.isFinite(anchorX) ? anchorX : _viewportSize().width / 2;
+    const focusY = Number.isFinite(anchorY) ? anchorY : _viewportSize().height / 2;
+    if(state.scale){
+      const ratio = bounded / state.scale;
+      state.x = focusX - (focusX - state.x) * ratio;
+      state.y = focusY - (focusY - state.y) * ratio;
+    }
+    state.scale = bounded;
+    _applyTransform();
+  }
+
+  function _fitViewer(){
+    const nextScale = _fitScale();
+    state.scale = nextScale;
+    _centerForScale(nextScale);
+    _applyTransform();
+  }
+
+  function _resetViewer(){
+    state.scale = 1;
+    _centerForScale(1);
+    _applyTransform();
+  }
+
+  function _zoomIn(){
+    const size = _viewportSize();
+    _setScale(state.scale * _MERMAID_VIEWER_ZOOM_STEP, size.width / 2, size.height / 2);
+  }
+
+  function _zoomOut(){
+    const size = _viewportSize();
+    _setScale(state.scale / _MERMAID_VIEWER_ZOOM_STEP, size.width / 2, size.height / 2);
+  }
+
+  function _zoomFromWheel(e){
+    if(e.preventDefault) e.preventDefault();
+    const rect = viewport.getBoundingClientRect ? viewport.getBoundingClientRect() : {left: 0, top: 0};
+    const anchorX = Number.isFinite(e.clientX) ? e.clientX - rect.left : undefined;
+    const anchorY = Number.isFinite(e.clientY) ? e.clientY - rect.top : undefined;
+    const deltaMode = Number(e.deltaMode) || 0;
+    const lineScale = deltaMode === 1 ? 30 : deltaMode === 2 ? 600 : 1;
+    const factor = Math.exp((-(Number(e.deltaY) || 0)) * lineScale * 0.0015);
+    _setScale(state.scale * factor, anchorX, anchorY);
+  }
+
+  function _onPointerDown(e){
+    if(e.button != null && e.button !== 0) return;
+    state.dragging = true;
+    state.dragged = false;
+    state.dragOriginX = Number(e.clientX) || 0;
+    state.dragOriginY = Number(e.clientY) || 0;
+    state.dragPointerId = e.pointerId != null ? e.pointerId : null;
+    state.dragStartX = state.x;
+    state.dragStartY = state.y;
+    viewport.classList.add('is-panning');
+    if(state.dragPointerId != null && viewport.setPointerCapture) viewport.setPointerCapture(state.dragPointerId);
+    if(e.preventDefault) e.preventDefault();
+  }
+
+  function _onPointerMove(e){
+    if(!state.dragging) return;
+    const dx = (Number(e.clientX) || 0) - state.dragOriginX;
+    const dy = (Number(e.clientY) || 0) - state.dragOriginY;
+    if(Math.abs(dx) + Math.abs(dy) > 3) state.dragged = true;
+    state.x = state.dragStartX + dx;
+    state.y = state.dragStartY + dy;
+    _applyTransform();
+  }
+
+  function _endPointerDrag(){
+    if(!state.dragging) return;
+    state.dragging = false;
+    if(state.dragPointerId != null && viewport.releasePointerCapture){
+      try{ viewport.releasePointerCapture(state.dragPointerId); }catch(_){}
+    }
+    state.dragPointerId = null;
+    viewport.classList.remove('is-panning');
+  }
+
+  function _openViewerOnClick(e){
+    if(mode !== 'inline') return;
+    if(state.dragged){
+      state.dragged = false;
+      return;
+    }
+    if(e.preventDefault) e.preventDefault();
+    if(e.stopPropagation) e.stopPropagation();
+    openLightbox();
+  }
+
+  viewport.onpointerdown = _onPointerDown;
+  viewport.onpointermove = _onPointerMove;
+  viewport.onpointerup = _endPointerDrag;
+  viewport.onpointercancel = _endPointerDrag;
+  viewport.onpointerleave = _endPointerDrag;
+  viewport.onwheel = _zoomFromWheel;
+  viewport.onclick = _openViewerOnClick;
+  root.onclick = e => e.stopPropagation();
+  state.fit = _fitViewer;
+  state.reset = _resetViewer;
+  state.zoomIn = _zoomIn;
+  state.zoomOut = _zoomOut;
+  state.zoomAt = _setScale;
+  state.applyTransform = _applyTransform;
+  state.openLightbox = openLightbox;
+
+  toolbar.appendChild(_createMermaidViewerButton('Zoom in', 'zoomIn', _zoomIn));
+  toolbar.appendChild(_createMermaidViewerButton('Zoom out', 'zoomOut', _zoomOut));
+  toolbar.appendChild(_createMermaidViewerButton('Reset view', 'reset', _resetViewer));
+  toolbar.appendChild(_createMermaidViewerButton('Fit to screen', 'fit', _fitViewer));
+  if(mode === 'inline'){
+    toolbar.appendChild(_createMermaidViewerButton('Fullscreen', 'fullscreen', openLightbox));
+  }
+
+  const initialFit = _fitScale();
+  state.scale = initialFit;
+  _centerForScale(initialFit);
+  _applyTransform();
+  if(mode === 'lightbox'){
+    viewport.style.width = Math.max(1, Math.round(box.width * initialFit)) + 'px';
+    viewport.style.height = Math.max(1, Math.round(box.height * initialFit)) + 'px';
+  } else {
+    viewport.style.width = '100%';
+    viewport.style.height = Math.max(1, Math.round(box.height * initialFit)) + 'px';
+  }
+
+  return root;
+}
+
 function _openMermaidLightbox(svgEl) {
   if(!svgEl) return;
   const lb = document.createElement('div');
@@ -1384,16 +1704,15 @@ function _openMermaidLightbox(svgEl) {
       styleEl.textContent = styleText;
     });
   }
-  clone.classList.add('mermaid-lightbox-svg');
   clone.removeAttribute('width');
   clone.removeAttribute('height');
-  clone.onclick = e => e.stopPropagation();
+  const viewer = _mountMermaidViewer(clone, {mode:'lightbox'});
   const cls = document.createElement('button');
   cls.className = 'img-lightbox-close';
   cls.setAttribute('aria-label', 'Close');
   cls.textContent = '×';
   cls.onclick = () => _closeImgLightbox(lb);
-  lb.appendChild(clone);
+  lb.appendChild(viewer);
   lb.appendChild(cls);
   lb.onclick = () => _closeImgLightbox(lb);
   lb._keyHandler = e => {
@@ -2071,6 +2390,7 @@ function _persistSessionModelCorrection(model, provider, opts){
   return opts&&opts.propagateErrors ? request : request.catch(()=>{});
 }
 let _modelDropdownRequestSeq=0;
+let _modelCatalogFallbackRetried=false;
 
 function _applySessionModelFallback(sel){
   if(!sel) return null;
@@ -2094,10 +2414,13 @@ function _applySessionModelFallback(sel){
 async function populateModelDropdown(opts={}){
   const sel=$('modelSelect');
   if(!sel) return;
+  // `_activeProvider` is refreshed from the /api/models response below.
   if(typeof _modelDropdownRequestSeq!=='number') _modelDropdownRequestSeq=0;
+  if(typeof _modelCatalogFallbackRetried!=='boolean') _modelCatalogFallbackRetried=false;
   const requestSeq=++_modelDropdownRequestSeq;
   try{
     const modelsUrl=new URL('api/models',document.baseURI||location.href);
+    const requestedFreshness=opts&&opts.freshness?String(opts.freshness):'';
     if(opts&&opts.freshness) modelsUrl.searchParams.set('freshness',opts.freshness);
     const _modelsRes=await fetch(modelsUrl.href,{credentials:'include'});
     if(requestSeq!==_modelDropdownRequestSeq) return;
@@ -2150,11 +2473,19 @@ async function populateModelDropdown(opts={}){
       return groups;
     };
 
-    const groups=(Array.isArray(data.groups)&&data.groups.length)
-      ? data.groups
-      : _synthGroupsFromConfigured();
+    const usedConfiguredFallback=!(Array.isArray(data.groups)&&data.groups.length);
+    const groups=usedConfiguredFallback
+      ? _synthGroupsFromConfigured()
+      : data.groups;
+    const willRetry=usedConfiguredFallback && requestedFreshness!=='session_visit' && !_modelCatalogFallbackRetried;
 
-    if(!groups.length) return; // no server groups and no configured fallback
+    if(!groups.length){
+      if(willRetry){
+        _modelCatalogFallbackRetried=true;
+        populateModelDropdown({...opts,freshness:'session_visit'}).catch(()=>{});
+      }
+      return; // no server groups and no configured fallback
+    }
     const previousSelection=_captureModelDropdownSelection(sel);
     // Clear existing options
     sel.innerHTML='';
@@ -2198,7 +2529,11 @@ async function populateModelDropdown(opts={}){
     }
     // Kick off a background live-model fetch for the active provider.
     // This runs after the static list is already shown (no blocking flicker).
-    if(data.active_provider) _fetchLiveModels(data.active_provider, sel, requestSeq);
+    if(data.active_provider && !willRetry) _fetchLiveModels(data.active_provider, sel, requestSeq);
+    if(willRetry){
+      _modelCatalogFallbackRetried=true;
+      populateModelDropdown({...opts,freshness:'session_visit'}).catch(()=>{});
+    }
   }catch(e){
     if(requestSeq!==_modelDropdownRequestSeq) return;
     // API unavailable -- keep the hardcoded HTML options as fallback
@@ -4433,6 +4768,19 @@ if(typeof window!=='undefined'){
         if(nearBottom){
           _nearBottomCount=_nearBottomCount+1;
           if(_nearBottomCount>=2){_scrollPinned=true;_nearBottomCount=0;}
+        }else if(!movedUp && _autoScrollFollow && _scrollPinned){
+          // Content-grew-beneath-a-pinned-viewport case (NOT a user scroll-away).
+          // During streaming on a tall transcript (esp. mobile, where chunks land
+          // fast), new content increases scrollHeight under a stationary viewport,
+          // so bottomDistance crosses the nearBottom threshold even though the
+          // reader never scrolled (top did NOT move up, _messageUserUnpinned is
+          // false). Previously this fell through to `_scrollPinned=false`, killing
+          // auto-follow mid-stream: the follow writer and this listener then fought
+          // frame-by-frame, the viewport stalled while content kept growing, and it
+          // was progressively stranded mid-transcript (the "jump back" report).
+          // Keep the pin and re-snap to the true bottom instead of unpinning.
+          _nearBottomCount=0;
+          if(typeof _setMessageScrollToBottom==='function') _setMessageScrollToBottom();
         }else{
           _nearBottomCount=0;
           _scrollPinned=false;
@@ -6054,12 +6402,12 @@ function getComposerPrimaryAction(){
   }
   const explicitAction=_getExplicitBusyCommandAction(msg&&msg.value);
   if(explicitAction) return explicitAction;
-  const busyMode=window._busyInputMode||'queue';
-  if(busyMode==='steer'){
+  const defaultMessageMode=window._defaultMessageMode||'steer';
+  if(defaultMessageMode==='steer'){
     if(S.activeStreamId&&typeof _trySteer==='function') return 'steer';
     return 'queue';
   }
-  if(busyMode==='interrupt'){
+  if(defaultMessageMode==='interrupt'){
     if(S.activeStreamId&&typeof cancelStream==='function') return 'interrupt';
     return 'queue';
   }
@@ -6077,7 +6425,7 @@ function _applyBusyComposerPlaceholder(){
     input.placeholder=idlePlaceholder;
     return;
   }
-  const busyMode=window._busyInputMode||'queue';
+  const busyMode=window._defaultMessageMode||'steer';
   const busyPlaceholderKey=busyMode==='interrupt'
     ? 'composer_placeholder_busy_interrupt'
     : busyMode==='steer'
@@ -6157,7 +6505,7 @@ async function handleComposerPrimaryAction(){
   const action=typeof getComposerPrimaryAction==='function'?getComposerPrimaryAction():'send';
   if(action==='disabled') return;
   if(action==='stop'){
-    if(typeof cancelStream==='function') await cancelStream();
+    if(typeof cancelStream==='function') await cancelStream('composer-stop');
     return;
   }
   await send();
@@ -6926,6 +7274,10 @@ function speakMessage(btn){
   if(!clean) return;
 
   const engine=localStorage.getItem('hermes-tts-engine')||'browser';
+  if(engine==='openai'){
+    _playOpenaiTts(clean, btn);
+    return;
+  }
   if(engine==='elevenlabs'){
     _playElevenLabsTts(clean, btn);
     return;
@@ -6996,6 +7348,33 @@ function _playElevenLabsTts(text, btn){
     return _playAudioBuf(buf, btn, 'ElevenLabs TTS');
   })
   .catch(function(e){ _fail((e&&e.message)||'ElevenLabs TTS failed'); });
+}
+
+function _playOpenaiTts(text, btn){
+  if(btn) btn.dataset.speaking='1';
+  _ttsSpeaking=true;
+  const _fail=function(msg){
+    _ttsSpeaking=false;_playingEdgeAudio=null;
+    if(btn)btn.dataset.speaking='0';
+    if(msg&&typeof showToast==='function') showToast(msg,4000,'error');
+  };
+  fetch(new URL('api/tts', document.baseURI || location.href).href, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text:text, engine:'openai'})
+  })
+  .then(function(r){
+    if(!r.ok){
+      return r.json().catch(function(){return {};}).then(function(j){
+        throw new Error((j&&j.error)||('TTS request failed: '+r.status));
+      });
+    }
+    return r.arrayBuffer();
+  })
+  .then(function(buf){
+    return _playAudioBuf(buf, btn, 'OpenAI TTS');
+  })
+  .catch(function(e){ _fail((e&&e.message)||'OpenAI TTS failed'); });
 }
 
 // ── Shared AudioContext for TTS playback (no blob URLs needed) ──
@@ -7077,6 +7456,10 @@ function autoReadLastAssistant(){
   if(!text.trim()) return;
   const clean=_stripForTTS(text);
   if(!clean) return;
+  if(engine==='openai'){
+    _playOpenaiTts(clean, null);
+    return;
+  }
   if(engine==='elevenlabs'){
     _playElevenLabsTts(clean, null);
     return;
@@ -7540,7 +7923,7 @@ function restoreLiveTurnHtmlForSession(sid){
   const liveGroup=restored.querySelector('.tool-call-group[data-live-tool-call-group="1"]');
   if(liveGroup&&typeof _startActivityElapsedTimer==='function') _startActivityElapsedTimer(liveGroup);
   if(typeof placeLiveToolCardsHost==='function') placeLiveToolCardsHost();
-  requestAnimationFrame(()=>postProcessRenderedMessages(restored));
+  requestAnimationFrame(()=>_postProcessWithAnchorSuppression(restored));
   return true;
 }
 
@@ -7851,9 +8234,28 @@ function _hideUpdateSummaryPanel(){
   const panel=$('updateSummaryPanel');
   const text=$('updateSummaryText');
   const links=$('updateSummaryDiffLinks');
-  if(panel) panel.style.display='none';
+  const toolbar=$('updateSummaryToolbar');
+  if(panel){
+    panel.style.display='none';
+    panel.classList.remove('update-summary-expanded');
+  }
+  if(toolbar) toolbar.style.display='none';
+  _syncUpdateSummaryExpandButton(false);
   if(text) text.textContent='';
   if(links){links.replaceChildren();links.style.display='none';}
+}
+function _syncUpdateSummaryExpandButton(expanded){
+  const btn=$('btnUpdateSummaryExpand');
+  if(!btn) return;
+  btn.setAttribute('aria-expanded',expanded?'true':'false');
+  btn.textContent=expanded?'Collapse summary':'Expand summary';
+}
+function toggleUpdateSummaryExpanded(){
+  const panel=$('updateSummaryPanel');
+  if(!panel||panel.style.display==='none') return;
+  const expanded=!panel.classList.contains('update-summary-expanded');
+  panel.classList.toggle('update-summary-expanded',expanded);
+  _syncUpdateSummaryExpandButton(expanded);
 }
 const WHATS_NEW_SUMMARY_STORAGE_KEY='hermes-whats-new-generated-summaries';
 function _loadStoredUpdateSummaries(){
@@ -7907,8 +8309,12 @@ function _renderUpdateSummaryPanel(payload,data,targetKey){
   const panel=$('updateSummaryPanel');
   const text=$('updateSummaryText');
   const links=$('updateSummaryDiffLinks');
+  const toolbar=$('updateSummaryToolbar');
   if(!panel||!text) return;
   panel.style.display='block';
+  panel.classList.remove('update-summary-expanded');
+  _syncUpdateSummaryExpandButton(false);
+  if(toolbar) toolbar.style.display='flex';
   const sections=Array.isArray(payload&&payload.summary_sections)?payload.summary_sections:null;
   text.replaceChildren();
   if(sections&&sections.length){
@@ -11880,9 +12286,12 @@ function _restoreMessageScrollSnapshot(snapshot){
 window._fixMobileScrollJank=function _fixMobileScrollJank(){
   const el=document.getElementById('messages');
   if(!el) return;
-  // Desktop with a mouse: keep overflow-anchor:none (explicitly set by CSS).
-  // Mobile touch devices only: temporarily suppress anchor re-selection.
-  if(window.matchMedia('(hover:hover) and (pointer:fine)').matches) return;
+  // Route through the same "is the browser scroll-anchor layer active?" predicate
+  // as _suppressBrowserOverflowAnchor so the two guards can't drift (#5338 review).
+  // Desktop rests at overflow-anchor:none (predicate false) → nothing to suppress.
+  // Mobile touch devices rest at auto (predicate true) → temporarily suppress
+  // anchor re-selection during the wipe-and-rebuild gap.
+  if(!_browserOverflowAnchorActive(el)) return;
   el.style.overflowAnchor='none';
   requestAnimationFrame(()=>{
     if(el.style.overflowAnchor==='none') el.style.overflowAnchor='';
@@ -12171,7 +12580,7 @@ function renderMessages(options){
       _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
       if(_maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow)) return;
       _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
-      requestAnimationFrame(()=>postProcessRenderedMessages(inner));
+      requestAnimationFrame(()=>_postProcessWithAnchorSuppression(inner));
       if(typeof _initMediaPlaybackObserver==='function') _initMediaPlaybackObserver();
       if(typeof loadTodos==='function'&&document.getElementById('panelTodos')&&document.getElementById('panelTodos').classList.contains('active')){loadTodos();}
       return;
@@ -12191,7 +12600,24 @@ function renderMessages(options){
   if(sid&&INFLIGHT[sid]){
     const _lt=document.getElementById('liveAssistantTurn');
     if(_lt&&(!_lt.dataset||!_lt.dataset.sessionId||_lt.dataset.sessionId===sid)){
-      _preservedLiveTurn=_lt;
+      // Blank-turn fix (对话消失): only preserve the live turn across the DOM
+      // wipe if it is GENUINELY live — either an active stream is still running
+      // (S.activeStreamId set: the #3877 mid-stream flicker case this preserve
+      // was written for), or the turn already holds real rendered content (a
+      // visible answer body, a tool card, or a reasoning row). A DEAD shell —
+      // an interrupted turn whose stream dropped (S.activeStreamId cleared to
+      // null) but whose INFLIGHT[sid] entry was not cleaned, leaving only an
+      // empty worklog group ("Processed Ns" with no body/tool rows) — must NOT
+      // be preserved: re-attaching it on a session-updated swap re-render pins
+      // an avatar-only empty turn OVER the settled transcript, hiding the real
+      // (already-persisted) answer. That is the reported blank. Reproduced +
+      // fix verified on an isolated debug instance (8710): stale INFLIGHT +
+      // empty live-turn survived the swap → blank; gating on real-content /
+      // active-stream clears it while a genuine live turn still renders.
+      const _hasRealLiveContent=!!_lt.querySelector('.msg-body, .tool-card-row, .wl-reason');
+      if(_hasRealLiveContent || S.activeStreamId){
+        _preservedLiveTurn=_lt;
+      }
     }
   }
   const compressionState=(()=>{
@@ -13525,7 +13951,7 @@ function renderMessages(options){
   _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
   if(_maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow)) return;
   // Apply syntax highlighting after DOM is built
-  requestAnimationFrame(()=>postProcessRenderedMessages(inner));
+  requestAnimationFrame(()=>_postProcessWithAnchorSuppression(inner));
   // Refresh todo panel if it's currently open
   if(typeof loadTodos==='function' && document.getElementById('panelTodos') && document.getElementById('panelTodos').classList.contains('active')){
     loadTodos();
@@ -14651,6 +15077,36 @@ async function regenerateResponse(btn) {
   } catch(e) { setStatus(t('regen_failed') + e.message); }
 }
 
+// postProcessRenderedMessages() runs one frame AFTER the render + JS scroll
+// restore (it is scheduled via requestAnimationFrame). It performs syntax
+// highlighting, inline diff/csv/pdf/html/excalidraw hydration, mermaid/katex
+// rendering — all of which can CHANGE the height of rows above the viewport.
+//
+// On mobile the scroller rests at overflow-anchor:auto, so any above-viewport
+// height change in this post-render frame makes the browser's native anchor
+// engine compensate scrollTop a SECOND time — after the JS restore already
+// settled the reader's position — yanking them to an unrelated turn ("往回大跳").
+// The synchronous _fixMobileScrollJank / _suppressBrowserOverflowAnchor guards
+// only cover the render frame itself; they have already released by the time
+// this rAF fires. Wrap the post-process (and the media-reflow frame right after
+// it) in the same suppression so the browser layer cannot re-anchor during the
+// async settle window. Desktop rests at `none`, so this is a no-op there.
+function _postProcessWithAnchorSuppression(container){
+  const scroller=$('messages');
+  const release=(scroller&&typeof _suppressBrowserOverflowAnchor==='function')
+    ? _suppressBrowserOverflowAnchor(scroller) : null;
+  try{
+    postProcessRenderedMessages(container);
+  }finally{
+    // Hold suppression across ONE more frame so late media/layout reflow
+    // (image decode, katex/mermaid measure) cannot re-anchor either, then let
+    // _suppressBrowserOverflowAnchor's own rAF-deferred restore run.
+    if(release){
+      if(typeof requestAnimationFrame==='function') requestAnimationFrame(release);
+      else release();
+    }
+  }
+}
 function postProcessRenderedMessages(container) {
   highlightCode(container);
   addCopyButtons(container);
@@ -15242,6 +15698,8 @@ function renderMermaidBlocks(container){
       const tmp=document.getElementById('d'+id);
       if(tmp) tmp.remove();
       block.innerHTML=svg;
+      const renderedSvg = block.querySelector('svg');
+      if(renderedSvg) _mountMermaidViewer(renderedSvg, {mode:'inline'});
       block.classList.add('mermaid-rendered');
     }catch(e){
       const tmp=document.getElementById('d'+id);
