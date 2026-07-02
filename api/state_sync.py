@@ -135,7 +135,8 @@ def sync_session_start(session_id: str, model=None, profile: Optional[str] = Non
 def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=0,
                        estimated_cost=None, model=None, title: Optional[str] = None,
                        message_count: Optional[int] = None, profile: Optional[str] = None,
-                       cache_read_tokens: int = 0, cache_write_tokens: int = 0) -> None:
+                       cache_read_tokens: int = 0, cache_write_tokens: int = 0,
+                       api_call_count: Optional[int] = None) -> None:
     """Update token usage and title for a WebUI session in state.db.
     Called after each turn completes. Uses absolute=True to set totals
     (the WebUI Session already accumulates across turns).
@@ -165,6 +166,7 @@ def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=
             output_tokens=output_tokens,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
+            api_call_count=api_call_count,
             estimated_cost_usd=estimated_cost,
             model=model,
             absolute=True,
