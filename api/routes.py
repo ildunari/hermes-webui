@@ -142,6 +142,8 @@ def _sync_session_title_to_insights(session) -> None:
             title=session.title,
             message_count=len(messages),
             profile=getattr(session, "profile", None),
+            cache_read_tokens=getattr(session, "cache_read_tokens", None) or 0,
+            cache_write_tokens=getattr(session, "cache_write_tokens", None) or 0,
         )
     except Exception:
         logger.debug("Failed to update session title in state.db", exc_info=True)
@@ -20316,6 +20318,8 @@ def _handle_chat_sync(handler, body):
                 model=s.model,
                 title=s.title,
                 message_count=len(s.messages),
+                cache_read_tokens=s.cache_read_tokens or 0,
+                cache_write_tokens=s.cache_write_tokens or 0,
                 # #2762 / #2827 parity with api/streaming.py:5078: pass the
                 # session's profile explicitly so a future refactor that
                 # backgrounds this handler doesn't silently leak writes to
