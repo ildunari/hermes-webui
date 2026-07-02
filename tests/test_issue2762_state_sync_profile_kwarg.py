@@ -89,7 +89,7 @@ def _read_session(db_path: Path, session_id: str):
         # column names so the test queries the actual schema.
         cur = conn.execute(
             "SELECT id AS session_id, title, input_tokens, output_tokens, "
-            "cache_read_tokens, cache_write_tokens "
+            "cache_read_tokens, cache_write_tokens, api_call_count "
             "FROM sessions WHERE id = ?",
             (session_id,),
         )
@@ -217,6 +217,7 @@ def test_sync_session_usage_writes_only_to_named_profile(two_profile_homes):
         profile='maiko',
         cache_read_tokens=1200,
         cache_write_tokens=300,
+        api_call_count=7,
     )
 
     maiko_row = _read_session(two_profile_homes['maiko'] / 'state.db', '2762-regression')
@@ -226,6 +227,7 @@ def test_sync_session_usage_writes_only_to_named_profile(two_profile_homes):
         "sync_session_usage(profile='maiko') did not write to maiko's state.db"
     assert maiko_row["cache_read_tokens"] == 1200
     assert maiko_row["cache_write_tokens"] == 300
+    assert maiko_row["api_call_count"] == 7
     assert hiyuki_row is None, \
         "sync_session_usage(profile='maiko') leaked into hiyuki's state.db — #2762 regression"
 
