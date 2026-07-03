@@ -1136,12 +1136,13 @@ _PROVIDER_DISPLAY = {
     "anthropic": "Anthropic",
     "openai": "OpenAI",
     "openai-api": "OpenAI API",
-    "openai-codex": "OpenAI Codex",
-    "xai-oauth": "xAI Grok OAuth",
+    "openai-codex": "Codex",
+    "xai-oauth": "xAI",
     "copilot": "GitHub Copilot",
-    "moa": "Mixture of Agents",
+    "moa": "MoA",
     "cursor-acp": "Cursor ACP",
-    "zai": "Z.AI / GLM",
+    "atomic": "Atomic",
+    "zai": "zAI",
     "kimi-coding": "Kimi / Moonshot",
     "deepseek": "DeepSeek",
     "minimax": "MiniMax",
@@ -4186,6 +4187,183 @@ def _invoke_models_rebuild(builder):
     return builder()
 
 
+def _model_picker_hidden_provider_slugs(config: dict | None) -> set[str]:
+    """Return provider slugs hidden from the WebUI model picker.
+
+    Mirrors Hermes Agent's display-only model_picker/model_catalog policy so
+    WebUI's /api/models payload does not drift from the CLI/Desktop picker.
+    """
+    hidden: list[str] = []
+    source = config if isinstance(config, dict) else {}
+    for section_name in ("model_picker", "model_catalog"):
+        section = source.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        values = section.get("hidden_providers") or section.get("hide_providers") or []
+        if isinstance(values, str):
+            hidden.extend(part.strip() for part in values.split(","))
+        elif isinstance(values, (list, tuple, set)):
+            hidden.extend(str(part).strip() for part in values)
+
+    try:
+        from hermes_cli.model_switch import expand_hidden_provider_slugs
+
+        return expand_hidden_provider_slugs(tuple(part for part in hidden if part))
+    except Exception:
+        pass
+
+    out: set[str] = set()
+    for raw in hidden:
+        value = str(raw or "").strip().lower()
+        if not value:
+            continue
+        if value == "google":
+            out.add("gemini")
+            continue
+        if value == "x-ai":
+            out.add("xai")
+            continue
+        if value == "xai":
+            out.update({"xai", "xai-oauth"})
+            continue
+        out.add(_resolve_provider_alias(value))
+    return out
+
+
+def _model_picker_visible_model_policy(config: dict | None) -> dict[str, tuple[str, ...]]:
+    """Return per-provider model allowlists for the WebUI picker."""
+    source = config if isinstance(config, dict) else {}
+    try:
+        from hermes_cli.model_switch import load_visible_model_policy
+
+        return load_visible_model_policy(source)
+    except Exception:
+        pass
+
+    visible: dict[str, tuple[str, ...]] = {}
+    for section_name in ("model_picker", "model_catalog"):
+        section = source.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        raw = section.get("visible_models") or section.get("show_models") or {}
+        if not isinstance(raw, dict):
+            continue
+        for provider, values in raw.items():
+            key = str(provider or "").strip()
+            if not key:
+                continue
+            if isinstance(values, str):
+                models = [part.strip() for part in values.split(",")]
+            elif isinstance(values, (list, tuple, set)):
+                models = [str(part).strip() for part in values]
+            else:
+                continue
+            canonical = _canonicalise_provider_id(_resolve_provider_alias(key)) or key.lower()
+            visible[canonical] = tuple(model for model in models if model)
+    return visible
+
+
+def _model_picker_policy_provider_id(provider_id: object, config: dict | None) -> str:
+    """Canonical provider id for display-policy and dedup purposes."""
+    pid = str(provider_id or "").strip().lower()
+    if not pid:
+        return ""
+    if pid.startswith("custom:"):
+        suffix = pid.removeprefix("custom:")
+        providers_cfg = config.get("providers", {}) if isinstance(config, dict) else {}
+        if isinstance(providers_cfg, dict) and suffix in providers_cfg:
+            return suffix
+    return _canonicalise_provider_id(_resolve_provider_alias(pid)) or pid
+
+
+def _rewrite_model_option_provider_prefix(model_id: object, old_provider: str, new_provider: str) -> str:
+    raw = str(model_id or "")
+    old = str(old_provider or "").strip()
+    new = str(new_provider or "").strip()
+    if not raw or not old or not new or old == new:
+        return raw
+    prefix = f"@{old}:"
+    if raw.startswith(prefix):
+        return f"@{new}:{raw[len(prefix):]}"
+    return raw
+
+
+def _filter_model_picker_groups_by_policy(groups: list[dict], config: dict | None) -> list[dict]:
+    """Apply model_picker hidden/visible policy and provider dedup to groups."""
+    hidden = _model_picker_hidden_provider_slugs(config)
+    visible = _model_picker_visible_model_policy(config)
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+
+    for group in groups:
+        raw_pid = str(group.get("provider_id") or "").strip().lower()
+        policy_pid = _model_picker_policy_provider_id(raw_pid, config)
+        if not policy_pid or policy_pid in hidden:
+            continue
+
+        next_group = copy.deepcopy(group)
+        next_group["provider_id"] = policy_pid
+        display_name = _PROVIDER_DISPLAY.get(policy_pid)
+        if not display_name and isinstance(config, dict):
+            providers_cfg = config.get("providers", {})
+            if isinstance(providers_cfg, dict):
+                provider_cfg = providers_cfg.get(policy_pid)
+                if isinstance(provider_cfg, dict):
+                    display_name = str(provider_cfg.get("name") or "").strip() or policy_pid
+        if display_name:
+            next_group["provider"] = display_name
+        if raw_pid != policy_pid:
+            next_group["provider"] = display_name or policy_pid
+            for bucket_name in ("models", "extra_models"):
+                bucket = next_group.get(bucket_name)
+                if isinstance(bucket, list):
+                    for model in bucket:
+                        if isinstance(model, dict):
+                            model["id"] = _rewrite_model_option_provider_prefix(
+                                model.get("id"), raw_pid, policy_pid
+                            )
+
+        allowed = visible.get(policy_pid)
+        if allowed:
+            allowed_lower = {model.lower() for model in allowed}
+            for bucket_name in ("models", "extra_models"):
+                bucket = next_group.get(bucket_name)
+                if isinstance(bucket, list):
+                    filtered = [
+                        model for model in bucket
+                        if str(model.get("id") or "").split(":", 1)[-1].lower() in allowed_lower
+                        or str(model.get("id") or "").split(":")[-1].lower() in allowed_lower
+                    ]
+                    next_group[bucket_name] = filtered
+
+        if not next_group.get("models") and not next_group.get("extra_models"):
+            continue
+
+        existing = merged.get(policy_pid)
+        if existing is None:
+            merged[policy_pid] = next_group
+            order.append(policy_pid)
+            continue
+
+        seen_ids = {
+            str(model.get("id") or "")
+            for bucket_name in ("models", "extra_models")
+            for model in existing.get(bucket_name, []) or []
+            if isinstance(model, dict)
+        }
+        for bucket_name in ("models", "extra_models"):
+            for model in next_group.get(bucket_name, []) or []:
+                if not isinstance(model, dict):
+                    continue
+                model_id = str(model.get("id") or "")
+                if not model_id or model_id in seen_ids:
+                    continue
+                existing.setdefault(bucket_name, []).append(model)
+                seen_ids.add(model_id)
+
+    return [merged[pid] for pid in order]
+
+
 def _append_moa_virtual_group(groups: list[dict], config: dict | None) -> None:
     """Expose configured MoA presets as a virtual model-picker provider."""
     if any(str(group.get("provider_id") or "").lower() == "moa" for group in groups):
@@ -4690,6 +4868,7 @@ def _static_models_catalog_without_live_probes() -> dict:
                     )
 
         _append_moa_virtual_group(groups, cfg)
+        groups = _filter_model_picker_groups_by_policy(groups, cfg)
         _deduplicate_model_ids(groups)
         groups = [
             group
@@ -4925,7 +5104,7 @@ def _current_webui_version() -> str | None:
 # guarantees that even if a future release accidentally reuses the same
 # WebUI version string (or a debug build doesn't have a version), a structural
 # change still invalidates the cache.
-_MODELS_CACHE_SCHEMA_VERSION = 3
+_MODELS_CACHE_SCHEMA_VERSION = 4
 
 
 _models_cache_path = STATE_DIR / "models_cache.json"
@@ -5274,11 +5453,16 @@ def _load_models_cache_from_disk() -> dict | None:
         # disk save path does not persist `aliases`, so reconstruct them from
         # current config to keep the /api/models.aliases contract intact (a
         # disk-cache hit must not silently drop `/model <alias>` resolution).
+        groups = _filter_model_picker_groups_by_policy(cache["groups"], cfg)
         return {
             "active_provider": cache["active_provider"],
             "default_model": cache["default_model"],
-            "configured_model_badges": cache["configured_model_badges"],
-            "groups": cache["groups"],
+            "configured_model_badges": _configured_model_badges_from_static_catalog(
+                groups,
+                active_provider=cache["active_provider"],
+                default_model=cache["default_model"],
+            ),
+            "groups": groups,
             "aliases": (
                 cache["aliases"]
                 if isinstance(cache.get("aliases"), dict)
@@ -5342,11 +5526,16 @@ def _load_stale_models_cache_from_disk() -> dict | None:
             # duration of the over-budget stale fallback. Reconstruct from
             # current config, mirroring the live/static catalog alias build.
             aliases = _model_aliases_from_config()
+        groups = _filter_model_picker_groups_by_policy(cache["groups"], cfg)
         return {
             "active_provider": cache["active_provider"],
             "default_model": cache["default_model"],
-            "configured_model_badges": cache["configured_model_badges"],
-            "groups": cache["groups"],
+            "configured_model_badges": _configured_model_badges_from_static_catalog(
+                groups,
+                active_provider=cache["active_provider"],
+                default_model=cache["default_model"],
+            ),
+            "groups": groups,
             "aliases": aliases,
         }
     except Exception:
@@ -7089,6 +7278,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # When multiple providers expose the same bare model ID, prefix
         # collisions with @provider_id: so the frontend can distinguish them.
         _append_moa_virtual_group(groups, cfg)
+        groups = _filter_model_picker_groups_by_policy(groups, cfg)
         _deduplicate_model_ids(groups)
 
         # Defense-in-depth: drop any optgroup that ended up with zero models
