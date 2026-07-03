@@ -27,6 +27,8 @@ if (helperStart < 0 || helperEnd < 0) {
 
 const documentListeners = {};
 const windowListeners = {};
+let nextTimerId = 1;
+const pendingTimers = new Map();
 function makeClassList(node) {
   const classes = new Set();
   return {
@@ -183,10 +185,26 @@ function triggerWindowResize(width, height) {
     window.dispatchEvent({type: 'resize'});
   }
 }
+
+function flushTimers() {
+  const timers = [...pendingTimers.entries()];
+  pendingTimers.clear();
+  for (const [, fn] of timers) fn();
+}
+
 global.document = document;
 global.window = window;
 global.requestAnimationFrame = (fn) => fn();
 global.cancelAnimationFrame = () => {};
+global.setTimeout = (fn) => {
+  const id = nextTimerId;
+  nextTimerId += 1;
+  pendingTimers.set(id, fn);
+  return id;
+};
+global.clearTimeout = (id) => {
+  pendingTimers.delete(id);
+};
 
 eval(ui.slice(helperStart, helperEnd));
 
@@ -312,23 +330,46 @@ function runScenario(payload) {
     const beforeViewportHeight = lightboxState.viewport.style.height;
     const beforeScale = lightboxState.scale;
     triggerWindowResize(payload.resizedViewportWidth, payload.resizedViewportHeight);
+    const queuedAfterFirstResize = pendingTimers.size;
+    const preFlushViewportWidth = lightboxState.viewport.style.width;
+    const preFlushViewportHeight = lightboxState.viewport.style.height;
+    triggerWindowResize(payload.resizedViewportWidth + 20, payload.resizedViewportHeight + 20);
+    const queuedAfterSecondResize = pendingTimers.size;
+    flushTimers();
     const afterViewportWidth = lightboxState.viewport.style.width;
     const afterViewportHeight = lightboxState.viewport.style.height;
     const afterScale = lightboxState.scale;
+    lightboxState.zoomIn();
+    const manualZoomScale = lightboxState.scale;
+    triggerWindowResize(payload.zoomedViewportWidth, payload.zoomedViewportHeight);
+    flushTimers();
+    const afterManualZoomResizeScale = lightboxState.scale;
+    const afterManualZoomResizeViewportWidth = lightboxState.viewport.style.width;
+    const afterManualZoomResizeViewportHeight = lightboxState.viewport.style.height;
     _closeImgLightbox(lightbox);
     const afterCloseListenerCount = (windowListeners.resize || []).length;
     return {
       beforeListenerCount,
       afterOpenListenerCount,
       afterCloseListenerCount,
+      queuedAfterFirstResize,
+      queuedAfterSecondResize,
       beforeViewportWidth,
       beforeViewportHeight,
       beforeScale,
+      preFlushViewportWidth,
+      preFlushViewportHeight,
       afterViewportWidth,
       afterViewportHeight,
       afterScale,
-      expectedViewportWidth: Math.round((payload.resizedViewportWidth || 0) * 0.9),
-      expectedViewportHeight: Math.round((payload.resizedViewportHeight || 0) * 0.9),
+      manualZoomScale,
+      afterManualZoomResizeScale,
+      afterManualZoomResizeViewportWidth,
+      afterManualZoomResizeViewportHeight,
+      expectedViewportWidth: Math.round(((payload.resizedViewportWidth || 0) + 20) * 0.9),
+      expectedViewportHeight: Math.round(((payload.resizedViewportHeight || 0) + 20) * 0.9),
+      expectedZoomedViewportWidth: Math.round((payload.zoomedViewportWidth || 0) * 0.9),
+      expectedZoomedViewportHeight: Math.round((payload.zoomedViewportHeight || 0) * 0.9),
     };
   }
 
@@ -525,16 +566,26 @@ def test_lightbox_resize_recomputes_viewport_and_scale(_driver_path):
         "viewportHeight": 640,
         "resizedViewportWidth": 800,
         "resizedViewportHeight": 400,
+        "zoomedViewportWidth": 640,
+        "zoomedViewportHeight": 500,
         "options": {"mode": "inline"},
     })
 
     assert _px(result["beforeViewportWidth"]) == round(360 * 0.9)
     assert _px(result["beforeViewportHeight"]) == round(640 * 0.9)
-    assert _px(result["afterViewportWidth"]) == round(800 * 0.9)
-    assert _px(result["afterViewportHeight"]) == round(400 * 0.9)
+    assert _px(result["preFlushViewportWidth"]) == _px(result["beforeViewportWidth"])
+    assert _px(result["preFlushViewportHeight"]) == _px(result["beforeViewportHeight"])
+    assert result["queuedAfterFirstResize"] == 1
+    assert result["queuedAfterSecondResize"] == 1
+    assert _px(result["afterViewportWidth"]) == round((800 + 20) * 0.9)
+    assert _px(result["afterViewportHeight"]) == round((400 + 20) * 0.9)
     expectedScale = min(result["expectedViewportWidth"] / 4000, result["expectedViewportHeight"] / 320)
     assert abs(result["afterScale"] - expectedScale) < 1e-9
     assert result["afterScale"] != result["beforeScale"]
+    assert result["manualZoomScale"] > result["afterScale"]
+    assert abs(result["afterManualZoomResizeScale"] - result["manualZoomScale"]) < 1e-9
+    assert _px(result["afterManualZoomResizeViewportWidth"]) == round(640 * 0.9)
+    assert _px(result["afterManualZoomResizeViewportHeight"]) == round(500 * 0.9)
     assert result["beforeListenerCount"] == 0
     assert result["afterOpenListenerCount"] == 1
     assert result["afterCloseListenerCount"] == 0

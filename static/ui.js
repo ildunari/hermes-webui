@@ -1592,6 +1592,7 @@ function _mountMermaidViewer(svgEl, options = {}) {
 
   function _fitViewer(){
     const nextScale = _fitScale();
+    state.fitScale = nextScale;
     state.scale = nextScale;
     _centerForScale(nextScale);
     _applyTransform();
@@ -1599,11 +1600,20 @@ function _mountMermaidViewer(svgEl, options = {}) {
 
   function _resizeToEnvelope(){
     if(mode !== 'lightbox') return;
+    const hadFitScale = Number.isFinite(state.fitScale);
+    const previousFitScale = hadFitScale ? state.fitScale : _fitScale();
+    const wasAtFit = !hadFitScale || Math.abs(state.scale - previousFitScale) < 1e-9;
     const envelope = _lightboxViewportEnvelope();
     viewport.style.width = Math.max(1, Math.round(envelope.width)) + 'px';
     viewport.style.height = Math.max(1, Math.round(envelope.height)) + 'px';
-    state.scale = _fitScale();
-    _centerForScale(state.scale);
+    const nextFitScale = _fitScale();
+    state.fitScale = nextFitScale;
+    if(wasAtFit){
+      state.scale = nextFitScale;
+      _centerForScale(state.scale);
+    } else {
+      state.scale = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, state.scale));
+    }
     _applyTransform();
   }
 
@@ -1764,7 +1774,13 @@ function _openMermaidLightbox(svgEl) {
   clone.removeAttribute('height');
   const viewer = _mountMermaidViewer(clone, {mode:'lightbox'});
   if(viewer && viewer._mermaidViewer && typeof viewer._mermaidViewer.resizeToEnvelope === 'function'){
-    lb._mermaidResizeHandler = () => viewer._mermaidViewer.resizeToEnvelope();
+    lb._mermaidResizeHandler = () => {
+      if(lb._mermaidResizeTimer && typeof clearTimeout === 'function') clearTimeout(lb._mermaidResizeTimer);
+      lb._mermaidResizeTimer = setTimeout(() => {
+        lb._mermaidResizeTimer = null;
+        viewer._mermaidViewer.resizeToEnvelope();
+      }, 120);
+    };
     if(window && typeof window.addEventListener === 'function'){
       window.addEventListener('resize', lb._mermaidResizeHandler);
     }
@@ -1855,6 +1871,10 @@ function _closeImgLightbox(lb) {
   document.removeEventListener('keydown', lb._keyHandler);
   if(lb._mermaidResizeHandler && window && typeof window.removeEventListener === 'function'){
     window.removeEventListener('resize', lb._mermaidResizeHandler);
+  }
+  if(lb._mermaidResizeTimer && typeof clearTimeout === 'function'){
+    clearTimeout(lb._mermaidResizeTimer);
+    lb._mermaidResizeTimer = null;
   }
   lb.style.animation = 'lb-in .12s ease reverse';
   setTimeout(() => lb.parentNode && lb.parentNode.removeChild(lb), 120);
