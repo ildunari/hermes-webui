@@ -1493,6 +1493,7 @@ async function send(){
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
 
+
       if(_AGENT_COMMANDS_RESOLVE_AS_SKILL.has(_agentCmdName)){
         try{
           const _skillResolved=typeof resolveSkillCommand==='function'
