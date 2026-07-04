@@ -204,13 +204,22 @@ def _run_send_js(*, command, status, adapter_status=None, hook_result=None, hook
                   aliases: ['browse'],
                   cli_only: true,
                   gateway_only: false
+                }},
+                {{
+                  name: 'restart-hermes',
+                  description: 'Queue one detached restart of gateways plus local Hermes surfaces',
+                  category: 'Session',
+                  aliases: ['restart_hermes'],
+                  cli_only: true,
+                  gateway_only: false
                 }}
               ]
             }};
             if (path === '/api/extensions/status') return {json.dumps(status)};
             if (path === '/api/commands/exec') {{
-              commandExecCalls.push(JSON.parse(options.body).command);
-              return {{ output: 'unexpected exec' }};
+              const command = JSON.parse(options.body).command;
+              commandExecCalls.push(command);
+              return {{ output: 'executed ' + command }};
             }}
             throw new Error('unexpected api path: ' + path);
           }},
@@ -507,6 +516,19 @@ def test_pet_slash_intercept_bypasses_generic_agent_execution():
     assert [item["role"] for item in browser["messages"]] == ["user", "assistant"]
     assert "`/browser` is a Hermes CLI-only command" in browser["messages"][1]["content"]
     assert browser["commandExecCalls"] == []
+
+
+def test_restart_hermes_send_executes_webui_command_even_if_metadata_marks_cli_only():
+    result = _run_send_js(
+        command="/restart-hermes",
+        status={"enabled": False, "extensions": []},
+        adapter_status=None,
+    )
+
+    assert [item["role"] for item in result["messages"]] == ["user", "assistant"]
+    assert result["messages"][1]["content"] == "executed /restart-hermes"
+    assert result["commandExecCalls"] == ["/restart-hermes"]
+    assert result["remainingInput"] == ""
 
 
 def test_pet_send_uses_extension_message_when_hook_returns_one():

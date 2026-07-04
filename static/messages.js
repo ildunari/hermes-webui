@@ -1372,6 +1372,22 @@ async function send(){
       const _agentCmd=typeof getAgentCommandMetadata==='function'
         ? await getAgentCommandMetadata(_parsedCmd.name)
         : null;
+      const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'').trim().toLowerCase();
+      if(_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)){
+        if(!S.session){await newSession();await renderSessionList();}
+        S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+        let _agentOutput='(no output)';
+        try{
+          _agentOutput=typeof executeAgentCommand==='function'
+            ? await executeAgentCommand(text,_agentCmd||{name:_agentCmdName})
+            : 'Agent command runtime unavailable in WebUI.';
+        }catch(e){
+          _agentOutput=`Agent command error: ${e&&e.message||e}`;
+        }
+        S.messages.push({role:'assistant',content:String(_agentOutput||'(no output)'),_ts:Date.now()/1000});
+        renderMessages();
+        $('msg').value='';autoResize();hideCmdDropdown();return;
+      }
       if(_agentCmd&&_agentCmd.cli_only){
         if(!S.session){await newSession();await renderSessionList();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
@@ -1379,7 +1395,6 @@ async function send(){
         renderMessages();
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
-      const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'').trim().toLowerCase();
       if(_AGENT_COMMANDS_RESOLVE_AS_SKILL.has(_agentCmdName)){
         try{
           const _skillResolved=typeof resolveSkillCommand==='function'
