@@ -18254,34 +18254,15 @@ def _handle_live_models(handler, parsed):
                 ids = ids[:_MODEL_PICKER_VISIBLE_TARGET]
 
         # Normalise to {id, label} — provider_model_ids() returns plain string IDs.
-        # For ollama-cloud use the shared Ollama formatter (handles `:variant` suffix).
-        # For all other providers use a simpler hyphen-split capitaliser.
-        from api.config import _format_ollama_label as _fmt_ollama
+        # Reuse api.config's formatter so the initial /api/models payload and
+        # background live enrichment agree on labels like Claude Opus 4.8.
+        from api.config import _format_ollama_label as _fmt_ollama, _get_label_for_model as _fmt_model
 
         def _make_label(mid):
             """Best-effort human label from a model ID string."""
             if provider in ("ollama", "ollama-cloud"):
                 return _fmt_ollama(mid)
-            # Preserve slashes for router IDs like "anthropic/claude-sonnet-4.6"
-            display = mid.split("/")[-1] if "/" in mid else mid
-            parts = display.split("-")
-            result = []
-            for p in parts:
-                pl = p.lower()
-                if pl == "gpt":
-                    result.append("GPT")
-                elif pl in ("claude", "gemini", "gemma", "llama", "mistral",
-                            "qwen", "deepseek", "grok", "kimi", "glm"):
-                    result.append(p.capitalize())
-                elif p[:1].isdigit():
-                    result.append(p)  # version numbers: 5.4, 3.5, 4.6 — unchanged
-                else:
-                    result.append(p.capitalize())
-            label = " ".join(result)
-            # Restore well-known uppercase tokens that title-casing breaks
-            for orig in ("GPT", "GLM", "API", "AI", "XL", "MoE"):
-                label = label.replace(orig.title(), orig)
-            return label
+            return _fmt_model(mid, [])
 
         models_out = [{"id": mid, "label": _make_label(mid)} for mid in ids if mid]
         return _finish({"provider": provider, "models": models_out,

@@ -76,3 +76,9 @@ def test_model_picker_policy_hides_noise_and_collapses_custom_atomic():
     assert filtered[2]["models"] == [
         {"id": "@zai:glm-5.2", "label": "GLM 5.2"}
     ]
+
+
+def test_model_label_prettifies_split_numeric_versions():
+    assert config._get_label_for_model("claude-opus-4-8", []) == "Claude Opus 4.8"
+    assert config._get_label_for_model("@vibeproxy:claude-opus-4-8", []) == "Claude Opus 4.8"
+    assert config._get_label_for_model("anthropic/claude-opus-4-8", []) == "Claude Opus 4.8"

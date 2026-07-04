@@ -5701,12 +5701,71 @@ def invalidate_provider_models_cache(provider_id: str):
     _delete_models_cache_on_disk()
 
 
+def _prettify_model_label_fallback(model_id: str) -> str:
+    """Standalone fallback for Hermes-style model labels."""
+    raw = str(model_id or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("@") and ":" in raw:
+        raw = raw.split(":", 1)[1]
+    if "://" not in raw and "/" in raw:
+        raw = raw.split("/", 1)[1]
+    tokens = [token for token in raw.replace("_", "-").replace(":", "-").split("-") if token]
+    out: list[str] = []
+    i = 0
+    token_cases = {
+        "ai": "AI",
+        "api": "API",
+        "chatgpt": "ChatGPT",
+        "claude": "Claude",
+        "codex": "Codex",
+        "deepseek": "DeepSeek",
+        "flash": "Flash",
+        "fable": "Fable",
+        "gemini": "Gemini",
+        "glm": "GLM",
+        "gpt": "GPT",
+        "haiku": "Haiku",
+        "mini": "Mini",
+        "opus": "Opus",
+        "pro": "Pro",
+        "qwopus": "Qwopus",
+        "sonnet": "Sonnet",
+        "spark": "Spark",
+    }
+    while i < len(tokens):
+        token = tokens[i]
+        lower = token.lower()
+        if token.isdigit() and i + 1 < len(tokens) and tokens[i + 1].isdigit():
+            out.append(f"{token}.{tokens[i + 1]}")
+            i += 2
+            continue
+        out.append(token_cases.get(lower) or (token[:1].upper() + token[1:]))
+        i += 1
+    return " ".join(out)
+
+
+def _prettify_model_label(model_id: str) -> str:
+    """Use Hermes Agent's model label formatter when available."""
+    if "://" in str(model_id or ""):
+        return _prettify_model_label_fallback(model_id)
+    try:
+        module = __import__("hermes_cli.model_display", fromlist=["prettify_model_label"])
+        label = module.prettify_model_label(model_id)
+        if label:
+            return label
+    except Exception:
+        pass
+    return _prettify_model_label_fallback(model_id)
+
+
 def _get_label_for_model(model_id: str, existing_groups: list) -> str:
     """Return a human-friendly label for *model_id*.
 
     Resolution order:
     1. If the model already appears in *existing_groups* with a label, use it.
-    2. Strip @provider: prefix and namespace prefix, then title-case.
+    2. Strip @provider: prefix and namespace prefix, then use the Hermes Agent
+       model-display formatter.
 
     This ensures the injected default model entry in the dropdown always shows
     the same label as the live-fetched or static-catalog version, rather than
@@ -5727,14 +5786,28 @@ def _get_label_for_model(model_id: str, existing_groups: list) -> str:
             if m.get("label") and _norm(str(m.get("id", ""))) == norm_lookup:
                 return m["label"]
 
-    # Fall back: strip only the first slash-segment (provider prefix),
-    # preserving vendor hierarchy for multi-slash IDs (#3360).
-    # Skip for URI-scheme IDs whose slashes are path separators (#3429).
-    bare = lookup_id.split("/", 1)[1] if ("/" in lookup_id and not _has_scheme(lookup_id)) else lookup_id
-    return " ".join(
-        w.upper() if (len(w) <= 3 and w.replace(".", "").isalnum() and not w.isdigit()) else w.capitalize()
-        for w in bare.replace("_", "-").split("-")
-    )
+    formatter = globals().get("_prettify_model_label")
+    if callable(formatter):
+        return str(formatter(lookup_id))
+
+    # Compatibility for tests/tools that exec only this function body.
+    bare = lookup_id if _has_scheme(lookup_id) else lookup_id.split("/", 1)[1] if "/" in lookup_id else lookup_id
+    words = [w for w in bare.replace("_", "-").split("-") if w]
+    result = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word.isdigit() and i + 1 < len(words) and words[i + 1].isdigit():
+            result.append(f"{word}.{words[i + 1]}")
+            i += 2
+            continue
+        result.append(
+            word.upper()
+            if (len(word) <= 3 and word.replace(".", "").isalnum() and not word.isdigit())
+            else word.capitalize()
+        )
+        i += 1
+    return " ".join(result)
 
 
 def _read_live_provider_model_ids(provider_id: str) -> list[str]:
