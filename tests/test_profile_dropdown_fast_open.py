@@ -157,6 +157,7 @@ def test_poisoned_profile_cache_opens_then_switches_after_fresh_refresh():
         globalThis.$ = (id) => elements.get(id) || null;
         globalThis.S = {{ activeProfile: 'default' }};
         globalThis.t = (key, n) => key === 'profile_skill_count' ? `${{n}} skills` : key;
+        globalThis.profileDisplayName = (name) => String(name == null ? '' : name);
         globalThis.esc = (value) => String(value == null ? '' : value)
           .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
           .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
