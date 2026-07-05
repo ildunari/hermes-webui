@@ -1051,6 +1051,10 @@ class Session:
                  context_engine_state=None,
                  context_length=None, threshold_tokens=None,
                  last_prompt_tokens=None,
+                 compression_recovery=None,
+                 recommended_recovery_action=None,
+                 compression_recovery_source_session_id=None,
+                 compression_recovery_action=None,
                  truncation_watermark=None,
                  truncation_boundary=None,
                  clear_generation=None,
@@ -1103,6 +1107,18 @@ class Session:
         self.context_length = context_length
         self.threshold_tokens = threshold_tokens
         self.last_prompt_tokens = last_prompt_tokens
+        self.compression_recovery = compression_recovery if isinstance(compression_recovery, dict) else {}
+        self.recommended_recovery_action = recommended_recovery_action
+        self.compression_recovery_source_session_id = (
+            str(compression_recovery_source_session_id).strip()
+            if compression_recovery_source_session_id
+            else None
+        )
+        self.compression_recovery_action = (
+            str(compression_recovery_action).strip()
+            if compression_recovery_action
+            else None
+        )
         self.truncation_watermark = truncation_watermark
         self.truncation_boundary = truncation_boundary
         self.clear_generation = clear_generation
@@ -1174,6 +1190,8 @@ class Session:
             'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
             'compression_anchor_details', 'context_engine_state',
             'context_length', 'threshold_tokens', 'last_prompt_tokens',
+            'compression_recovery', 'recommended_recovery_action',
+            'compression_recovery_source_session_id', 'compression_recovery_action',
             'truncation_watermark',
             'truncation_boundary',
             'clear_generation',
@@ -1422,12 +1440,18 @@ class Session:
             'context_length': self.context_length,
             'threshold_tokens': self.threshold_tokens,
             'last_prompt_tokens': self.last_prompt_tokens,
+            'compression_recovery': self.compression_recovery,
+            'recommended_recovery_action': self.recommended_recovery_action,
             'gateway_routing': self.gateway_routing,
             'gateway_routing_history': self.gateway_routing_history,
             'manual_title': self.manual_title,
             # Only emit 'parent_session_id' when set (the /branch fork link, #1342).
             # Sessions without a fork must not leak None — see test_session_lineage_metadata_api.
             **({'parent_session_id': self.parent_session_id} if self.parent_session_id else {}),
+            **({
+                'compression_recovery_source_session_id': self.compression_recovery_source_session_id,
+                'compression_recovery_action': self.compression_recovery_action,
+            } if (self.compression_recovery_source_session_id or self.compression_recovery_action) else {}),
             **({
                 'worktree_path': self.worktree_path,
                 'worktree_branch': self.worktree_branch,
@@ -3268,6 +3292,97 @@ def get_session(sid, metadata_only=False):
                 pass  # repair is best-effort
         return s
     raise KeyError(sid)
+
+
+_COMPRESSION_RECOVERY_PROFILE_UNSET = object()
+
+
+def _compression_recovery_child_matches(
+    session,
+    source_session_id: str,
+    action: str,
+    source_profile=_COMPRESSION_RECOVERY_PROFILE_UNSET,
+) -> bool:
+    if source_profile is not _COMPRESSION_RECOVERY_PROFILE_UNSET:
+        try:
+            from api.profiles import _profiles_match
+        except (ImportError, AttributeError):
+            logger.debug("Failed to profile-check compression recovery session", exc_info=True)
+            return False
+        if not _profiles_match(getattr(session, "profile", None), source_profile):
+            return False
+    return (
+        str(getattr(session, "compression_recovery_source_session_id", "") or "").strip() == source_session_id
+        and str(getattr(session, "compression_recovery_action", "") or "").strip() == action
+    )
+
+
+def find_compression_recovery_session(
+    source_session_id: str,
+    action: str,
+    source_profile=_COMPRESSION_RECOVERY_PROFILE_UNSET,
+):
+    """Return an existing focused recovery child for ``source_session_id``.
+
+    The recovery-start endpoint is a retryable UI action. A persisted marker on
+    the child session makes double-clicks, repeated calls, and cache reloads
+    converge on the same continuation instead of creating duplicate siblings.
+    """
+
+    source_sid = str(source_session_id or "").strip()
+    recovery_action = str(action or "").strip()
+    if not source_sid or not recovery_action:
+        return None
+
+    matches = []
+    seen_ids: set[str] = set()
+    try:
+        with LOCK:
+            memory_sessions = list(SESSIONS.values())
+        for session in memory_sessions:
+            sid = str(getattr(session, "session_id", "") or "").strip()
+            if sid:
+                seen_ids.add(sid)
+            if _compression_recovery_child_matches(session, source_sid, recovery_action, source_profile):
+                matches.append(session)
+    except Exception:
+        logger.debug("Failed to scan cached compression recovery sessions", exc_info=True)
+
+    try:
+        persisted_ids = _persisted_session_ids_snapshot()
+    except Exception:
+        persisted_ids = frozenset()
+    for sid in persisted_ids:
+        if sid in seen_ids:
+            continue
+        try:
+            meta = Session.load_metadata_only(sid)
+        except Exception:
+            logger.debug("Failed to inspect compression recovery session %s", sid, exc_info=True)
+            continue
+        if not meta or not _compression_recovery_child_matches(meta, source_sid, recovery_action, source_profile):
+            continue
+        try:
+            matches.append(get_session(sid))
+        except Exception:
+            matches.append(meta)
+
+    if not matches:
+        return None
+
+    def _sort_key(session):
+        try:
+            created_at = float(getattr(session, "created_at", 0) or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        try:
+            updated_at = float(getattr(session, "updated_at", 0) or 0)
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        return (created_at, updated_at, str(getattr(session, "session_id", "") or ""))
+
+    return sorted(matches, key=_sort_key)[0]
+
 
 def _profile_default_model_state(profile=None):
     """Return the default model/provider configured for *profile*."""

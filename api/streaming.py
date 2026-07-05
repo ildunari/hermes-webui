@@ -44,6 +44,7 @@ from api.config import (
 )
 from api.helpers import redact_session_data, _redact_text
 from api.compression_anchor import is_context_compression_marker, visible_messages_for_anchor
+from api.compression_recovery import stamp_compression_exhausted_recovery
 from api.metering import meter
 from api.run_journal import RunJournalWriter
 from api.todo_state import attach_todo_state, emit_todo_state
@@ -8680,6 +8681,15 @@ def _run_agent_streaming(
                             'timestamp': int(time.time()),
                             '_error': True,
                         }
+                        if _err_type == 'compression_exhausted':
+                            _recovery = stamp_compression_exhausted_recovery(
+                                s,
+                                message=_error_payload.get('message') or _err_label,
+                                details=_error_payload.get('details') or '',
+                            )
+                            _error_message['_compressionRecovery'] = _recovery
+                            _error_payload['compression_recovery'] = _recovery
+                            _error_payload['recommended_recovery_action'] = _recovery.get('recommended_action')
                         if _error_payload.get('details'):
                             _error_message['provider_details'] = _error_payload['details']
                         if _err_type == 'cancelled':
@@ -9573,6 +9583,7 @@ def _run_agent_streaming(
         _exc_is_not_found = _classification['type'] == 'model_not_found'  # detects '404', 'not found', 'does not exist', and 'invalid model'.
         _exc_is_cancelled = _classification['type'] == 'cancelled'
         _exc_is_interrupted = _classification['type'] == 'interrupted'
+        _exc_is_compression_exhausted = _classification['type'] == 'compression_exhausted'
 
         # The user hint still points to Settings / `hermes model` from _classify_provider_error().
         if _exc_is_quota:
@@ -9703,6 +9714,10 @@ def _run_agent_streaming(
             _exc_label, _exc_type, _exc_hint = (
                 _classification['label'], _classification['type'], _classification['hint'],
             )
+        elif _exc_is_compression_exhausted:
+            _exc_label, _exc_type, _exc_hint = (
+                _classification['label'], _classification['type'], _classification['hint'],
+            )
         else:
             _exc_label, _exc_type, _exc_hint = 'Error', 'error', ''
 
@@ -9742,6 +9757,15 @@ def _run_agent_streaming(
                     'timestamp': int(time.time()),
                     '_error': True,
                 }
+                if _exc_type == 'compression_exhausted':
+                    _recovery = stamp_compression_exhausted_recovery(
+                        s,
+                        message=_error_payload.get('message') or err_str,
+                        details=_error_payload.get('details') or '',
+                    )
+                    _error_message['_compressionRecovery'] = _recovery
+                    _error_payload['compression_recovery'] = _recovery
+                    _error_payload['recommended_recovery_action'] = _recovery.get('recommended_action')
                 if _error_payload.get('details'):
                     _error_message['provider_details'] = _error_payload['details']
                 if _exc_type == 'cancelled':

@@ -5786,6 +5786,16 @@ main.main > #mainPlugin{display:none;}
 .status-card-label{color:var(--muted);font-weight:550;background:rgba(0,0,0,.015);}
 .status-card-value{color:var(--text);word-break:break-word;font-family:var(--font-mono);}
 @media (max-width:700px){.status-card{margin-left:0;}.status-card-head{flex-direction:column;}.status-card-session-copy{max-width:100%;}.status-card-grid{grid-template-columns:1fr;}.status-card-label{padding-bottom:2px;border-top:1px solid var(--border-subtle);}.status-card-value{padding-top:2px;border-top:0;}}
+.compression-recovery-card{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:12px 0 4px;padding:14px 16px;border:1px solid var(--border-subtle);border-radius:var(--radius-card);background:var(--surface-subtle);box-shadow:0 8px 20px rgba(0,0,0,.04);}
+.compression-recovery-copy{display:flex;flex-direction:column;gap:3px;min-width:0;}
+.compression-recovery-title{color:var(--text);font-size:14px;font-weight:650;line-height:1.35;}
+.compression-recovery-summary{color:var(--muted);font-size:12px;line-height:1.45;}
+.compression-recovery-action{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:32px;padding:6px 11px;border:1px solid var(--accent-bg-strong);border-radius:7px;background:var(--accent-bg);color:var(--accent-text);font:inherit;font-size:12px;font-weight:650;white-space:nowrap;cursor:pointer;}
+.compression-recovery-action:hover{background:var(--accent-bg-strong);color:var(--accent-text);}
+.compression-recovery-action:disabled{opacity:.65;cursor:progress;}
+.compression-recovery-card[data-compression-recovery-consumed="1"]{opacity:.6;}
+.compression-recovery-card[data-compression-recovery-consumed="1"] .compression-recovery-action{opacity:.55;cursor:default;pointer-events:none;}
+@media (max-width:700px){.compression-recovery-card{flex-direction:column;align-items:stretch;margin-left:0;}.compression-recovery-action{width:100%;}}
 .assistant-segment-anchor { display: none; }
 
 /* ── Classic conversation layout: user right, half-width; assistant left ── */

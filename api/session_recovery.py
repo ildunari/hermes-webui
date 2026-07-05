@@ -536,6 +536,9 @@ def _state_db_row_to_sidecar(row: dict) -> dict:
     messages = row.get('messages') if isinstance(row.get('messages'), list) else []
     last_ts = messages[-1].get('timestamp') if messages and isinstance(messages[-1], dict) else started_at
     workspace_value = row.get('workspace') or ''
+    compression_recovery = row.get('compression_recovery')
+    if not isinstance(compression_recovery, dict):
+        compression_recovery = {}
     return {
         'session_id': row.get('id'),
         'title': row.get('title') or 'Recovered WebUI Session',
@@ -567,6 +570,10 @@ def _state_db_row_to_sidecar(row: dict) -> dict:
         'context_length': None,
         'threshold_tokens': None,
         'last_prompt_tokens': None,
+        'compression_recovery': compression_recovery,
+        'recommended_recovery_action': row.get('recommended_recovery_action') or None,
+        'compression_recovery_source_session_id': row.get('compression_recovery_source_session_id') or None,
+        'compression_recovery_action': row.get('compression_recovery_action') or None,
         'gateway_routing': None,
         'gateway_routing_history': [],
         'llm_title_generated': False,

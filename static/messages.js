@@ -1326,6 +1326,11 @@ async function send(){
   _flushSelectionBlocksToComposer();
   text=$('msg').value.trim();
   if(!text&&!S.pendingFiles.length){_sendInProgress=false;_sendInProgressSid=null;return;}
+  if(typeof shouldInterceptCompressionRecoveryContinuation==='function'&&shouldInterceptCompressionRecoveryContinuation(text,S.pendingFiles)){
+    if(typeof showCompressionRecoveryContinuationHint==='function') showCompressionRecoveryContinuationHint();
+    _sendInProgress=false;_sendInProgressSid=null;
+    return;
+  }
 
   // #5472: snapshot the ORIGINAL user-typed composer state now — before slash
   // rewrites (/moa, bundles) mutate `text` and before uploadPendingFiles()
@@ -5707,7 +5712,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
               if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(S.session.session_id);
             }
           } else {
-            S.messages.push({role:'assistant',content:`**${label}:** ${d.message}${hint}`,provider_details:details,provider_details_label:detailsLabel});
+            const recovery=(d.compression_recovery&&typeof d.compression_recovery==='object')?d.compression_recovery:null;
+            S.messages.push({role:'assistant',content:`**${label}:** ${d.message}${hint}`,provider_details:details,provider_details_label:detailsLabel,_compressionRecovery:recovery||undefined});
             _attachProjectedAnchorSceneToLastAssistant(S.messages);
           }
         }catch(_){
