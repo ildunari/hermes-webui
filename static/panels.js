@@ -530,7 +530,7 @@ function _cronProfileName(profile){
 
 function _cronProfileLabel(profile){
   const name = _cronProfileName(profile);
-  return name || (t('cron_profile_server_default') || 'server default');
+  return name ? profileDisplayName(name) : (t('cron_profile_server_default') || 'server default');
 }
 
 function _cronProfileTitle(profile){
@@ -610,11 +610,11 @@ function _cronProfileOptions(selected){
     const name = _cronProfileName(p && p.name);
     if (!name || seen.has(name)) continue;
     seen.add(name);
-    const label = p && p.is_default ? `${name} (${t('default') || 'default'})` : name;
+    const label = p && p.is_default ? `${profileDisplayName(name)} (${t('default') || 'default'})` : profileDisplayName(name);
     opts.push(`<option value="${esc(name)}"${current === name ? ' selected' : ''}>${esc(label)}</option>`);
   }
   if (current && !seen.has(current)) {
-    opts.push(`<option value="${esc(current)}" selected>${esc(current)} (${esc(t('not_available') || 'not available')})</option>`);
+    opts.push(`<option value="${esc(current)}" selected>${esc(profileDisplayName(current))} (${esc(t('not_available') || 'not available')})</option>`);
   }
   return opts.join('');
 }
@@ -2132,7 +2132,7 @@ async function dropKanbanTask(event, status){
 
 const KANBAN_UNASSIGNED_LANE = '__unassigned__';
 function _kanbanLaneKey(task){ return task && task.assignee ? String(task.assignee) : KANBAN_UNASSIGNED_LANE; }
-function _kanbanLaneLabel(lane){ return lane === KANBAN_UNASSIGNED_LANE ? t('kanban_unassigned') : lane; }
+function _kanbanLaneLabel(lane){ return lane === KANBAN_UNASSIGNED_LANE ? t('kanban_unassigned') : profileDisplayName(lane); }
 
 function _kanbanLaneNames(columns){
   const names = new Set();
@@ -6035,7 +6035,7 @@ async function loadProfilesPanel() {
       card.innerHTML = `
         <div class="profile-card-header">
           <div style="min-width:0;flex:1">
-            <div class="profile-card-name${isActive ? ' is-active' : ''}">${gwDot}${esc(p.name)}${defaultBadge}${activeBadge}${hiddenBadge}</div>
+            <div class="profile-card-name${isActive ? ' is-active' : ''}">${gwDot}${esc(profileDisplayName(p.name))}${defaultBadge}${activeBadge}${hiddenBadge}</div>
             ${meta.length ? `<div class="profile-card-meta">${esc(meta.join(' \u00b7 '))}</div>` : `<div class="profile-card-meta">${esc(t('profile_no_configuration'))}</div>`}
           </div>
         </div>`;
@@ -6082,7 +6082,7 @@ function _renderProfileDetail(p, activeName){
   const body = $('profileDetailBody');
   const empty = $('profileDetailEmpty');
   if (!title || !body) return;
-  title.textContent = p.name;
+  title.textContent = profileDisplayName(p.name);
   const isActive = p.name === activeName;
   const isDefault = !!p.is_default;
   const statusBadge = isActive
@@ -6176,14 +6176,14 @@ async function activateCurrentProfile(){
 async function deleteCurrentProfile(){
   if (!_currentProfileDetail) return;
   const name = _currentProfileDetail.name;
-  const _ok = await showConfirmDialog({title:t('profile_delete_confirm_title',name),message:t('profile_delete_confirm_message'),confirmLabel:t('delete_title'),danger:true,focusCancel:true});
+  const _ok = await showConfirmDialog({title:t('profile_delete_confirm_title',profileDisplayName(name)),message:t('profile_delete_confirm_message'),confirmLabel:t('delete_title'),danger:true,focusCancel:true});
   if(!_ok) return;
   try {
     await api('/api/profile/delete', { method: 'POST', body: JSON.stringify({ name }) });
     _invalidateKanbanProfileCache();
     _clearProfileDetail();
     await loadProfilesPanel();
-    showToast(t('profile_deleted', name));
+    showToast(t('profile_deleted', profileDisplayName(name)));
   } catch (e) { showToast(t('delete_failed') + e.message); }
 }
 
@@ -6205,7 +6205,7 @@ function renderProfileDropdown(data) {
     const gwDot = `<span class="profile-opt-badge ${p.gateway_running ? 'running' : 'stopped'}"></span>`;
     const checkmark = p.name === active ? ' <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--link)" stroke-width="3" style="vertical-align:-1px"><polyline points="20 6 9 17 4 12"/></svg>' : '';
     const defaultBadge = p.is_default ? ` <span style="opacity:.5;font-weight:400">${esc(t('profile_default_label'))}</span>` : '';
-    opt.innerHTML = `<div class="profile-opt-name">${gwDot}${esc(p.name)}${defaultBadge}${checkmark}</div>` +
+    opt.innerHTML = `<div class="profile-opt-name">${gwDot}${esc(profileDisplayName(p.name))}${defaultBadge}${checkmark}</div>` +
       (meta.length ? `<div class="profile-opt-meta">${esc(meta.join(' \u00b7 '))}</div>` : '');
     opt.onclick = async () => {
       closeProfileDropdown();
@@ -6224,7 +6224,7 @@ function renderProfileDropdown(data) {
   }
   // Sync titlebar label to the resolved active profile
   const tbl = $('titlebarProfileLabel');
-  if (tbl) tbl.textContent = active;
+  if (tbl) tbl.textContent = profileDisplayName(active);
 }
 
 function toggleProfileDropdown(e) {
@@ -6310,8 +6310,8 @@ async function switchToProfile(name) {
   if (_chip) { _chip.classList.add('switching'); _chip.disabled = true; }
   if (_titlebarBtn) { _titlebarBtn.classList.add('switching'); _titlebarBtn.disabled = true; }
   // Optimistic name update — shows the target name right away
-  if (_chipLabel) _chipLabel.textContent = name;
-  if (_titlebarLabel) _titlebarLabel.textContent = name;
+  if (_chipLabel) _chipLabel.textContent = profileDisplayName(name);
+  if (_titlebarLabel) _titlebarLabel.textContent = profileDisplayName(name);
 
   // ── Clear stale content + show loading skeletons immediately (#4662) ───────
   // The conversation list and workspace tree still show the PREVIOUS profile's
@@ -6491,7 +6491,7 @@ async function switchToProfile(name) {
       if ((!S.session || !S.session.workspace) && typeof clearWorkspaceTreeSkeleton === 'function') {
         clearWorkspaceTreeSkeleton();
       }
-      showToast(t('profile_switched_new_conversation', name));
+      showToast(t('profile_switched_new_conversation', profileDisplayName(name)));
     } else {
       // No messages yet — refresh the list and topbar in place, then the
       // workspace tree. The loading skeletons shown up front (top of this
@@ -6518,7 +6518,7 @@ async function switchToProfile(name) {
         // doesn't strand (#4662 Opus gate).
         clearWorkspaceTreeSkeleton();
       }
-      showToast(t('profile_switched', name));
+      showToast(t('profile_switched', profileDisplayName(name)));
     }
 
     await _profileSwitchPanelLoad();
@@ -6526,8 +6526,8 @@ async function switchToProfile(name) {
 
   } catch (e) {
     // Revert the optimistic name update on error
-    if (_switchGen === _profileSwitchGeneration && _chipLabel) _chipLabel.textContent = _prevProfileName;
-    if (_switchGen === _profileSwitchGeneration && _titlebarLabel) _titlebarLabel.textContent = _prevProfileName;
+    if (_switchGen === _profileSwitchGeneration && _chipLabel) _chipLabel.textContent = profileDisplayName(_prevProfileName);
+    if (_switchGen === _profileSwitchGeneration && _titlebarLabel) _titlebarLabel.textContent = profileDisplayName(_prevProfileName);
     if (_switchGen === _profileSwitchGeneration) showToast(t('switch_failed') + e.message);
     // The switch failed, so we're still on the previous profile and its caches
     // are intact — restore the real list/tree so the loading skeletons we showed
@@ -6684,7 +6684,7 @@ async function saveProfileForm(){
     _invalidateKanbanProfileCache();
     _profilePreFormDetail = null;
     await loadProfilesPanel();
-    showToast(t('profile_created', name));
+    showToast(t('profile_created', profileDisplayName(name)));
     openProfileDetail(name);
   } catch (e) {
     errEl.textContent = e.message || t('create_failed');
@@ -6698,13 +6698,13 @@ function toggleProfileForm(){ openProfileCreate();
 }
 
 async function deleteProfile(name) {
-  const _delProf=await showConfirmDialog({title:t('profile_delete_confirm_title',name),message:t('profile_delete_confirm_message'),confirmLabel:t('delete_title'),danger:true,focusCancel:true});
+  const _delProf=await showConfirmDialog({title:t('profile_delete_confirm_title',profileDisplayName(name)),message:t('profile_delete_confirm_message'),confirmLabel:t('delete_title'),danger:true,focusCancel:true});
   if(!_delProf) return;
   try {
     await api('/api/profile/delete', { method: 'POST', body: JSON.stringify({ name }) });
     _invalidateKanbanProfileCache();
     await loadProfilesPanel();
-    showToast(t('profile_deleted', name));
+    showToast(t('profile_deleted', profileDisplayName(name)));
   } catch (e) { showToast(t('delete_failed') + e.message); }
 }
 

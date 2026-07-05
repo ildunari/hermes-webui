@@ -30,22 +30,30 @@ import api.config as config
 import api.profiles as profiles
 
 
-def _install_fake_hermes_cli(monkeypatch, *, with_load_pool: bool = False, pool_data: dict | None = None):
+def _install_fake_hermes_cli(
+    monkeypatch,
+    *,
+    with_load_pool: bool = False,
+    pool_data: dict | None = None,
+    available_providers: list[dict] | None = None,
+    auth_status: dict[str, dict] | None = None,
+):
     """Stub hermes_cli so detection is deterministic and offline.
 
-    list_available_providers() returns [] so the ONLY way a provider can be
-    detected is via the credential_pool path under test (mirrors the
-    test_credential_pool_providers.py helper).
+    By default list_available_providers() returns [] so the ONLY way a provider
+    can be detected is via the credential_pool path under test (mirrors the
+    test_credential_pool_providers.py helper). Tests can pass available_providers
+    + auth_status to drive the Hermes-auth detection branch directly.
     """
     fake_pkg = types.ModuleType("hermes_cli")
     fake_pkg.__path__ = []
 
     fake_models = types.ModuleType("hermes_cli.models")
-    fake_models.list_available_providers = lambda: []
+    fake_models.list_available_providers = lambda: list(available_providers or [])
     fake_models.provider_model_ids = lambda pid: []
 
     fake_auth = types.ModuleType("hermes_cli.auth")
-    fake_auth.get_auth_status = lambda _pid: {}
+    fake_auth.get_auth_status = lambda pid: dict((auth_status or {}).get(pid, {}))
 
     monkeypatch.setitem(sys.modules, "hermes_cli", fake_pkg)
     monkeypatch.setitem(sys.modules, "hermes_cli.models", fake_models)
@@ -113,11 +121,14 @@ def _install_fake_base_url_probe(monkeypatch, model_ids):
 
 
 def _call_get_available_models(monkeypatch, tmp_path, auth_payload, *,
-                               with_load_pool=False, base_url=None, probe_models=None):
+                               with_load_pool=False, base_url=None, probe_models=None,
+                               available_providers=None, auth_status=None):
     _install_fake_hermes_cli(
         monkeypatch,
         with_load_pool=with_load_pool,
         pool_data=auth_payload.get("credential_pool", {}),
+        available_providers=available_providers,
+        auth_status=auth_status,
     )
     if base_url is not None:
         _install_fake_base_url_probe(monkeypatch, probe_models or [])
@@ -178,6 +189,34 @@ def _photon_auth_payload(extra_pool=None):
         "active_provider": "openai-codex",
         "credential_pool": pool,
     }
+
+
+
+
+def test_hermes_auth_env_github_token_does_not_detect_copilot(monkeypatch, tmp_path):
+    """An ambient GITHUB_TOKEN from hermes_cli auth must not make Copilot look
+    configured.
+
+    The credential-pool path already filters env:GITHUB_TOKEN, but the separate
+    list_available_providers()/get_auth_status() branch also needs the same
+    ambient-token filter; classic PATs are rejected by the Copilot API and can
+    otherwise slow /api/models while the live catalog tries Copilot.
+    """
+    result = _call_get_available_models(
+        monkeypatch,
+        tmp_path,
+        _photon_auth_payload({"copilot": []}),
+        available_providers=[{"id": "copilot", "authenticated": True}],
+        auth_status={
+            "copilot": {
+                "source": "env:GITHUB_TOKEN",
+                "label": "GITHUB_TOKEN",
+                "key_source": "env:GITHUB_TOKEN",
+            }
+        },
+    )
+    names = _group_names(result)
+    assert "GitHub Copilot" not in names, f"Ambient GITHUB_TOKEN must be filtered; got {names}"
 
 
 # ── load_pool path (primary) ─────────────────────────────────────────────────

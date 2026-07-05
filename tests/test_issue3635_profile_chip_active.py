@@ -48,15 +48,16 @@ class TestIssue3635ProfileChipActive:
         """The session-present chip-label update must read S.activeProfile."""
         body = _sync_topbar_body(_ui_js())
         # There are two profileChipLabel updates: the !S.session early-return
-        # block and the session-present block. Both must key on S.activeProfile.
+        # block and the session-present block. Both must key on S.activeProfile
+        # while passing through the display formatter.
         updates = re.findall(
             r"profileChipLabel'\);\s*\n\s*if\([^)]*\)\s*[^.]*\.textContent=([^;]+);",
             body,
         )
         assert updates, "no profileChipLabel textContent assignment found in syncTopbar"
         for expr in updates:
-            assert "S.activeProfile" in expr, (
-                "profile chip label must read S.activeProfile, got: " + expr.strip()
+            assert "profileDisplayName" in expr and "S.activeProfile" in expr, (
+                "profile chip label must display-format S.activeProfile, got: " + expr.strip()
             )
 
     def test_chip_does_not_key_on_session_profile(self):
@@ -84,9 +85,9 @@ class TestIssue3635ProfileChipActive:
         inconsistency was the bug. They must now be identical.
         """
         body = _sync_topbar_body(_ui_js())
-        setters = re.findall(r"\.textContent=(S\.activeProfile\|\|'default')", body)
+        setters = re.findall(r"\.textContent=(profileDisplayName\(S\.activeProfile\|\|'default'\))", body)
         assert len(setters) >= 2, (
-            "expected both syncTopbar chip-label setters to read "
+            "expected both syncTopbar chip-label setters to display-format "
             "S.activeProfile||'default'; found: " + str(setters)
         )
 
@@ -144,6 +145,21 @@ class TestProfileSwitcherSourceOfTruthInvariant:
             "dropdown active-row must resolve from S.activeProfile so it agrees "
             "with the chip (switcher source-of-truth invariant): " + expr.strip()
         )
+
+    def test_visible_profile_labels_use_display_name_helper(self):
+        ui = _ui_js()
+        panels = _panels_js()
+        assert "function profileDisplayName(name)" in ui
+        expected_snippets = [
+            "profileDisplayName(p.name)",
+            "profileDisplayName(active)",
+            "profileDisplayName(name)",
+            "profileDisplayName(_prevProfileName)",
+            "profileDisplayName(lane)",
+            "profileDisplayName(current)",
+        ]
+        for snippet in expected_snippets:
+            assert snippet in panels, f"visible profile label should use display helper: {snippet}"
 
     def test_chip_and_dropdown_share_source_of_truth(self):
         """The chip and the dropdown active-row must BOTH key on S.activeProfile.
