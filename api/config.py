@@ -4808,7 +4808,7 @@ def _static_models_catalog_without_live_probes() -> dict:
             if isinstance(provider_cfg, dict) and "models" in provider_cfg:
                 cfg_models = provider_cfg["models"]
                 if isinstance(cfg_models, dict):
-                    raw_models = [{"id": key, "label": key} for key in cfg_models.keys()]
+                    raw_models = [{"id": key, "label": _get_label_for_model(key, [])} for key in cfg_models.keys()]
                 elif isinstance(cfg_models, list):
                     raw_models = []
                     for item in cfg_models:
@@ -4827,7 +4827,7 @@ def _static_models_catalog_without_live_probes() -> dict:
                                 }
                             )
                         elif item:
-                            raw_models.append({"id": item, "label": item})
+                            raw_models.append({"id": item, "label": _get_label_for_model(item, [])})
             if not raw_models:
                 raw_models = copy.deepcopy(_PROVIDER_MODELS.get(pid, []))
             for model_id in configured_model_ids.get(pid, []):
@@ -6218,8 +6218,13 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 if not _p.get("authenticated"):
                     continue
                 try:
-                    _src = _gas(_p["id"]).get("key_source", "")
-                    if _src == "gh auth token":
+                    _status = _gas(_p["id"])
+                    _src = _status.get("key_source", "")
+                    _label = _status.get("label", "")
+                    _source = _status.get("source", _src)
+                    if _p.get("id") in {"copilot", "github-copilot"} and _is_ambient_gh_cli_entry(
+                        str(_source), str(_label), str(_src)
+                    ):
                         continue
                 except Exception:
                     logger.debug("Failed to get key source for provider %s", _p.get("id", "unknown"))
