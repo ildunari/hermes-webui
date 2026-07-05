@@ -1027,8 +1027,12 @@ function _composerTextWithPendingSelections(){
 }
 
 function _clearComposerAfterQueuedSelectionSend(){
+  const sid=arguments.length?arguments[0]:(S.session&&S.session.session_id);
   const composer=(typeof $==='function'&&$('msg'))||document.getElementById('msg');
+  const draftText=composer?String(composer.value||''):'';
+  const draftFiles=Array.isArray(S.pendingFiles)?[...S.pendingFiles]:[];
   if(composer)composer.value='';
+  if(sid&&typeof _clearComposerDraft==='function') _clearComposerDraft(sid,draftText,draftFiles);
   _clearPendingSelections();
   if(typeof autoResize==='function') autoResize();
 }
@@ -1217,6 +1221,80 @@ function applySessionTitleUpdate(sid, titleText, options={}){
   return true;
 }
 
+// #5472: when a provider/background error aborts a send, send() has already
+// cleared the composer (`$('msg').value=''`), the persisted draft
+// (`_clearComposerDraft`), and the staged files (uploadPendingFiles() sets
+// `S.pendingFiles=[]`) before the turn was durably accepted server-side. On a
+// start-time throw the turn is never persisted, so the user loses the entire
+// typed message + attachments and must retype. Restore the ORIGINAL captured
+// draft text + staged files so the user can re-send with one key press.
+// Mirrors the draft-restore idiom already used by _trySteer (commands.js) and
+// _stashClarifyDraft.
+//
+// `draftText` and `filesSnapshot` are immutable snapshots captured in send()
+// BEFORE slash rewrites (/moa, bundles) mutate the payload and BEFORE
+// uploadPendingFiles() drains S.pendingFiles — so we restore what the user
+// actually typed, not the transformed send payload.
+function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, clearPromise){
+  const restore=String(draftText||'');
+  const files=Array.isArray(filesSnapshot)?filesSnapshot.filter(Boolean):[];
+  if(!restore&&!files.length) return false;
+
+  // Only mutate the VISIBLE composer / staged tray when the failed send belongs
+  // to the session the user is currently looking at — otherwise a background
+  // send failure would pollute another session's composer. (Codex #5484 catch.)
+  const visibleSid=(S.session&&S.session.session_id)||null;
+  const belongsToVisible=!(sid&&visibleSid&&sid!==visibleSid);
+  let restoredVisible=false;
+  if(belongsToVisible){
+    const inp=$('msg');
+    // Do not clobber a new message the user began typing during the async window.
+    if(inp && !String(inp.value||'').trim()){
+      inp.value=restore;
+      if(typeof autoResize==='function') autoResize();
+      if(typeof updateSendBtn==='function') updateSendBtn();
+      // Re-stage the originally attached files so a one-key resend keeps them.
+      if(files.length){
+        S.pendingFiles=files;
+        if(typeof renderTray==='function') renderTray();
+      }
+      restoredVisible=true;
+    }
+  }
+
+  // Persist the failed session's draft so it survives a reload, ordered AFTER the
+  // send-time _clearComposerDraft POST (text:'') resolves — otherwise the two
+  // same-origin writes can be reordered under HTTP/2 multiplexing and leave the
+  // server draft empty. (Opus #5484 NIT.) Because the persist is deferred, it
+  // must be STALE-AWARE at fire time (Codex #5488 catch): if the failed session
+  // is still visible, re-read the LIVE composer so a post-restore edit is
+  // captured rather than clobbered by the original snapshot; if we restored the
+  // visible session but the user has since switched away, skip entirely (the
+  // session-switch save path already persisted this session's composer).
+  if(sid&&typeof _saveComposerDraftNow==='function'){
+    const _persist=()=>{
+      try{
+        const stillVisible=(S.session&&S.session.session_id)===sid;
+        if(stillVisible){
+          const inp=$('msg');
+          const liveText=inp?String(inp.value||''):restore;
+          _saveComposerDraftNow(sid, liveText, S.pendingFiles?[...S.pendingFiles]:[]);
+        } else if(!restoredVisible){
+          // Background failure (sid was never the visible session): no live
+          // composer to read, so persist the captured snapshot — it's the only copy.
+          _saveComposerDraftNow(sid, restore, []);
+        }
+        // else: restored the visible composer, then the user switched away — the
+        // session-switch save path already saved sid's composer; skip stale write.
+      }catch(_){ }
+    };
+    if(clearPromise&&typeof clearPromise.then==='function') clearPromise.then(_persist,_persist);
+    else _persist();
+  }
+
+  return restoredVisible;
+}
+
 async function send(){
   // Static guards expect _defaultMessageMode to stay near send() while the actual
   // read remains in the S.busy branch below.
@@ -1233,6 +1311,7 @@ async function send(){
       const _modelState=_chatPayloadModelState();
       queueSessionMessage(_targetSid,{text:_text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
       _clearComposerAfterQueuedSelectionSend();
+      if(_targetSid&&typeof _clearComposerDraft==='function'&&_targetSid!==(S.session&&S.session.session_id)) _clearComposerDraft(_targetSid,_text,S.pendingFiles?[...S.pendingFiles]:[]);
       S.pendingFiles=[];renderTray();
       updateQueueBadge(_targetSid);
       showToast(`Queued: "${_text.slice(0,40)}${_text.length>40?'…':''}"`,2000);
@@ -1248,6 +1327,20 @@ async function send(){
   _flushSelectionBlocksToComposer();
   text=$('msg').value.trim();
   if(!text&&!S.pendingFiles.length){_sendInProgress=false;_sendInProgressSid=null;return;}
+  if(typeof shouldInterceptCompressionRecoveryContinuation==='function'&&shouldInterceptCompressionRecoveryContinuation(text,S.pendingFiles)){
+    if(typeof showCompressionRecoveryContinuationHint==='function') showCompressionRecoveryContinuationHint();
+    _sendInProgress=false;_sendInProgressSid=null;
+    return;
+  }
+
+  // #5472: snapshot the ORIGINAL user-typed composer state now — before slash
+  // rewrites (/moa, bundles) mutate `text` and before uploadPendingFiles()
+  // clears S.pendingFiles. If /api/chat/start throws (turn never durably
+  // started), _restoreComposerDraftAfterFailedSend() puts this exact text +
+  // staged files back so the user can re-send without retyping. Captured as an
+  // immutable snapshot so later reassignments to `text` don't leak into it.
+  const _failedSendDraftText=text;
+  const _failedSendFilesSnapshot=Array.isArray(S.pendingFiles)?[...S.pendingFiles]:[];
 
   // Dismiss handoff hint when user sends a message (resets seen_at).
   if(S.session&&S.session.session_id&&typeof _dismissHandoffHint==='function'){
@@ -1258,7 +1351,7 @@ async function send(){
   _clearStaleBusyStateBeforeSend({compressionRunning});
   // If busy or a manual compression is still running, handle based on default_message_mode
   if(S.busy||compressionRunning){
-    if(text){
+    if(text||S.pendingFiles.length){
       if(!S.session){await newSession();await renderSessionList();}
       // Busy-control slash commands must be intercepted HERE, before the
       // defaultMessageMode routing block, so the user can always type /steer, /interrupt,
@@ -1282,21 +1375,21 @@ async function send(){
       if(defaultMessageMode==='steer'&&S.activeStreamId&&typeof _trySteer==='function'){
         // Real steer: clear the input first so the user gets immediate
         // feedback, then ship the steer payload via /api/chat/steer.
-        // _trySteer restores the draft and leaves the active stream running if
-        // the agent isn't running / cached / steer-capable.
+        // _trySteer captures the owner session/files before awaiting uploads,
+        // restores/persists the draft on failure, and clears the owner draft
+        // only after /api/chat/steer accepts.
         $('msg').value='';autoResize();
-        // Do NOT clear pendingFiles yet — a failed steer restores the draft and
-        // must keep staged files available for the user's next explicit action.
-        const _steerDelivered=await _trySteer(text, /*explicitSteer=*/false);
-        // After a delivered steer, clear any staged files because the text-only
-        // steer payload has been handled. On failure, keep files staged.
-        if(_steerDelivered){S.pendingFiles=[];renderTray();}
+        // Do NOT clear pendingFiles yet — _trySteer uploads with clearPending=false,
+        // and a failed steer must keep staged files available for the user's next explicit action.
+        await _trySteer(text, /*explicitSteer=*/false);
+        // _trySteer clears staged files only after /api/chat/steer accepts, and
+        // only when the visible session still matches the captured owner sid.
       } else if(defaultMessageMode==='interrupt'){
         // Queue the message, then cancel so drain re-sends it.
         const _modelState=_chatPayloadModelState();
         queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
         updateQueueBadge(S.session.session_id);
-        $('msg').value='';autoResize();
+        _clearComposerAfterQueuedSelectionSend(S.session&&S.session.session_id);
         S.pendingFiles=[];renderTray();
         if(S.activeStreamId&&typeof cancelStream==='function'){
           showToast(t('busy_interrupt_confirm'),2000);
@@ -1309,7 +1402,7 @@ async function send(){
         // 'steer' mode when no stream is active or _trySteer is unavailable.
         const _modelState=_chatPayloadModelState();
         queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
-        $('msg').value='';autoResize();
+        _clearComposerAfterQueuedSelectionSend(S.session&&S.session.session_id);
         S.pendingFiles=[];renderTray();
         updateQueueBadge(S.session.session_id);
         showToast(`Queued: "${text.slice(0,40)}${text.length>40?'…':''}"`,2000);
@@ -1526,10 +1619,16 @@ async function send(){
     }
   }
   if(!msgText){setComposerStatus('Nothing to send');return;}
-
+  const _submittedDraftTextForClear=$('msg').value||'';
+  const _submittedDraftFilesForClear=Array.isArray(_failedSendFilesSnapshot)?[..._failedSendFilesSnapshot]:[];
   $('msg').value='';autoResize();
-  // Clear persisted composer draft since message was sent.
-  if (activeSid && typeof _clearComposerDraft === 'function') _clearComposerDraft(activeSid);
+  // Clear persisted composer draft since message was sent. Capture the promise
+  // so the #5472 failed-send restore can chain its re-persist AFTER this clear
+  // resolves — otherwise the two same-origin POSTs (clear text:'' then restore
+  // text:<draft>) can be reordered under HTTP/2 multiplexing and leave the
+  // server draft empty after a reload. (Opus #5484 NIT.)
+  let _composerDraftClearPromise=null;
+  if (activeSid && typeof _clearComposerDraft === 'function') _composerDraftClearPromise=_clearComposerDraft(activeSid,_submittedDraftTextForClear,_submittedDraftFilesForClear);
   const displayText=_slashDisplayTextOverride||text||(uploaded.length?`Uploaded: ${uploadedNames.join(', ')}`:'(file upload)');
   const userMsg={role:'user',content:displayText,attachments:uploaded.length?uploadedNames:undefined,_ts:Date.now()/1000};
   S.toolCalls=[];  // clear tool calls from previous turn
@@ -1709,6 +1808,11 @@ async function send(){
     if(!_clarifySessionId || _clarifySessionId===activeSid) hideClarifyCard(true, 'terminal');
     S.messages.push({role:'assistant',content:`**Error:** ${errMsg}`});
     _queueDrainSid=activeSid;renderMessages();setBusy(false);setComposerStatus(`Error: ${errMsg}`);
+    // #5472: the send was rejected before the turn was durably started, so the
+    // composer text + attachments (cleared at send time) would otherwise be
+    // lost. Put back the ORIGINAL captured draft (not the mutated /moa/bundle
+    // payload) and re-stage files so the user can re-send without retyping.
+    _restoreComposerDraftAfterFailedSend(_failedSendDraftText, _failedSendFilesSnapshot, activeSid, _composerDraftClearPromise);
     if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
     // Reconcile with server truth after immediately clearing the optimistic spinner.
     if(typeof renderSessionList==='function') void renderSessionList();
@@ -2154,6 +2258,20 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function snapshotLiveTurn(){
     if(typeof snapshotLiveTurnHtmlForSession==='function') snapshotLiveTurnHtmlForSession(activeSid);
   }
+  // Throttled per-frame variant. snapshotLiveTurnHtmlForSession serializes the
+  // whole (growing) live turn via turn.outerHTML — O(n)/frame -> O(n^2) over a
+  // long answer, and a real GC-pressure source. The snapshot only backs
+  // mid-stream session-switch restore, and the switch path (sessions.js) plus
+  // the stream event boundaries (tool/done) already capture synchronously, so a
+  // coarse trailing snapshot during streaming is sufficient. (#5455 WS2.2)
+  let _snapshotLiveTurnTimer=null;
+  function _throttledSnapshotLiveTurn(){
+    if(_snapshotLiveTurnTimer) return;
+    _snapshotLiveTurnTimer=setTimeout(()=>{_snapshotLiveTurnTimer=null;snapshotLiveTurn();},700);
+  }
+  function _cancelThrottledSnapshotTimer(){
+    if(_snapshotLiveTurnTimer){clearTimeout(_snapshotLiveTurnTimer);_snapshotLiveTurnTimer=null;}
+  }
   // Throttled variant for token-by-token updates. persistInflightState()
   // calls saveInflightState() which does JSON.parse + JSON.stringify + write
   // on the entire inflight map every call. On a fast model at 60 tok/s with
@@ -2199,6 +2317,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _finalizeStreamEndFallback(source){
     _clearStreamEndRecovery();
     if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+    _cancelThrottledSnapshotTimer();
     _terminalStateReached=true;
     _streamFinalized=true;
     _cancelAnimationFramePendingStreamRender();
@@ -2210,6 +2329,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _clearStreamNotificationBackground(activeSid, streamId);
     _flushReasoningToAnchor();
     _scheduleAnchorRegistryCleanup();
+    _clearAnchorProseIncrementalNode();
     _clearApprovalForOwner();
     _clearClarifyForOwner('terminal');
     if(_isActiveSession()){
@@ -2620,12 +2740,35 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const seq=Number(_assistantSegmentSeq||_currentLiveSegmentSeq||0);
     return Number.isFinite(seq)&&seq>0?seq:1;
   }
+  function _anchorSceneActiveMode(){
+    const normalize=value=>value==='transparent_stream'||value==='compact_worklog'?value:'';
+    if(typeof window!=='undefined'){
+      if(typeof window.chatActivityMode==='function'){
+        try{
+          const mode=normalize(window.chatActivityMode());
+          if(mode) return mode;
+        }catch(_){}
+      }
+      const displayMode=normalize(window._chatActivityDisplayMode);
+      if(displayMode) return displayMode;
+      if(window._transparentStream) return 'transparent_stream';
+    }
+    return 'compact_worklog';
+  }
+  function _anchorSceneRowDisplayHintForMode(row, sceneMode){
+    const hints=row&&typeof row==='object'&&row.display_hints&&typeof row.display_hints==='object'
+      ? row.display_hints
+      : null;
+    if(sceneMode==='transparent_stream') return (hints&&hints.transparent_stream)||'chronological_activity';
+    if(sceneMode==='compact_worklog') return (hints&&hints.compact_worklog)||row.display_hint||'activity_row';
+    return row&&row.display_hint||'activity_row';
+  }
   function _renderAnchorLiveScene(){
     if(!_anchorRegistry||!_isActiveSession()) return false;
     if(typeof window==='undefined'||typeof window._renderLiveAnchorActivitySceneForStream!=='function') return false;
     try{
       return !!window._renderLiveAnchorActivitySceneForStream(streamId, activeSid, {
-        mode:'compact_worklog',
+        mode:_anchorSceneActiveMode(),
       });
     }catch(err){
       if(!_anchorShadowWarned&&typeof console!=='undefined'&&console.warn){
@@ -2638,7 +2781,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _projectLiveAnchorActivityScene(){
     if(!_anchorRegistry||!_anchorApi||typeof _anchorApi.projectAssistantTurnAnchorActivityScene!=='function') return null;
     try{
-      return _anchorApi.projectAssistantTurnAnchorActivityScene(_anchorRegistry,{mode:'compact_worklog'});
+      return _anchorApi.projectAssistantTurnAnchorActivityScene(_anchorRegistry,{mode:_anchorSceneActiveMode()});
     }catch(_){
       return null;
     }
@@ -3372,6 +3515,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
     }
     const base=(projectedScene&&typeof projectedScene==='object')?projectedScene:{};
+    const sceneMode=base.mode==='transparent_stream'?'transparent_stream':_anchorSceneActiveMode();
     const messageFinalAnswer=_anchorSceneFinalAnswerText(lastAsst);
     const finalAnswer=_anchorSceneCleanText(messageFinalAnswer)
       ? messageFinalAnswer
@@ -3394,7 +3538,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(key&&seen.has(key)) return;
       if(key) seen.add(key);
       if(isTextual&&textKey) seenTextKeys.push(textKey);
-      rows.push({...row,order_index:rows.length,seq:rows.length});
+      rows.push({
+        ...row,
+        display_hint:_anchorSceneRowDisplayHintForMode(row,sceneMode),
+        order_index:rows.length,
+        seq:rows.length,
+      });
     };
     const projectedRows=Array.isArray(base.activity_rows)?base.activity_rows:[];
     for(const row of projectedRows){
@@ -3411,7 +3560,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const scene={
       ...base,
       version:'activity_scene_v1',
-      mode:'compact_worklog',
+      mode:sceneMode,
       identity:{
         ...((base.identity&&typeof base.identity==='object')?base.identity:{}),
         source_message_refs:messages.slice(turnStart+1,lastAsstIndex+1)
@@ -3539,6 +3688,58 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       activityBurstId:_currentActivityBurstId,
     },null);
     return _findAnchorActivityEventByLocalId(localId,'token');
+  }
+  // Persistent incremental renderer for anchor-scene live prose rows. The compact
+  // worklog re-renders the whole scene each frame; rendering the growing prose via
+  // renderMd(fullText) every frame is O(n^2) over a long answer. Instead keep a
+  // per-segment smd parser + node (the SAME safe renderer as the main live body)
+  // and feed only the delta, then hand the persistent node back to the ui.js scene
+  // builder. Returns null whenever smd or a stable key is unavailable so the caller
+  // falls back to the full renderMd path — identical structure, just not
+  // incremental. (#5455 WS2.1)
+  const _anchorProseSmdCache = new Map();
+  function _anchorProseIncrementalNode(key, text){
+    if(!window.smd || !key || typeof _safeSmdRenderer!=='function') return null;
+    const value=String(text||'');
+    try{
+      let st=_anchorProseSmdCache.get(key);
+      // Self-heal desyncs (edit/sanitize made the text no longer a pure append):
+      // rebuild the parser+node from scratch, mirroring _smdWrite's guard.
+      if(st && st.writtenText && !value.startsWith(st.writtenText)) st=null;
+      if(!st){
+        const node=document.createElement('div');
+        node.className='assistant-segment';
+        node.setAttribute('data-anchor-scene-prose','1');
+        const body=document.createElement('div');
+        body.className='msg-body';
+        node.appendChild(body);
+        const baseRenderer=_safeSmdRenderer(body);
+        const renderer=_smdRendererWithoutUnderscoreEmphasis(baseRenderer);
+        st={node,parser:window.smd.parser(renderer),writtenText:''};
+        _anchorProseSmdCache.set(key,st);
+        // Bound memory across turns: keys embed the stream id, so stale entries
+        // from finished streams age out here.
+        if(_anchorProseSmdCache.size>32){
+          const oldest=_anchorProseSmdCache.keys().next().value;
+          if(oldest!==key) _anchorProseSmdCache.delete(oldest);
+        }
+      }
+      const delta=value.slice(st.writtenText.length);
+      if(delta){
+        window.smd.parser_write(st.parser,delta);
+        st.writtenText=value;
+      }
+      st.node.dataset.rawText=value;
+      return st.node;
+    }catch(_){
+      _anchorProseSmdCache.delete(key);
+      return null;
+    }
+  }
+  window.__anchorProseIncrementalNode=_anchorProseIncrementalNode;
+  function _clearAnchorProseIncrementalNode(){
+    if(typeof window!=='undefined'&&window.__anchorProseIncrementalNode===_anchorProseIncrementalNode) window.__anchorProseIncrementalNode=null;
+    _anchorProseSmdCache.clear();
   }
   function _anchorHasReasoningEvents(){
     const events=_anchorActivityEvents();
@@ -3773,8 +3974,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // Also handles DSML-prefixed variants from DeepSeek/Bedrock, including
     // spacing variants like "<｜DSML |function_calls" and truncated prefixes.
     if(!s) return s;
-    const lo=String(s).toLowerCase();
-    if(lo.indexOf('function_calls')===-1 && lo.indexOf('dsml')===-1) return s;
+    // Case-insensitive presence check without allocating a full lowercased copy
+    // of the (growing) text on every call — cuts per-token/per-frame GC pressure.
+    // Equivalent to the previous toLowerCase()+indexOf gate. (#5455 WS2.3)
+    if(!/function_calls|dsml/i.test(String(s))) return s;
     // Support both plain <function_calls> and DSML-prefixed variants.
     s=s.replace(/<(?:\s*｜\s*DSML\s*[｜|]\s*)?function_calls>[\s\S]*?<\/(?:\s*｜\s*DSML\s*[｜|]\s*)?function_calls>/gi,'');
     // Also remove truncated opening tags (missing closing ">" at stream tail).
@@ -4623,7 +4826,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(typeof _syncLiveWorklogReasonsForAnchor==='function') _syncLiveWorklogReasonsForAnchor(assistantRow, displayText);
       }
       scrollIfPinned();
-      snapshotLiveTurn();
+      _throttledSnapshotLiveTurn();
     };
     const frameIntervalMs=_shouldUseStreamFade()?33:66;
     if(sinceLastMs>=frameIntervalMs){
@@ -4679,10 +4882,21 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       syncInflightAssistantMessage();
       if(!S.session||S.session.session_id!==activeSid) return;
       _completeAutomaticCompressionOnLiveProgress(activeSid);
-      const parsed=_parseStreamState();
       if(_freshSegment) appendThinking('', _liveThinkingPlacement());
-      if(String((parsed&&parsed.displayText)||'').trim()||assistantRow) ensureAssistantRow();
-      _scheduleRender(parsed);
+      // Once the assistant row exists its creation gate is already satisfied, and
+      // the throttled _doRender re-parses once per frame anyway — so the per-token
+      // full-text parse here is pure waste (O(n)/token -> O(n^2) over the answer).
+      // Still call ensureAssistantRow() every token exactly as before (cheap; it
+      // also starts a new segment on a post-tool _freshSegment). Only the parse is
+      // skipped, and only once the row exists. (#5455 WS2.3)
+      if(assistantRow){
+        ensureAssistantRow();
+        _scheduleRender();
+      }else{
+        const parsed=_parseStreamState();
+        if(String((parsed&&parsed.displayText)||'').trim()) ensureAssistantRow();
+        _scheduleRender(parsed);
+      }
     });
 
     source.addEventListener('interim_assistant',e=>{
@@ -5044,6 +5258,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _streamFinalized=true;
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+      _cancelThrottledSnapshotTimer();
       const _doneData=JSON.parse(e.data);
       const _doneEvent=e;
       const _finishDone=()=>{
@@ -5075,6 +5290,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           created_at:d.created_at||null,
         },_doneEvent);
         _scheduleAnchorRegistryCleanup();
+        _clearAnchorProseIncrementalNode();
         const isActiveSession=_isSessionCurrentPane(activeSid);
         const isSessionViewed=_isSessionActivelyViewed(activeSid);
         const completedSession=d.session||{session_id:activeSid};
@@ -5459,6 +5675,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _clearStreamEndRecovery();
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+      _cancelThrottledSnapshotTimer();
+      _clearAnchorProseIncrementalNode();
       _streamFinalized=true;
       _cancelAnimationFramePendingStreamRender();
       _streamFadeCleanupReduceMotionListener();
@@ -5526,7 +5744,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
               if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(S.session.session_id);
             }
           } else {
-            S.messages.push({role:'assistant',content:`**${label}:** ${d.message}${hint}`,provider_details:details,provider_details_label:detailsLabel});
+            const recovery=(d.compression_recovery&&typeof d.compression_recovery==='object')?d.compression_recovery:null;
+            S.messages.push({role:'assistant',content:`**${label}:** ${d.message}${hint}`,provider_details:details,provider_details_label:detailsLabel,_compressionRecovery:recovery||undefined});
             _attachProjectedAnchorSceneToLastAssistant(S.messages);
           }
         }catch(_){
@@ -5611,7 +5830,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // during this retry window and only surface an error after all probes fail.
       if(!_reconnectAttempted && streamId){
         _reconnectAttempted=true;
-        const _retryDelays=[1500,3000,5000,8000];
+        const _retryDelays=[1500,3000,5000,8000,12000,20000];
         setComposerStatus(`Reconnecting… (1/${_retryDelays.length})`);
         const _probeReconnect=async(attempt=0)=>{
           if(_terminalStateReached || _streamFinalized) return;
@@ -5640,6 +5859,42 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             setTimeout(()=>{void _probeReconnect(attempt+1);}, nextDelay);
             return;
           }
+          // Last-ditch: the stream may have finished while we were retrying.
+          // _restoreSettledSession polls the full session API (not just stream
+          // status) and can recover a completed response without an error banner.
+          // This is especially important on iOS where Tailscale reconnects can
+          // take longer than the retry window.
+          setComposerStatus('Restoring session…');
+          let _restoreTimedOut=false;
+          const _restoreTimer=setTimeout(()=>{
+            // If _restoreSettledSession hangs (flaky Tailscale), don't leave
+            // the UI stuck on "Restoring session…" forever. Fall through to
+            // _handleStreamError after 8s.
+            _restoreTimedOut=true;
+            if(!_terminalStateReached&&!_streamFinalized){
+              if(_deferStreamErrorIfOffline()) return;
+              if(_deferStreamErrorIfPageHidden(source)) return;
+              _flushReasoningToAnchor();
+              _scheduleAnchorRegistryCleanup(120000);
+              _handleStreamError(source);
+            }
+          },8000);
+          try{
+            if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})){
+              if(_restoreTimedOut) return; // timer already fired _handleStreamError
+              clearTimeout(_restoreTimer);
+              return;
+            }
+          }catch(_){
+            // _restoreSettledSession threw. If the timer already fired,
+            // _handleStreamError was called there; we return below.
+            // Otherwise the code below cancels the timer and calls it directly.
+          }
+          if(_restoreTimedOut) return; // timer already fired _handleStreamError
+          clearTimeout(_restoreTimer);
+          if(_terminalStateReached||_streamFinalized) return;
+          if(_deferStreamErrorIfOffline()) return;
+          if(_deferStreamErrorIfPageHidden(source)) return;
           _flushReasoningToAnchor();
           _scheduleAnchorRegistryCleanup(120000);
           _handleStreamError(source);
@@ -5660,6 +5915,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _clearStreamEndRecovery();
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+      _cancelThrottledSnapshotTimer();
+      _clearAnchorProseIncrementalNode();
       _streamFinalized=true;
       _cancelAnimationFramePendingStreamRender();
       _streamFadeCleanupReduceMotionListener();
@@ -5810,6 +6067,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!session) return returnStatus?'missing':false;
       if(session.active_stream_id||session.pending_user_message) return returnStatus?'active':false;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+      _cancelThrottledSnapshotTimer();
+      _clearAnchorProseIncrementalNode();
       _streamFinalized=true;
       _cancelAnimationFramePendingStreamRender();
       _streamFadeCleanupReduceMotionListener();
@@ -5904,6 +6163,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // Opus review Q1: mirror done/apperror/cancel finalization so any pending rAF
     // cannot fire after renderMessages() has settled the DOM with the error message.
     if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+    _cancelThrottledSnapshotTimer();
+    _clearAnchorProseIncrementalNode();
     _streamFinalized=true;
     _cancelAnimationFramePendingStreamRender();
     _streamFadeCleanupReduceMotionListener();
@@ -6029,9 +6290,18 @@ function autoResize(){
     _composerAutoResizeRaf=0;
   }
   const el=$('msg');
+  const _prevComposerH=el.offsetHeight;
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,200)+'px';
   updateSendBtn();
+  // #5514/#5515: growing the composer shrinks the flex:1 transcript viewport, so
+  // a reader pinned to the bottom would be stranded above it ("scrolls up 1 row
+  // per composer row"). Re-pin the transcript when it's genuinely still pinned —
+  // but only when the composer actually GREW (a shrink enlarges the viewport and
+  // can't strand a reader), so the common no-height-change keystroke skips the
+  // re-pin's DOM read entirely. The #composerWrap ResizeObserver is the safety
+  // net for any growth path that doesn't route through here.
+  if(el.offsetHeight>_prevComposerH && typeof _repinMessagesAfterComposerResize==='function') _repinMessagesAfterComposerResize();
 }
 function scheduleComposerAutoResize(){
   if(typeof requestAnimationFrame!=='function'){autoResize();return;}
@@ -6098,6 +6368,26 @@ const APPROVAL_MIN_VISIBLE_MS = 30000;
 
 // showApprovalCard moved above respondApproval
 
+function _setPromptFlyoutHidden(card, hidden) {
+  if (!card) return;
+  if (hidden) {
+    card.setAttribute("aria-hidden", "true");
+    card.setAttribute("inert", "");
+    const markHidden = () => {
+      if (!card.classList || !card.classList.contains("visible")) card.hidden = true;
+    };
+    if (typeof setTimeout === "function") setTimeout(markHidden, 450);
+    else markHidden();
+    return;
+  }
+  card.hidden = false;
+  card.setAttribute("aria-hidden", "false");
+  card.removeAttribute("inert");
+  // Force the unhidden, pre-visible state to be observed so the existing
+  // transform/opacity transition can still animate when `.visible` is added.
+  void card.offsetHeight;
+}
+
 function _clearApprovalHideTimer() {
   if (_approvalHideTimer) {
     clearTimeout(_approvalHideTimer);
@@ -6131,6 +6421,7 @@ function hideApprovalCard(force=false) {
   _resetApprovalCardState();
   card.classList.remove("visible");
   card.classList.remove("collapsed");
+  _setPromptFlyoutHidden(card, true);
   _syncApprovalTranscriptSpace(null);
   $("approvalCmd").textContent = "";
   $("approvalDesc").textContent = "";
@@ -6293,6 +6584,7 @@ function showApprovalCard(pending, pendingCount) {
     responding ? _approvalResponding.choice : null,
     responding,
   );
+  _setPromptFlyoutHidden(card, false);
   card.classList.add("visible");
   _syncApprovalCollapseButton(card);
   _syncApprovalTranscriptSpace(card, {immediate: true});
@@ -7070,6 +7362,7 @@ function _ensureClarifyCardDom() {
   card.setAttribute("role", "dialog");
   card.setAttribute("aria-labelledby", "clarifyHeading");
   card.setAttribute("aria-describedby", "clarifyQuestion clarifyHint");
+  _setPromptFlyoutHidden(card, true);
   card.innerHTML = `
     <div class="clarify-inner">
       <div class="clarify-header">
@@ -7282,6 +7575,7 @@ function hideClarifyCard(force=false, reason="dismissed") {
   _clarifySessionId = null;
   _resetClarifyCardState();
   card.classList.remove("visible");
+  _setPromptFlyoutHidden(card, true);
   _syncClarifyTranscriptSpace(null);
   if (typeof unlockComposerForClarify === "function") unlockComposerForClarify();
   $("clarifyQuestion").textContent = "";
@@ -7400,6 +7694,7 @@ function showClarifyCard(pending) {
   }
   _clarifySetControlsDisabled(false, false);
   _ensureClarifyResizeListener();
+  _setPromptFlyoutHidden(card, false);
   card.classList.add("visible");
   _syncClarifyCollapseButton(card);
   _syncClarifyTranscriptSpace(card, {immediate: true});

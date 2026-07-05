@@ -26,12 +26,14 @@ import sys
 import threading
 import time
 import uuid
+import http.client
+import socket as _socket
 from collections import defaultdict
 from pathlib import Path
 from contextlib import closing
-from urllib.parse import parse_qs, quote, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     _looks_like_default_cli_title,
@@ -40,6 +42,12 @@ from api.agent_sessions import (
     read_session_lineage_report,
 )
 from api.compression_anchor import visible_messages_for_anchor
+from api.compression_recovery import (
+    COMPRESSION_RECOVERY_ACTION_START_FOCUSED,
+    clear_compression_recovery,
+    compression_recovery_payload_for_session,
+    is_generic_continuation_intent,
+)
 from api.session_events import (
     add_session_list_changed_listener,
     publish_session_list_changed,
@@ -505,10 +513,12 @@ def _visible_pinned_lineage_ids(session_rows) -> set[str]:
 from api.profiles import (  # noqa: F401, E402  (re-export)
     _profiles_match,
     _is_isolated_profile_mode,
+    _is_root_profile,
     _SKILLS_STATS_CACHE,
     get_active_profile_name,
     get_active_profile_name as _get_active_profile_name,
     get_active_hermes_home,
+    list_profiles_api,
 )
 
 
@@ -2854,6 +2864,7 @@ from api.config import (
     SESSION_AGENT_LOCKS_LOCK,
     CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS,
     load_settings,
+    persisted_speech_settings_keys,
     save_settings,
     SETTINGS_FILE,
     set_hermes_default_model,
@@ -5187,6 +5198,28 @@ def _check_same_origin_browser_request(handler, *, require_provenance: bool = Fa
     return True
 
 
+def apply_cors_preflight_headers(handler) -> None:
+    """Emit CORS preflight headers on ``handler`` for a same-origin/allowlisted
+    request; emit nothing for a disallowed origin (browser treats the header-less
+    200 as a preflight denial).
+
+    Echoes the request Origin only when it is same-origin or explicitly
+    allowlisted via HERMES_WEBUI_ALLOWED_ORIGINS — the exact policy the CSRF gate
+    enforces for real requests. Reuses _check_same_origin_browser_request so the
+    preflight can never advertise wider access (`*`) than an actual request would
+    be granted. A wildcard here would let any site read authenticated responses
+    on a deployment with no password set. Kept in api/ so server.py stays a thin
+    dispatcher.
+    """
+    origin = handler.headers.get("Origin", "").strip()
+    if not origin or not _check_same_origin_browser_request(handler):
+        return
+    handler.send_header("Access-Control-Allow-Origin", origin)
+    handler.send_header("Vary", "Origin")
+    handler.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+
 def _csrf_exempt_path(path: str) -> bool:
     """Paths that cannot or must not carry a session CSRF token."""
     return path in {
@@ -7206,6 +7239,13 @@ def _session_index_marks_was_webui(sid: str) -> bool:
     return False
 
 
+def _session_deleted_tombstone_marks_was_webui(sid: str) -> bool:
+    try:
+        return sid in _load_webui_deleted_session_tombstone()
+    except Exception:
+        return False
+
+
 def _state_db_session_source(sid: str) -> str:
     """Return the lowercased ``sessions.source`` for ``sid`` from state.db.
 
@@ -7440,13 +7480,29 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
 
     if not is_safe_session_id(sid):
         return None, "invalid_sid"
-    if _session_index_marks_was_webui(sid) and not _is_subagent_child_session_id(sid):
+    if (
+        (
+            _session_index_marks_was_webui(sid)
+            or (
+                _session_deleted_tombstone_marks_was_webui(sid)
+                and _state_db_session_source(sid) in ("", "webui", "fork")
+            )
+        )
+        and not _is_subagent_child_session_id(sid)
+    ):
         # A delegated subagent child (source='subagent' in state.db) can be
         # registered in the WebUI index as a webui/fork/blank-source row (it
         # shares the parent's lineage) yet have no WebUI sidecar of its own.
         # Those must recover their transcript from state.db below rather than
         # 404 as a genuinely-deleted WebUI session (#5307). Every other
         # index-marked-WebUI id keeps the #2782 self-heal 404 contract.
+        #
+        # The durable delete tombstone only 404s a row that is WebUI-owned
+        # (source webui/fork, or blank = a stale URL with no surviving row).
+        # A foreign-source row (messaging/cli/tui/desktop) that happens to
+        # carry a tombstone — e.g. a WebUI delete of an imported session whose
+        # state.db row the external writer later re-created — must still
+        # materialize its transcript, never be self-healed to a 404 (#5504).
         return None, "was_webui"
     if cli_meta is None:
         cli_meta = _lookup_cli_session_metadata(sid) or {}
@@ -7562,6 +7618,21 @@ def _normalize_import_profile_value(value):
     except Exception:
         pass
     return profile
+
+
+def _load_branch_source_or_refuse(handler, sid: str):
+    if _session_is_subagent_view_only(sid):
+        bad(handler, "Subagent sessions are view-only and cannot be branched from WebUI", 400)
+        return None
+    try:
+        return get_session(sid)
+    except KeyError:
+        _foreign_session, _reason = _claim_or_synthesize_cli_session(sid)
+        if _reason == "not_claimable":
+            bad(handler, "Read-only sessions cannot be branched from WebUI", 403)
+            return None
+        bad(handler, "Session not found", 404)
+        return None
 
 
 def _resolve_cli_import_metadata(session_id: str, *, requested_profile=None, allow_all_profiles: bool = False) -> dict:
@@ -8076,6 +8147,8 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
     segments = []
     current = session
     session_messages = list(getattr(session, "messages", []) or [])
+    source = str(getattr(session, "session_source", "") or "").strip().lower()
+    root_is_fork = source == "fork"
     seen = {str(getattr(session, "session_id", "") or "")}
     for _ in range(max(0, int(max_hops))):
         parent_id = str(getattr(current, "parent_session_id", "") or "").strip()
@@ -8083,6 +8156,9 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
             break
         parent = Session.load(parent_id)
         if not parent or not getattr(parent, "pre_compression_snapshot", False):
+            break
+        parent_source = str(getattr(parent, "session_source", "") or "").strip().lower()
+        if root_is_fork and parent_source != "fork":
             break
         if not segments and _messages_start_with_visible_prefix(
             session_messages,
@@ -8162,6 +8238,11 @@ def _merged_webui_lineage_messages_for_display(session, messages=None) -> list:
     primary_messages = list(messages if messages is not None else (getattr(session, "messages", []) or []))
     parent_id = str(getattr(session, "parent_session_id", "") or "").strip()
     if not parent_id:
+        return primary_messages
+    if (
+        str(getattr(session, "compression_recovery_source_session_id", "") or "").strip()
+        and str(getattr(session, "compression_recovery_action", "") or "").strip()
+    ):
         return primary_messages
     source = str(getattr(session, "session_source", "") or "").strip().lower()
     relationship = str(getattr(session, "relationship_type", "") or "").strip().lower()
@@ -8633,6 +8714,7 @@ def _keep_latest_messaging_session_per_source(
 from api.models import (
     Session,
     get_session,
+    find_compression_recovery_session,
     get_session_for_file_ops,
     new_session,
     all_sessions,
@@ -8665,11 +8747,16 @@ from api.models import (
     _load_webui_zero_message_orphan_tombstone,
     _record_webui_zero_message_orphan_tombstone,
     _clear_webui_zero_message_orphan_tombstone,
+    _load_webui_deleted_session_tombstone,
+    _record_webui_deleted_session_tombstone,
     ensure_cron_project,
     _profile_has_user_projects,
     is_cron_session,
     is_safe_session_id,
 )
+
+
+_COMPRESSION_RECOVERY_START_LOCK = threading.Lock()
 
 
 def _pre_compression_continuation_session_id(session) -> str | None:
@@ -9293,6 +9380,37 @@ def _safe_login_redirect_path(raw_path: str | None) -> str:
     if path[1:2] in {"/", "\\"}:
         return "/"
     if re.search(r"[\x00-\x1f\x7f\s]", path):
+        return "/"
+    # #5578: reject a `next` that points back at the login page, so an
+    # expired-auth bounce on the login page can't feed the redirect its own
+    # address and grow the URL exponentially. Length cap is belt-and-suspenders:
+    # a legitimate app path is never this long.
+    if len(path) > 2048:
+        return "/"
+    # Detect a login-route target even through nested percent-encoding: a nested
+    # login-redirect chain looks like `/session/login%3Fnext%3D...`, where the
+    # `?` separating the path from the query is itself encoded, so a plain
+    # split("?") wouldn't isolate the real path. Fully decode (bounded) and check
+    # the leading PATH of EVERY decode level, including the final fully-decoded
+    # form. Only collapse login-route chains — a legitimate non-login path that
+    # merely carries its own `next=` query key (e.g. `/admin?action=foo&next=/x`)
+    # must still round-trip (regression guarded by test_v050258_opus_followups.py).
+    _probe = path
+    for _ in range(8):
+        _path_only = _probe.split("?", 1)[0].split("#", 1)[0].split("&", 1)[0].rstrip("/")
+        if _path_only.endswith("/login") or _path_only == "/login":
+            return "/"
+        _decoded = unquote(_probe)
+        if _decoded == _probe:
+            break
+        _probe = _decoded
+    else:
+        # Loop exhausted the cap while STILL decoding (pathologically deep
+        # encoding): check the final decoded form too, then fail closed — an
+        # 8-level-deep encoded value is never a legitimate redirect.
+        _path_only = _probe.split("?", 1)[0].split("#", 1)[0].split("&", 1)[0].rstrip("/")
+        if _path_only.endswith("/login") or _path_only == "/login":
+            return "/"
         return "/"
     return path
 
@@ -11528,6 +11646,7 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/settings":
         settings = load_settings()
+        settings["persisted_speech_keys"] = persisted_speech_settings_keys()
         # Never expose the stored password hash to clients
         settings.pop("password_hash", None)
         settings.setdefault("max_tokens", None)
@@ -12125,7 +12244,8 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/sessions":
         diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger)
         try:
-            from api.profiles import get_active_profile_name
+            from api import profiles as profiles_api
+
             diag.stage("load_settings")
             settings = load_settings()
             show_cli_sessions = bool(settings.get("show_cli_sessions"))
@@ -12137,7 +12257,7 @@ def handle_get(handler, parsed) -> bool:
             show_cron_sessions = bool(settings.get("show_cron_sessions"))
             show_webhook_sessions = bool(settings.get("show_webhook_sessions"))
             agent_session_source_filter = settings.get("agent_session_source_filter")
-            active_profile = get_active_profile_name()
+            active_profile = profiles_api.get_active_profile_name()
             all_profiles = _all_profiles_enabled(parsed)
             include_archived = _query_flag(parsed, "include_archived")
             exclude_hidden = _query_flag(parsed, "exclude_hidden")
@@ -12200,8 +12320,9 @@ def handle_get(handler, parsed) -> bool:
         # ── Profile scoping (#1614) ────────────────────────────────────────
         # Default: filter to the active profile. ?all_profiles=1 returns the
         # aggregate list so settings/admin UIs can still see everything.
-        from api.profiles import get_active_profile_name
-        active_profile = get_active_profile_name()
+        from api import profiles as profiles_api
+
+        active_profile = profiles_api.get_active_profile_name()
         all_projects = load_projects()
         isolated_profile_mode = _is_isolated_profile_mode()
         all_profiles = _all_profiles_enabled(parsed)
@@ -12636,28 +12757,21 @@ def handle_get(handler, parsed) -> bool:
 
     # ── Profile API (GET) ──
     if parsed.path == "/api/profiles":
-        from api.profiles import (
-            get_active_profile_name,
-            list_profiles_api,
-        )
+        from api import profiles as profiles_api
 
         return j(
             handler,
             {
-                "profiles": list_profiles_api(),
-                "active": get_active_profile_name(),
+                "profiles": profiles_api.list_profiles_api(),
+                "active": profiles_api.get_active_profile_name(),
                 "single_profile_mode": _is_isolated_profile_mode(),
             },
         )
 
     if parsed.path == "/api/profile/active":
-        from api.profiles import (
-            _is_root_profile,
-            get_active_hermes_home,
-            get_active_profile_name,
-        )
+        from api import profiles as profiles_api
 
-        active_profile_name = get_active_profile_name()
+        active_profile_name = profiles_api.get_active_profile_name()
         # Resolve the ACTIVE PROFILE's configured workspace so a cold boot with a
         # profile cookie shows the right composer workspace chip on a blank
         # new-chat page (#5169). Use get_profile_default_workspace() (NOT
@@ -12675,8 +12789,8 @@ def handle_get(handler, parsed) -> bool:
             handler,
             {
                 "name": active_profile_name,
-                "path": str(get_active_hermes_home()),
-                "is_default": _is_root_profile(active_profile_name),
+                "path": str(profiles_api.get_active_hermes_home()),
+                "is_default": profiles_api._is_root_profile(active_profile_name),
                 "default_workspace": _profile_default_workspace,
             },
         )
@@ -13145,19 +13259,57 @@ def handle_post(handler, parsed) -> bool:
         # ── Memory lifecycle: commit the previous session before starting a new one ──
         prev_session_id = body.get("prev_session_id")
         if prev_session_id:
-            if not _session_id_visible_to_request_profile(handler, prev_session_id):
-                return True
-            try:
-                from api.session_lifecycle import commit_session_memory
-                from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
-                prev_agent = None
-                with SESSION_AGENT_CACHE_LOCK:
-                    _cached = SESSION_AGENT_CACHE.get(prev_session_id)
-                    if _cached:
-                        prev_agent = _cached[0]
-                commit_session_memory(prev_session_id, agent=prev_agent)
-            except Exception:
-                logger.debug("Lifecycle commit for prev_session %s failed", prev_session_id, exc_info=True)
+            if not _session_id_visible_to_request_profile(
+                handler, prev_session_id, emit_error=False
+            ):
+                # Cross-profile hand-off after a profile switch: skip memory
+                # commit for the previous profile's session, but still create
+                # the new session (#5420).
+                prev_session_id = None
+            if prev_session_id:
+                # Fire-and-forget: commit_memory_session() can take 1-5+ seconds
+                # (extraction call to the memory provider), and blocking the
+                # response here made "+ New Chat" feel slow/unresponsive.
+                # commit_session_memory() already serialises overlapping commits
+                # for a session via its own in-flight guard, so running it off
+                # the request thread is safe.
+                def _commit_prev_session_memory(_sid=prev_session_id):
+                    try:
+                        from api.session_lifecycle import commit_session_memory
+                        from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
+                        prev_agent = None
+                        with SESSION_AGENT_CACHE_LOCK:
+                            _cached = SESSION_AGENT_CACHE.get(_sid)
+                            if _cached:
+                                prev_agent = _cached[0]
+                        commit_session_memory(_sid, agent=prev_agent)
+                    except Exception:
+                        logger.warning(
+                            "Lifecycle commit for prev_session %s failed",
+                            _sid,
+                            exc_info=True,
+                        )
+                    finally:
+                        # Self-unregister so the background-commit registry does
+                        # not leak completed threads; drain only tracks live ones.
+                        try:
+                            from api.session_lifecycle import _unregister_background_commit_thread
+                            _unregister_background_commit_thread(threading.current_thread())
+                        except Exception:
+                            pass
+
+                t = threading.Thread(
+                    target=_commit_prev_session_memory,
+                    daemon=True,
+                    name=f"commit-memory-{prev_session_id}",
+                )
+                from api.session_lifecycle import _register_background_commit_thread
+                # Refused only if shutdown draining has already begun; in that
+                # window the inline drain commits the pending generation instead,
+                # so skipping the worker start is safe (avoids a late daemon
+                # thread the drain snapshot already missed).
+                if _register_background_commit_thread(t):
+                    t.start()
         s = new_session(
             workspace=workspace,
             model=model,
@@ -13174,6 +13326,9 @@ def handle_post(handler, parsed) -> bool:
                 session_id=getattr(s, "session_id", None),
             )
         return j(handler, {"session": s.compact() | {"messages": _visible_messages_for_client(s.messages)}})
+
+    if parsed.path == "/api/session/compression-recovery/start":
+        return _handle_session_compression_recovery_start(handler, body)
 
     if parsed.path == "/api/session/duplicate":
         try:
@@ -13320,6 +13475,13 @@ def handle_post(handler, parsed) -> bool:
         if not result.get("ok"):
             return bad(handler, result.get("error", "Unknown error"))
         return j(handler, result)
+
+    if parsed.path == "/api/providers/self-hosted":
+        try:
+            from api.onboarding import apply_self_hosted_provider_setup
+            return j(handler, apply_self_hosted_provider_setup(body))
+        except ValueError as exc:
+            return bad(handler, str(exc), 400)
 
     if parsed.path == "/api/models/refresh":
         provider_id = (body.get("provider") or "").strip().lower()
@@ -13687,15 +13849,25 @@ def handle_post(handler, parsed) -> bool:
             p.relative_to(SESSION_DIR.resolve())
         except Exception:
             return bad(handler, "Invalid session_id", 400)
+        sidecar_deleted = False
         try:
             p.unlink(missing_ok=True)
-            p.with_suffix('.json.bak').unlink(missing_ok=True)
         except Exception:
             logger.debug("Failed to unlink session file %s", p)
+        sidecar_deleted = not p.exists()
+        try:
+            p.with_suffix('.json.bak').unlink(missing_ok=True)
+        except Exception:
+            logger.debug("Failed to unlink session backup file %s", p.with_suffix('.json.bak'))
         try:
             prune_session_from_index(sid)
         except Exception:
             logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
+        if sidecar_deleted and not is_messaging_session:
+            try:
+                _record_webui_deleted_session_tombstone(sid)
+            except Exception:
+                logger.debug("Failed to tombstone deleted WebUI session %s", sid, exc_info=True)
         try:
             from api.upload import _session_attachment_dir
 
@@ -13753,8 +13925,49 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         sid = body["session_id"]
         with _get_session_agent_lock(sid):
-            s.messages = []
+            had_sidecar_messages = bool(s.messages or [])
+            # Clear is a full truncate-to-empty: route through the SAME helper the
+            # /api/session/truncate handler uses (single source of truth) so the
+            # display + context arrays are emptied AND the truncation watermark is
+            # set via _truncation_watermark_for([]) == 0.0 — the #2914
+            # truncate-to-empty sentinel that blocks state.db replay. Before this,
+            # /clear wiped s.messages but left the watermark unset, so the
+            # append-only state.db merge treated it as "keep everything" and the
+            # cleared history resurrected on the next /api/session read (#5532).
+            from api.session_ops import truncate_session_at_keep
+            truncate_session_at_keep(s, 0)
             s.tool_calls = []
+            # A compressed-continuation child keeps its archived transcript in a
+            # parent sidecar marked pre_compression_snapshot;
+            # _webui_sidecar_lineage_messages_for_display() stitches that parent
+            # back with truncation_watermark=None, so the 0.0 sentinel on the
+            # CHILD does NOT stop the parent from resurrecting the cleared history
+            # on refresh. Detach the compression lineage (#5532/#5553) — but ONLY
+            # when the parent is actually a pre_compression_snapshot; a genuine
+            # fork parent (session_source="fork" from /api/session/branch) must
+            # keep its link so the child still nests + shows "Forked from"
+            # (sessions.js:5720/5964/7105). Dropping every parent broke that
+            # (#5532 Codex gate).
+            _parent_sid = getattr(s, "parent_session_id", None)
+            if _parent_sid:
+                _parent_is_compression_snapshot = False
+                try:
+                    _parent = get_session(_parent_sid, metadata_only=True)
+                    _parent_is_compression_snapshot = bool(
+                        getattr(_parent, "pre_compression_snapshot", False)
+                    )
+                except Exception:
+                    _parent_is_compression_snapshot = False
+                if _parent_is_compression_snapshot:
+                    s.parent_session_id = None
+                    s.compression_anchor_visible_idx = None
+                    s.compression_anchor_message_key = None
+            s.active_stream_id = None
+            s.pending_user_message = None
+            s.pending_attachments = []
+            s.pending_started_at = None
+            s.pending_user_source = None
+            s.clear_generation = uuid.uuid4().hex if had_sidecar_messages else None
             # Reset the title via the rename helper so clearing a manually-named
             # session also clears manual_title/llm_title_generated — otherwise the
             # reused session keeps its manual-title protection and never auto-names
@@ -13762,6 +13975,28 @@ def handle_post(handler, parsed) -> bool:
             from api.session_ops import apply_session_title_rename
             apply_session_title_rename(s, "Untitled")
             s.save()
+            persisted_clear = False
+            try:
+                persisted = json.loads(s.path.read_text(encoding="utf-8"))
+                persisted_clear = (
+                    persisted.get("messages") == []
+                    and persisted.get("context_messages") == []
+                    and persisted.get("truncation_watermark") == 0.0
+                    and persisted.get("truncation_boundary") == 0.0
+                    and persisted.get("active_stream_id") is None
+                    and persisted.get("pending_user_message") is None
+                    and persisted.get("pending_attachments") == []
+                    and persisted.get("pending_started_at") is None
+                    and persisted.get("pending_user_source") is None
+                    and persisted.get("clear_generation") == s.clear_generation
+                )
+            except (OSError, json.JSONDecodeError, ValueError):
+                logger.warning("session clear could not verify persisted empty state for %s", sid, exc_info=True)
+            if had_sidecar_messages and persisted_clear:
+                try:
+                    s.path.with_suffix('.json.bak').unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("session clear could not remove stale backup for %s", sid, exc_info=True)
         # Evict cached agent outside the per-session lock.  Eviction may run a
         # boundary memory commit for batch-extraction providers, and provider
         # I/O must not hold the session mutation lock.
@@ -13826,12 +14061,9 @@ def handle_post(handler, parsed) -> bool:
         # (Opus pre-release follow-up.)
         if not isinstance(body["session_id"], str):
             return bad(handler, "session_id must be a string")
-        if _session_is_subagent_view_only(body["session_id"]):
-            return bad(handler, "Subagent sessions are view-only and cannot be branched from WebUI", 400)
-        try:
-            source = get_session(body["session_id"])
-        except KeyError:
-            return bad(handler, "Session not found", 404)
+        source = _load_branch_source_or_refuse(handler, body["session_id"])
+        if source is None:
+            return True
 
         keep_count = body.get("keep_count")
         if keep_count is not None:
@@ -14439,6 +14671,7 @@ def handle_post(handler, parsed) -> bool:
         from api.config import get_max_tokens_status, set_max_tokens
 
         saved = save_settings(body)
+        saved["persisted_speech_keys"] = persisted_speech_settings_keys()
         if max_tokens_provided:
             max_tokens_status = set_max_tokens(max_tokens_value)
         saved.pop("password_hash", None)  # never expose hash to client
@@ -14750,7 +14983,6 @@ def handle_post(handler, parsed) -> bool:
         # #1614: refuse moves into a project owned by another profile.
         target_pid = body.get("project_id") or None
         if target_pid:
-            from api.profiles import get_active_profile_name
             # Use the session's own profile for authorization, not the global
             # active profile. A session belongs to a specific profile set at
             # creation; projects from that profile should always be assignable,
@@ -14800,7 +15032,6 @@ def handle_post(handler, parsed) -> bool:
         except ValueError as e:
             return bad(handler, str(e))
         import re as _re
-        from api.profiles import get_active_profile_name
 
         name = body["name"].strip()[:128]
         if not name:
@@ -14835,7 +15066,6 @@ def handle_post(handler, parsed) -> bool:
         except ValueError as e:
             return bad(handler, str(e))
         import re as _re
-        from api.profiles import get_active_profile_name
 
         projects = load_projects()
         proj = next(
@@ -14861,7 +15091,6 @@ def handle_post(handler, parsed) -> bool:
             require(body, "project_id")
         except ValueError as e:
             return bad(handler, str(e))
-        from api.profiles import get_active_profile_name
         projects = load_projects()
         proj = next(
             (p for p in projects if p["project_id"] == body["project_id"]), None
@@ -16442,6 +16671,34 @@ _TTS_PROXY_MAX_BYTES = 16 * 1024 * 1024
 _TTS_LOCALHOST_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
+def _tts_addr_is_blocked(ip_str: str) -> bool:
+    """Return True when IP is in a private or otherwise non-routable class.
+
+    The explicit flags below document the concrete SSRF-risk classes, but the
+    load-bearing rule is the ``not is_global`` backstop: it blocks every address
+    that is not globally routable — including ranges the named flags miss, most
+    notably ``100.64.0.0/10`` (RFC 6598 CGNAT, also Tailscale's default address
+    space), the ``198.18.0.0/15`` benchmarking range, and any future
+    non-global allocation — so a rebinding host cannot reach a victim's tailnet
+    or carrier-NAT peer.
+    """
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return (
+        not ip.is_global
+        or ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
 def _tts_host_is_blocked_target(hostname: str) -> bool:
     """True if the hostname resolves to (or literally is) a private / loopback /
     link-local / reserved / multicast address — the SSRF-risk targets that an
@@ -16455,24 +16712,10 @@ def _tts_host_is_blocked_target(hostname: str) -> bool:
     if not host:
         return True
 
-    def _addr_blocked(ip_str: str) -> bool:
-        try:
-            ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            return False
-        return (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_multicast
-            or ip.is_unspecified
-        )
-
     # Literal IP host?
     try:
         ipaddress.ip_address(host)
-        return _addr_blocked(host)
+        return _tts_addr_is_blocked(host)
     except ValueError:
         pass
 
@@ -16489,9 +16732,40 @@ def _tts_host_is_blocked_target(hostname: str) -> bool:
         return False
     for info in infos:
         sockaddr = info[4]
-        if sockaddr and _addr_blocked(str(sockaddr[0])):
+        if sockaddr and _tts_addr_is_blocked(str(sockaddr[0])):
             return True
     return False
+
+
+def _tts_resolve_pinned_addresses(hostname: str, port: int | None) -> list[str]:
+    """Resolve once, validate the RRset, and preserve candidate dial order."""
+    import socket
+
+    host = (hostname or "").strip().lower()
+    if not host:
+        raise ValueError("invalid OpenAI TTS base_url host")
+
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except Exception as exc:
+        raise ValueError("could not resolve OpenAI TTS base_url host") from exc
+    pinned_hosts = []
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        pinned_host = str(sockaddr[0])
+        if _tts_addr_is_blocked(pinned_host):
+            raise ValueError("resolved OpenAI TTS target is not allowed")
+        pinned_hosts.append(pinned_host)
+    if not pinned_hosts:
+        raise ValueError("could not resolve OpenAI TTS base_url host")
+    return pinned_hosts
+
+
+def _tts_resolve_pinned_address(hostname: str) -> str:
+    """Return the first vetted literal address for direct helper callers."""
+    return _tts_resolve_pinned_addresses(hostname, None)[0]
 
 
 def _normalized_openai_tts_base_url(base_url: str) -> str:
@@ -16552,6 +16826,52 @@ def _buffer_tts_audio_response(resp, *, max_bytes: int | None = None) -> bytes:
         if len(audio_data) > max_bytes:
             raise ValueError("upstream audio exceeded byte limit")
     return bytes(audio_data)
+
+class _NoRedirectTtsHandler(HTTPRedirectHandler):
+    """Refuse to follow redirects on the TTS call.
+
+    A redirect is never a legitimate response to POST /audio/speech and can
+    carry the Authorization bearer to a target that bypasses the base_url check.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("OpenAI TTS upstream attempted a redirect")
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to a pinned IP while keeping Host and TLS SNI on the hostname."""
+
+    def connect(self):
+        sys.audit("http.client.connect", self, self.host, self.port)
+        last_error = None
+        for pinned_host in _tts_resolve_pinned_addresses(self.host, self.port):
+            try:
+                self.sock = _socket.create_connection(
+                    (pinned_host, self.port), self.timeout, self.source_address
+                )
+                break
+            except OSError as exc:
+                last_error = exc
+        else:
+            if last_error is not None:
+                raise last_error
+            raise OSError("could not connect to any pinned OpenAI TTS target")
+        try:
+            self.sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+        except OSError as exc:
+            if exc.errno != errno.ENOPROTOOPT:
+                raise
+
+        if self._tunnel_host:
+            self._tunnel()
+
+        server_hostname = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+
+class _PinnedHTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_PinnedHTTPSConnection, req, context=self._context)
 
 
 def _tts_open(req, *, timeout=30, opener_factory=None):
@@ -16720,8 +17040,6 @@ def _handle_tts(handler, parsed):
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
         }).encode("utf-8")
 
-        from urllib.request import Request, urlopen as _urlopen
-
         req = Request(url, data=req_body, headers={
             "xi-api-key": api_key,
             "Content-Type": "application/json",
@@ -16734,7 +17052,7 @@ def _handle_tts(handler, parsed):
         # payloads. A hard cap keeps the buffered path bounded even if the
         # upstream misbehaves.
         try:
-            with _urlopen(req, timeout=30) as resp:
+            with _tts_open(req, timeout=30, opener_factory=lambda: build_opener(ProxyHandler({}), _NoRedirectTtsHandler())) as resp:
                 audio_data = _buffer_tts_audio_response(resp)
         except ValueError:
             logger.warning("ElevenLabs TTS rejected an invalid upstream response", exc_info=True)
@@ -16804,29 +17122,17 @@ def _handle_tts(handler, parsed):
             "voice": oai_voice,
         }).encode("utf-8")
 
-        from urllib.request import Request, build_opener, HTTPRedirectHandler, urlopen as _urlopen
-
-        class _NoRedirectTtsHandler(HTTPRedirectHandler):
-            """Refuse to follow redirects on the TTS call. A redirect is never a
-            legitimate response to a POST /audio/speech, and following one would
-            (a) carry the Authorization bearer to the redirect target and
-            (b) let a public host bounce the request to a private/link-local
-            SSRF target after the base-url validation already passed."""
-
-            def redirect_request(self, req, fp, code, msg, headers, newurl):
-                raise ValueError("OpenAI TTS upstream attempted a redirect")
-
         req = Request(url, data=req_body, headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "audio/mpeg",
         })
 
-        # Use a no-redirect opener so an upstream redirect can't carry the bearer
-        # to (or SSRF-bounce into) a different/private target. _tts_open is a thin
-        # module seam so tests can still intercept the network call.
+        # Use a pinned HTTPS opener so the resolved address is the one that gets
+        # dialed. Keep the no-redirect handler in the same chain to block
+        # bearer leaks and SSRF bounce redirects after hostname validation.
         try:
-            with _tts_open(req, timeout=30, opener_factory=lambda: build_opener(_NoRedirectTtsHandler())) as resp:
+            with _tts_open(req, timeout=30, opener_factory=lambda: build_opener(ProxyHandler({}), _NoRedirectTtsHandler(), _PinnedHTTPSHandler())) as resp:
                 audio_data = _buffer_tts_audio_response(resp)
         except ValueError:
             logger.warning("OpenAI TTS rejected an invalid upstream response", exc_info=True)
@@ -19712,6 +20018,103 @@ def _handle_bg_task_complete_ack(handler, body):
     )
 
 
+def _handle_session_compression_recovery_start(handler, body):
+    try:
+        require(body, "session_id")
+    except ValueError as e:
+        return bad(handler, str(e))
+    sid = str(body.get("session_id") or "").strip()
+    if not sid:
+        return bad(handler, "session_id is required")
+    if _session_is_subagent_view_only(sid):
+        return bad(handler, "Subagent sessions are view-only and cannot start compression recovery from WebUI", 400)
+    try:
+        source = get_session(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    if not _session_visible_to_active_profile(getattr(source, "profile", None), handler):
+        return bad(handler, "Session not found", 404)
+    recovery = compression_recovery_payload_for_session(source)
+    if not recovery:
+        return bad(handler, "Session does not have a compression recovery action.", 409)
+    action = str(recovery.get("recommended_action") or "")
+    if action != COMPRESSION_RECOVERY_ACTION_START_FOCUSED:
+        return bad(handler, "Unsupported compression recovery action.", 409)
+
+    created = False
+    with _COMPRESSION_RECOVERY_START_LOCK:
+        source_profile = getattr(source, "profile", None)
+        copied_session = find_compression_recovery_session(sid, action, source_profile=source_profile)
+        if copied_session is None:
+            title = str(getattr(source, "title", None) or "Untitled").strip() or "Untitled"
+            if not title.endswith(" (focused continuation)"):
+                title = f"{title} (focused continuation)"
+            copied_session = Session(
+                session_id=uuid.uuid4().hex[:12],
+                title=title,
+                workspace=getattr(source, "workspace", get_last_workspace()),
+                model=getattr(source, "model", None),
+                model_provider=getattr(source, "model_provider", None),
+                messages=[],
+                tool_calls=[],
+                pinned=False,
+                archived=False,
+                project_id=getattr(source, "project_id", None),
+                profile=getattr(source, "profile", None),
+                session_source="fork",
+                personality=getattr(source, "personality", None),
+                enabled_toolsets=copy.deepcopy(getattr(source, "enabled_toolsets", None)),
+                context_length=getattr(source, "context_length", None),
+                threshold_tokens=getattr(source, "threshold_tokens", None),
+                gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),
+                gateway_routing_history=copy.deepcopy(getattr(source, "gateway_routing_history", None) or []),
+                parent_session_id=getattr(source, "session_id", sid),
+                worktree_path=getattr(source, "worktree_path", None),
+                worktree_branch=getattr(source, "worktree_branch", None),
+                worktree_repo_root=getattr(source, "worktree_repo_root", None),
+                worktree_created_at=getattr(source, "worktree_created_at", None),
+                compression_recovery_source_session_id=sid,
+                compression_recovery_action=action,
+            )
+            # Preserve the workspace/model/profile lane, but intentionally start with an
+            # empty model-facing transcript so a focused follow-up does not replay the
+            # exhausted state.db/context tail.
+            copied_session.context_messages = []
+            copied_session.composer_draft = {"text": "", "files": []}
+            try:
+                copied_session.save()
+            except Exception as e:
+                logger.exception("failed to persist compression recovery session for %s", sid)
+                return bad(handler, f"Failed to start compression recovery: {_sanitize_error(e)}", 500)
+
+            with LOCK:
+                SESSIONS[copied_session.session_id] = copied_session
+                SESSIONS.move_to_end(copied_session.session_id)
+                _evict_sessions_over_cap()
+            created = True
+    if created:
+        publish_session_list_changed(
+            "session_compression_recovery",
+            profile=getattr(copied_session, "profile", None),
+            session_id=getattr(copied_session, "session_id", None),
+        )
+    session_payload = redact_session_data(copied_session.compact() | {"messages": copied_session.messages})
+    return j(
+        handler,
+        {
+            "ok": True,
+            "session": session_payload,
+            "source_session_id": sid,
+            "recommended_recovery_action": action,
+            "message": (
+                "Started a focused continuation. Describe the next narrow task to continue."
+                if created
+                else "Opened the existing focused continuation for this exhausted session."
+            ),
+        },
+    )
+
+
 def _handle_goal_command(handler, body):
     """Handle WebUI /goal command controls and optional kickoff stream."""
     try:
@@ -19980,6 +20383,19 @@ def _handle_chat_start(handler, body, diag=None):
             return bad(handler, "message is required")
         diag.stage("normalize_attachments") if diag else None
         attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
+        recovery = compression_recovery_payload_for_session(s)
+        if recovery and not attachments and is_generic_continuation_intent(msg):
+            return j(
+                handler,
+                {
+                    "error": "This session exhausted context compression. Start a focused continuation, then describe the next narrow task.",
+                    "type": "compression_recovery_required",
+                    "recommended_recovery_action": recovery.get("recommended_action"),
+                    "compression_recovery": recovery,
+                    "session_id": getattr(s, "session_id", body["session_id"]),
+                },
+                status=409,
+            )
         diag.stage("resolve_workspace") if diag else None
         try:
             workspace = _resolve_chat_workspace_with_recovery(s, body.get("workspace"))
@@ -20042,16 +20458,43 @@ def _handle_chat_start(handler, body, diag=None):
         }
         if not gateway_chat_enabled and moa_config is not None:
             start_run_kwargs["moa_config"] = moa_config
-        response = _start_run(
-            s,
-            **start_run_kwargs,
-        )
+        recovery_cleared_for_start = None
+        def _restore_cleared_recovery():
+            if recovery_cleared_for_start is None:
+                return None
+            s.compression_recovery = recovery_cleared_for_start
+            s.recommended_recovery_action = recovery_cleared_for_start.get("recommended_action")
+            try:
+                s.save()
+            except Exception as restore_err:
+                logger.exception("failed to restore compression recovery after chat start rejection for %s", getattr(s, "session_id", None))
+                return restore_err
+            return None
+
+        if recovery:
+            recovery_cleared_for_start = copy.deepcopy(recovery)
+            clear_compression_recovery(s)
+        try:
+            response = _start_run(
+                s,
+                **start_run_kwargs,
+            )
+        except Exception:
+            _restore_cleared_recovery()
+            raise
         # Map adapter-selection NotImplementedError (501) onto the legacy
         # bad-request response shape that this route exposed historically
         # before the helper extraction.
         if response.get("_status") == 501 and "error" in response:
+            restore_err = _restore_cleared_recovery()
+            if restore_err is not None:
+                return bad(handler, f"failed to restore compression recovery: {_sanitize_error(restore_err)}", 500)
             return j(handler, {"error": response["error"]}, status=501)
         status = int(response.pop("_status", 200) or 200)
+        if status >= 400 and recovery_cleared_for_start is not None:
+            restore_err = _restore_cleared_recovery()
+            if restore_err is not None:
+                return bad(handler, f"failed to restore compression recovery: {_sanitize_error(restore_err)}", 500)
         diag.stage("response_write") if diag else None
         return j(handler, response, status=status)
     finally:
@@ -20205,6 +20648,7 @@ def _handle_chat_sync(handler, body):
             )
             from api.streaming import (
                 _WEBUI_PROGRESS_PROMPT,
+                _assign_stable_message_ids,
                 _dedupe_replayed_context_messages,
                 _merge_display_messages_after_agent_result,
                 _restore_display_reasoning_metadata,
@@ -20268,6 +20712,11 @@ def _handle_chat_sync(handler, body):
         _next_context_messages = _restore_reasoning_metadata(
             _previous_context_messages,
             _result_messages,
+        )
+        # Mint ids on the shared result rows BEFORE dedupe deep-copies any
+        # stale-user boundary row, so both arrays share the id (#5564).
+        _assign_stable_message_ids(
+            _result_messages, _previous_messages, _previous_context_messages
         )
         _next_context_messages = _dedupe_replayed_context_messages(
             _previous_context_messages,

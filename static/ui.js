@@ -201,7 +201,8 @@ else initOfflineMonitor();
 // Redirect to login when the server responds with 401 (auth session expired).
 // Handles iOS PWA standalone mode and keeps subpath mounts like /hermes/ from
 // escaping to the personal site root /login.
-function _redirectIfUnauth(res){if(res&&res.status===401){window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);return true;}return false;}
+// #5578: on a login-shaped page, reload 'login' WITHOUT a next (avoid self-nesting).
+function _redirectIfUnauth(res){if(res&&res.status===401){var _p=(window.location.pathname||'').replace(/\/+$/,'');if(/(?:^|\/)login$/.test(_p)){window.location.href='login';}else{window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);}return true;}return false;}
 function _getSessionQueue(sid, create=false){
   if(!sid) return [];
   if(!SESSION_QUEUES[sid]&&create) SESSION_QUEUES[sid]=[];
@@ -415,6 +416,109 @@ function _statusCardHtml(card){
     </div>
     <div class="status-card-grid">${rowHtml}</div>
   </div>`;
+}
+
+function _compressionRecoveryHtml(recovery, sessionId){
+  if(!recovery||typeof recovery!=='object') return '';
+  if(String(recovery.terminal_state||'')!=='compression_exhausted') return '';
+  const action=String(recovery.recommended_action||'');
+  if(action!=='start_focused_continuation') return '';
+  const sid=String(recovery.source_session_id||sessionId||'');
+  const title=String(recovery.title||'Context compression exhausted');
+  const summary=String(recovery.summary||'Start a focused continuation, then describe the next narrow task.');
+  const actionLabel=String(recovery.action_label||'Start focused continuation');
+  const icon=(typeof li==='function')?li('git-branch',14):'';
+  return `<div class="compression-recovery-card" data-compression-recovery-card="1">
+    <div class="compression-recovery-copy">
+      <div class="compression-recovery-title">${esc(title)}</div>
+      <div class="compression-recovery-summary">${esc(summary)}</div>
+    </div>
+    <button class="compression-recovery-action" type="button" data-recovery-session-id="${esc(sid)}" onclick="startCompressionRecovery(this);event.stopPropagation()">${icon}<span>${esc(actionLabel)}</span></button>
+  </div>`;
+}
+
+function _activeCompressionRecoveryPayload(){
+  if(!S||!S.session) return null;
+  const recovery=S.session.compression_recovery;
+  if(recovery&&typeof recovery==='object'&&String(recovery.terminal_state||'')==='compression_exhausted') return recovery;
+  // A cleared session-level recovery payload is authoritative. Only scan
+  // message metadata for older sessions that never exposed this field.
+  if(Object.prototype.hasOwnProperty.call(S.session,'compression_recovery')) return null;
+  const messages=Array.isArray(S.messages)?S.messages:[];
+  for(let i=messages.length-1;i>=0;i--){
+    const msg=messages[i];
+    const msgRecovery=msg&&msg._compressionRecovery;
+    if(msgRecovery&&typeof msgRecovery==='object'&&String(msgRecovery.terminal_state||'')==='compression_exhausted') return msgRecovery;
+  }
+  return null;
+}
+
+function isGenericCompressionContinuationIntent(text){
+  const raw=String(text||'').trim().toLowerCase();
+  if(!raw) return false;
+  const normalized=raw.replace(/[^\p{L}\p{N}]+/gu,' ').trim();
+  const generic=new Set(['continue','continue please','go on','keep going','resume','proceed','carry on','继续','继续吧','接着','接着做','继续做','继续执行']);
+  if(generic.has(normalized)) return true;
+  const parts=normalized.split(/\s+/).filter(Boolean);
+  return !!parts.length&&parts.length<=2&&parts.every(part=>generic.has(part));
+}
+
+function shouldInterceptCompressionRecoveryContinuation(text, files){
+  const hasFiles=Array.isArray(files)&&files.length>0;
+  if(hasFiles||!isGenericCompressionContinuationIntent(text)) return false;
+  const recovery=_activeCompressionRecoveryPayload();
+  return !!(recovery&&String(recovery.recommended_action||'')==='start_focused_continuation');
+}
+
+function showCompressionRecoveryContinuationHint(){
+  const card=document.querySelector('[data-compression-recovery-card="1"]');
+  if(card&&typeof card.scrollIntoView==='function'){
+    try{card.scrollIntoView({block:'center',behavior:'smooth'});}catch(_){card.scrollIntoView();}
+    const btn=card.querySelector('.compression-recovery-action');
+    if(btn&&typeof btn.focus==='function') setTimeout(()=>btn.focus(),120);
+  }
+  if(typeof showToast==='function') showToast('This session exhausted context compression. Start a focused continuation, then describe the next narrow task.',4500,'warning');
+}
+
+async function startCompressionRecovery(btn){
+  const sourceSid=String((btn&&btn.dataset&&btn.dataset.recoverySessionId)||(S.session&&S.session.session_id)||'').trim();
+  if(!sourceSid) return;
+  let retiredRecoveryCard=false;
+  if(btn){btn.disabled=true;btn.classList.add('loading');}
+  try{
+    const data=await api('/api/session/compression-recovery/start',{method:'POST',body:JSON.stringify({session_id:sourceSid})});
+    const sid=data&&data.session&&data.session.session_id;
+    if(!sid) throw new Error('Compression recovery did not return a session.');
+    try{localStorage.setItem('hermes-webui-session',sid);}catch(_){}
+    if(typeof loadSession==='function') await loadSession(sid,{preserveActiveInput:false});
+    else if(data.session){S.session=data.session;S.messages=data.session.messages||[];syncTopbar();renderMessages();}
+    if(typeof renderSessionList==='function') await renderSessionList();
+    if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(sid);
+    if(typeof showToast==='function') showToast((data&&data.message)||'Started focused continuation.',3000,'success');
+    const composer=$('msg');
+    if(composer&&typeof composer.focus==='function') composer.focus();
+  }catch(e){
+    // A 409 means this session no longer has an active recovery action (the
+    // session already moved on — e.g. a substantive prompt cleared it). The
+    // persisted card in the transcript is stale, so retire it and show a neutral
+    // note instead of a raw error. The server is authoritative on availability.
+    if(e&&e.status===409){
+      const staleCard=(btn&&btn.closest&&btn.closest('.compression-recovery-card'))
+        ||document.querySelector('[data-compression-recovery-card="1"]');
+      if(staleCard){
+        staleCard.setAttribute('data-compression-recovery-consumed','1');
+        const staleBtn=staleCard.querySelector('.compression-recovery-action');
+        if(staleBtn){staleBtn.disabled=true;staleBtn.classList.remove('loading');}
+        retiredRecoveryCard=true;
+      }
+      if(typeof showToast==='function') showToast('This conversation already moved on — the focused-continuation action is no longer available.',4000,'info');
+      return;
+    }
+    if(typeof showToast==='function') showToast('Compression recovery failed: '+(e&&e.message||e),5000,'error');
+  }finally{
+    // Do NOT re-enable a button we deliberately retired in the 409 branch.
+    if(btn){if(!retiredRecoveryCard) btn.disabled=false;btn.classList.remove('loading');}
+  }
 }
 
 const MESSAGE_RENDER_WINDOW_DEFAULT=50;
@@ -759,11 +863,35 @@ function _messageVisibleIndexForRawIdx(rawIdx, visWithIdx){
   }
   return -1;
 }
+function _safeEncodeURIComponent(v){
+  try{return encodeURIComponent(String(v));}
+  catch(e){
+    // encodeURIComponent threw URIError -> one or more lone UTF-16 surrogates.
+    // Walk the string as UTF-16 code units: keep valid high(D800-DBFF) +
+    // low(DC00-DFFF) pairs intact (so emoji survive) and drop lone surrogates.
+    // No regex lookbehind/lookahead so this parses on every browser engine
+    // (some older WebViews / Safari <16.4 don't support lookbehind in regex
+    // literals, which would otherwise brick ui.js at parse time).
+    const s=String(v);
+    let cleaned='';
+    for(let i=0;i<s.length;i++){
+      const c=s.charCodeAt(i);
+      if(c>=0xD800&&c<=0xDBFF){
+        const n=(i+1<s.length)?s.charCodeAt(i+1):0;
+        if(n>=0xDC00&&n<=0xDFFF){cleaned+=s[i]+s[i+1];i++;}
+      }else if(c<0xDC00||c>0xDFFF){
+        cleaned+=s[i];
+      }
+    }
+    return encodeURIComponent(cleaned);
+  }
+}
+
 function _messageViewportAnchorKeyForMessage(m){
   if(typeof _compressionMessageAnchorKey!=='function') return '';
   const key=_compressionMessageAnchorKey(m);
   if(!key) return '';
-  return [key.role||'',key.ts??'',key.attachments??0,key.text||''].map(v=>encodeURIComponent(String(v))).join('|');
+  return [key.role||'',key.ts??'',key.attachments??0,key.text||''].map(v=>_safeEncodeURIComponent(v)).join('|');
 }
 function _messageVisibleIndexForAnchorKey(anchorKey, visWithIdx){
   const key=String(anchorKey||'');
@@ -814,11 +942,17 @@ function _captureMessageViewportAnchor(){
     const rect=row.getBoundingClientRect();
     if(rect.bottom>containerRect.top+1){
       const sessionIdx=Number(row&&row.dataset&&row.dataset.sessionMsgIdx);
+      // Record the current top-spacer (virtual topPad) height so the compensation
+      // path can fall back to a topPad-delta shift when the anchor row itself is
+      // recycled out of the render window after a measurement-driven re-render.
+      const spacer=container.querySelector('[data-virtual-spacer="before"]');
+      const topPadBefore=spacer?parseFloat(spacer.style.height||'0')||0:0;
       return {
         rawIdx,
         sessionIdx:Number.isFinite(sessionIdx)?sessionIdx:_messageSessionIndexForRawIdx(rawIdx),
         key:row&&row.dataset?String(row.dataset.messageAnchorKey||''):'',
         topOffset:rect.top-containerRect.top,
+        topPadBefore,
       };
     }
   }
@@ -868,13 +1002,27 @@ function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
   const container=$('messages');
   if(!container||!anchor) return false;
   const anchorKey=String(anchor.key||'');
-  let row=anchorKey?Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el&&el.dataset&&el.dataset.messageAnchorKey===anchorKey):null;
-  if(row&&row.getClientRects&&row.getClientRects().length===0) row=null;
-  if(!row&&anchorKey) return false;
   const sessionIdx=Number(anchor.sessionIdx);
   const hasSessionIdx=Number.isFinite(sessionIdx);
+  let row=anchorKey?Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el&&el.dataset&&el.dataset.messageAnchorKey===anchorKey):null;
+  if(row&&row.getClientRects&&row.getClientRects().length===0) row=null;
+  // The anchor key is content-derived (role|ts|attachments|first-160-chars, built by
+  // _messageViewportAnchorKeyForMessage) so it goes STALE while a live assistant
+  // message is still streaming: every chunk that changes the first 160 chars
+  // recomputes that row's data-message-anchor-key, so a snapshot captured mid-stream
+  // no longer matches by key. We used to concede the moment the keyed lookup missed
+  // (`if(!row&&anchorKey) return false`), and the caller then fell back to an ABSOLUTE
+  // scrollTop=snapshot.top that does NOT compensate the above-viewport height growth
+  // from that same streaming chunk — the residual DESKTOP scroll jump-back. (Desktop
+  // rests at overflow-anchor:none, so #5392's mobile overflow-anchor guard is a no-op
+  // here; this is a distinct code path.) The anchored row is still in the DOM under
+  // its STABLE session-relative index, so recover it via sessionIdx before conceding.
+  // A genuinely removed anchor (message compressed/deleted away) misses key AND
+  // sessionIdx and still returns false. A missing sessionIdx is NOT degraded to the
+  // window-relative rawIdx (which could resolve to a different message), preserving
+  // the original per-tier guard.
   if(!row&&hasSessionIdx) row=container.querySelector(`[data-session-msg-idx="${sessionIdx}"]`);
-  if(!row&&hasSessionIdx) return false;
+  if(!row&&(anchorKey||hasSessionIdx)) return false;
   const targetIdx=Number(anchor.rawIdx)+Number(rawIdxDelta||0);
   if(!row&&Number.isFinite(targetIdx)) row=container.querySelector(`[data-msg-idx="${targetIdx}"]`);
   if(!row) return false;
@@ -955,8 +1103,43 @@ function _compensateScrollForMeasurementDelta(renderFn){
     const spacer=container.querySelector('[data-virtual-spacer="before"]');
     if(!spacer||parseFloat(spacer.style.height||'0')<=0) return;
   }
-  const row=container.querySelector(`[data-msg-idx="${anchorBefore.rawIdx}"]`);
-  if(!row) return;
+  // Re-find the anchor row after the measurement-driven re-render. The primary
+  // lookup is by rawIdx (the DOM index), but on a big virtualized session a large
+  // scroll delta can RECYCLE the old anchor row out of the render window entirely
+  // (verified via real-device telemetry: DOM collapsed to 1 row, scrollHeight
+  // lurched by tens of thousands of px). The old code did `if(!row) return` here,
+  // abandoning compensation → the full estimated↔measured height lurch hit
+  // scrollTop uncompensated and threw the viewport to the top (the recurring
+  // mobile scroll jump-back). Fall back to the stable sessionIdx anchor (captured in
+  // _captureMessageViewportAnchor) before giving up, mirroring the "recover via
+  // sessionIdx when the primary anchor key is gone" approach used elsewhere but for
+  // the virtualization-measurement compensation path.
+  let row=container.querySelector(`[data-msg-idx="${anchorBefore.rawIdx}"]`);
+  if(!row&&Number.isFinite(Number(anchorBefore.sessionIdx))){
+    row=container.querySelector(`[data-session-msg-idx="${anchorBefore.sessionIdx}"]`);
+  }
+  if(!row){
+    // Anchor row is no longer rendered (recycled out of the virtual window). We
+    // cannot measure its live offset, but we CAN keep the viewport visually
+    // stable by compensating for the top-spacer (topPad) height change: the
+    // whole reason scrollHeight lurched is that the estimated topPad was replaced
+    // by a measured one. Shift scrollTop by that same delta so content under the
+    // viewport does not appear to jump. Without this the browser lands at an
+    // uncompensated absolute scrollTop against a wildly different scrollHeight.
+    const spacerAfter=container.querySelector('[data-virtual-spacer="before"]');
+    const topPadAfter=spacerAfter?parseFloat(spacerAfter.style.height||'0')||0:0;
+    const topPadBefore=Number(anchorBefore.topPadBefore);
+    if(Number.isFinite(topPadBefore)){
+      const padDelta=topPadAfter-topPadBefore;
+      if(Math.abs(padDelta)>=2){
+        _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
+        container.scrollTop=Math.max(0,scrollTopBefore+padDelta);
+        _lastScrollTop=container.scrollTop;
+        _deferClearProgrammaticScroll();
+      }
+    }
+    return;
+  }
   const containerRect=container.getBoundingClientRect();
   const rowRect=row.getBoundingClientRect();
   const actualOffset=rowRect.top-containerRect.top;
@@ -1399,6 +1582,7 @@ function _openImgLightbox(imgEl) {
 const _MERMAID_VIEWER_MIN_SCALE = 0.25;
 const _MERMAID_VIEWER_MAX_SCALE = 8;
 const _MERMAID_VIEWER_ZOOM_STEP = 1.2;
+const _MERMAID_VIEWER_INLINE_MIN_HEIGHT = 220;
 
 function _mermaidViewerIcon(kind) {
   const icons = {
@@ -1406,7 +1590,7 @@ function _mermaidViewerIcon(kind) {
     zoomOut: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"></circle><path d="M7 10h6"></path><path d="M15 15l4 4"></path></svg>',
     reset: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9V4H1"></path><path d="M1 4l4 4"></path><path d="M10 4a8 8 0 1 1-5.66 13.66"></path></svg>',
     fit: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"></path></svg>',
-    fullscreen: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5"></path></svg>',
+    fullscreen: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"></path><path d="M4 4l5 5M20 4l-5 5M4 20l5-5M20 20l-5-5"></path></svg>',
   };
   return icons[kind] || '';
 }
@@ -1503,14 +1687,58 @@ function _mountMermaidViewer(svgEl, options = {}) {
   };
   root._mermaidViewer = state;
 
+  function _lightboxViewportEnvelope() {
+    const width = Math.round((window.innerWidth || box.width) * 0.9);
+    const height = Math.round((window.innerHeight || box.height) * 0.9);
+    return {
+      width: Math.max(1, Number.isFinite(width) ? width : 1),
+      height: Math.max(1, Number.isFinite(height) ? height : 1),
+    };
+  }
+
+  function _viewportFallbackSize(){
+    if(mode === 'lightbox') return _lightboxViewportEnvelope();
+    const width = Math.round(window.innerWidth || box.width);
+    const height = Math.round((window.innerHeight || box.height) * 0.7);
+    return {
+      width: Math.max(1, Number.isFinite(width) ? width : 1),
+      height: Math.max(1, Number.isFinite(height) ? height : 1),
+    };
+  }
+
   function _viewportSize(){
     const rect = viewport.getBoundingClientRect ? viewport.getBoundingClientRect() : null;
-    const width = viewport.clientWidth || (rect && rect.width) || (mode === 'lightbox' ? Math.round((window.innerWidth || box.width) * 0.9) : Math.round(window.innerWidth || box.width));
-    const height = viewport.clientHeight || (rect && rect.height) || (mode === 'lightbox' ? Math.round((window.innerHeight || box.height) * 0.9) : Math.round((window.innerHeight || box.height) * 0.7));
+    const fallback = _viewportFallbackSize();
+    const width = mode === 'lightbox'
+      ? fallback.width
+      : (viewport.clientWidth || (rect && rect.width) || fallback.width);
+    const height = mode === 'lightbox'
+      ? fallback.height
+      : (viewport.clientHeight || (rect && rect.height) || fallback.height);
     return {
       width: Math.max(1, Number(width) || box.width || 1),
       height: Math.max(1, Number(height) || box.height || 1),
     };
+  }
+
+  function _rawFitScale(size){
+    return Math.min(size.width / Math.max(1, box.width), size.height / Math.max(1, box.height));
+  }
+
+  function _minScale(){
+    // Inline stays bounded by readable-height minimum to preserve usability.
+    // Lightbox allows fit-to-screen to shrink below the old 0.25 floor when
+    // the diagram envelope is narrower than 25%.
+    if(mode === 'lightbox') return Math.min(_MERMAID_VIEWER_MIN_SCALE, _rawFitScale(_viewportSize()));
+    return Math.min(_MERMAID_VIEWER_MIN_SCALE, _inlineViewportHeight() / Math.max(1, box.height));
+  }
+
+  function _inlineViewportHeight(){
+    const size = _viewportSize();
+    const widthFitScale = size.width / Math.max(1, box.width);
+    const widthBasedHeight = Math.max(1, Math.round(box.height * widthFitScale));
+    const fallback = _viewportFallbackSize();
+    return Math.min(fallback.height, Math.max(_MERMAID_VIEWER_INLINE_MIN_HEIGHT, widthBasedHeight));
   }
 
   function _applyTransform(){
@@ -1528,11 +1756,11 @@ function _mountMermaidViewer(svgEl, options = {}) {
 
   function _fitScale(){
     const size = _viewportSize();
-    return Math.max(_MERMAID_VIEWER_MIN_SCALE, Math.min(_MERMAID_VIEWER_MAX_SCALE, Math.min(size.width / box.width, size.height / box.height)));
+    return Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, _rawFitScale(size)));
   }
 
   function _setScale(nextScale, anchorX, anchorY){
-    const bounded = Math.max(_MERMAID_VIEWER_MIN_SCALE, Math.min(_MERMAID_VIEWER_MAX_SCALE, nextScale));
+    const bounded = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, nextScale));
     if(!Number.isFinite(bounded) || !box.width || !box.height) return;
     const focusX = Number.isFinite(anchorX) ? anchorX : _viewportSize().width / 2;
     const focusY = Number.isFinite(anchorY) ? anchorY : _viewportSize().height / 2;
@@ -1547,8 +1775,28 @@ function _mountMermaidViewer(svgEl, options = {}) {
 
   function _fitViewer(){
     const nextScale = _fitScale();
+    state.fitScale = nextScale;
     state.scale = nextScale;
     _centerForScale(nextScale);
+    _applyTransform();
+  }
+
+  function _resizeToEnvelope(){
+    if(mode !== 'lightbox') return;
+    const hadFitScale = Number.isFinite(state.fitScale);
+    const previousFitScale = hadFitScale ? state.fitScale : _fitScale();
+    const wasAtFit = !hadFitScale || Math.abs(state.scale - previousFitScale) < 1e-9;
+    const envelope = _lightboxViewportEnvelope();
+    viewport.style.width = Math.max(1, Math.round(envelope.width)) + 'px';
+    viewport.style.height = Math.max(1, Math.round(envelope.height)) + 'px';
+    const nextFitScale = _fitScale();
+    state.fitScale = nextFitScale;
+    if(wasAtFit){
+      state.scale = nextFitScale;
+      _centerForScale(state.scale);
+    } else {
+      state.scale = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, state.scale));
+    }
     _applyTransform();
   }
 
@@ -1638,6 +1886,7 @@ function _mountMermaidViewer(svgEl, options = {}) {
   state.zoomOut = _zoomOut;
   state.zoomAt = _setScale;
   state.applyTransform = _applyTransform;
+  state.resizeToEnvelope = _resizeToEnvelope;
   state.openLightbox = openLightbox;
 
   toolbar.appendChild(_createMermaidViewerButton('Zoom in', 'zoomIn', _zoomIn));
@@ -1648,16 +1897,16 @@ function _mountMermaidViewer(svgEl, options = {}) {
     toolbar.appendChild(_createMermaidViewerButton('Fullscreen', 'fullscreen', openLightbox));
   }
 
-  const initialFit = _fitScale();
-  state.scale = initialFit;
-  _centerForScale(initialFit);
-  _applyTransform();
   if(mode === 'lightbox'){
-    viewport.style.width = Math.max(1, Math.round(box.width * initialFit)) + 'px';
-    viewport.style.height = Math.max(1, Math.round(box.height * initialFit)) + 'px';
+    state.resizeToEnvelope();
   } else {
+    const initialHeight = _inlineViewportHeight();
+    const readableScale = initialHeight / Math.max(1, box.height);
+    state.scale = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, readableScale));
     viewport.style.width = '100%';
-    viewport.style.height = Math.max(1, Math.round(box.height * initialFit)) + 'px';
+    viewport.style.height = Math.max(1, Math.round(initialHeight)) + 'px';
+    _centerForScale(state.scale);
+    _applyTransform();
   }
 
   return root;
@@ -1707,6 +1956,18 @@ function _openMermaidLightbox(svgEl) {
   clone.removeAttribute('width');
   clone.removeAttribute('height');
   const viewer = _mountMermaidViewer(clone, {mode:'lightbox'});
+  if(viewer && viewer._mermaidViewer && typeof viewer._mermaidViewer.resizeToEnvelope === 'function'){
+    lb._mermaidResizeHandler = () => {
+      if(lb._mermaidResizeTimer && typeof clearTimeout === 'function') clearTimeout(lb._mermaidResizeTimer);
+      lb._mermaidResizeTimer = setTimeout(() => {
+        lb._mermaidResizeTimer = null;
+        viewer._mermaidViewer.resizeToEnvelope();
+      }, 120);
+    };
+    if(window && typeof window.addEventListener === 'function'){
+      window.addEventListener('resize', lb._mermaidResizeHandler);
+    }
+  }
   const cls = document.createElement('button');
   cls.className = 'img-lightbox-close';
   cls.setAttribute('aria-label', 'Close');
@@ -1720,6 +1981,7 @@ function _openMermaidLightbox(svgEl) {
   };
   document.body.appendChild(lb);
   document.addEventListener('keydown', lb._keyHandler);
+  return lb;
 }
 function _openImgLightboxWithNav(src, alt, images, index) {
   const lb = document.createElement('div');
@@ -1790,6 +2052,13 @@ function _navigateLightbox(lb, direction) {
 function _closeImgLightbox(lb) {
   if(!lb || !lb.parentNode) return;
   document.removeEventListener('keydown', lb._keyHandler);
+  if(lb._mermaidResizeHandler && window && typeof window.removeEventListener === 'function'){
+    window.removeEventListener('resize', lb._mermaidResizeHandler);
+  }
+  if(lb._mermaidResizeTimer && typeof clearTimeout === 'function'){
+    clearTimeout(lb._mermaidResizeTimer);
+    lb._mermaidResizeTimer = null;
+  }
   lb.style.animation = 'lb-in .12s ease reverse';
   setTimeout(() => lb.parentNode && lb.parentNode.removeChild(lb), 120);
 }
@@ -2330,23 +2599,41 @@ function _refreshOpenModelDropdown(){
     renderModelDropdown();
     if(typeof _positionModelDropdown==='function') _positionModelDropdown();
   }
+  const sdd=$('settingsModelDropdown');
+  if(sdd&&sdd.classList&&sdd.classList.contains('open')&&typeof renderModelDropdown==='function'){
+    // Re-rendering the OPEN settings picker (e.g. when a late live-model fetch
+    // resolves) must not re-grab search focus on touch — same coarse-pointer rule
+    // as openSettingsModelDropdown, or the mobile keyboard pops after opening.
+    const _coarsePointer=(typeof window.matchMedia==='function')&&window.matchMedia('(pointer: coarse)').matches;
+    renderModelDropdown({
+      dropdownId:'settingsModelDropdown',
+      selectId:'settingsModel',
+      forceOpenKey:'settingsModel',
+      closeDropdown:closeSettingsModelDropdown,
+      selectModel:selectSettingsModelFromDropdown,
+      scopeNoteText:t('settings_desc_model')||'Used for new conversations. Existing conversations keep their selected model.',
+      autoFocusSearch:!_coarsePointer,
+    });
+  }
 }
 function _applyModelToDropdown(modelId, sel, preferredProviderId, opts){
   if(!modelId||!sel) return null;
-  const currentState=(sel.id==='modelSelect'&&typeof _modelStateForSelect==='function')
+  const isRichPickerSelect=sel.id==='modelSelect'||sel.id==='settingsModel';
+  const currentState=(isRichPickerSelect&&typeof _modelStateForSelect==='function')
     ? _modelStateForSelect(sel, sel.value)
     : null;
   const resolved=_findModelInDropdown(modelId,sel,preferredProviderId);
   if(resolved){
     sel.value=resolved;
-    if(sel.id==='modelSelect'){
+    if(isRichPickerSelect){
       const resolvedState=typeof _modelStateForSelect==='function'
         ? _modelStateForSelect(sel, resolved)
         : {model:resolved,model_provider:preferredProviderId||null};
       const pickerChanged= !!(opts&&opts.forceRefresh) || !currentState
         || String(currentState.model||'')!==String(resolvedState.model||'')
         || String(currentState.model_provider||'')!==String(resolvedState.model_provider||'');
-      if(typeof syncModelChip==='function') syncModelChip();
+      if(sel.id==='modelSelect'&&typeof syncModelChip==='function') syncModelChip();
+      if(sel.id==='settingsModel'&&typeof syncSettingsModelChip==='function') syncSettingsModelChip();
       if(pickerChanged) _refreshOpenModelDropdown();
     }
     return resolved;
@@ -2370,6 +2657,10 @@ function _ensureModelOptionInDropdown(modelId, sel, preferredProviderId){
   sel.value=modelId;
   if(sel.id==='modelSelect'){
     if(typeof syncModelChip==='function') syncModelChip();
+    _refreshOpenModelDropdown();
+  }
+  if(sel.id==='settingsModel'){
+    if(typeof syncSettingsModelChip==='function') syncSettingsModelChip();
     _refreshOpenModelDropdown();
   }
   return modelId;
@@ -2978,9 +3269,20 @@ function _mountSearchableModelSelect(opts={}){
 }
 
 function renderModelDropdown(){
-  const dd=$('composerModelDropdown');
-  const sel=$('modelSelect');
+  const opts=arguments[0]||{};
+  const dd=$(opts.dropdownId||'composerModelDropdown');
+  const sel=$(opts.selectId||'modelSelect');
   if(!dd||!sel) return;
+  // Whether the search input should auto-grab focus on (re-)render. Default true
+  // preserves the composer picker's behavior exactly; the settings picker passes
+  // false on coarse-pointer devices so opening it doesn't pop the mobile keyboard.
+  const _autoFocusSearch=opts.autoFocusSearch!==false;
+  const selectFromDropdown=typeof opts.selectModel==='function'
+    ? opts.selectModel
+    : (value,provider)=>selectModelFromDropdown(value,provider);
+  const closeDropdown=typeof opts.closeDropdown==='function'
+    ? opts.closeDropdown
+    : closeModelDropdown;
   // Group(s) that must render OPEN even though they aren't the selected group —
   // set when the user expands a group's overflow via "Show more" so a later full
   // re-render doesn't re-collapse it (_groupOpenState is rebuilt per render, so
@@ -2989,8 +3291,10 @@ function renderModelDropdown(){
   // #3691 node test driver evals the function body without module scope).
   const _forceOpenGroups=(()=>{
     const _g=(typeof window!=='undefined')?window:(typeof globalThis!=='undefined'?globalThis:{});
-    if(!_g.__modelGroupForceOpen) _g.__modelGroupForceOpen=new Set();
-    return _g.__modelGroupForceOpen;
+    const key=opts.forceOpenKey||'composer';
+    if(!_g.__modelGroupForceOpenByPicker) _g.__modelGroupForceOpenByPicker={};
+    if(!_g.__modelGroupForceOpenByPicker[key]) _g.__modelGroupForceOpenByPicker[key]=new Set();
+    return _g.__modelGroupForceOpenByPicker[key];
   })();
   const _modelData=[];
   const _groupMeta=new Map();
@@ -3087,7 +3391,7 @@ function renderModelDropdown(){
   // Create search input FIRST before filterModels definition
   const _scopeNote=document.createElement('div');
   _scopeNote.className='model-scope-note';
-  _scopeNote.textContent=t('model_scope_advisory')||'Applies to this conversation from your next message.';
+  _scopeNote.textContent=opts.scopeNoteText||(t('model_scope_advisory')||'Applies to this conversation from your next message.');
   const _searchRow=document.createElement('div');
   _searchRow.className='model-search-row';
   _searchRow.innerHTML=`<input class="model-search-input" type="text" placeholder="${esc(t('model_search_placeholder')||'Search models…')}" spellcheck="false" autocomplete="off"><button class="model-search-clear" title="Clear search">${li('x',10)}</button>`;
@@ -3127,7 +3431,7 @@ function renderModelDropdown(){
     const _plainGroup=m.group?String(m.group).replace(/\s*\(\d+\s+of\s+\d+\)\s*$/,''):'';
     const providerChip=(_plainGroup&&withProviderChip)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
     row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-    row.onclick=()=>selectModelFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
+    row.onclick=()=>selectFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
     return row;
   };
   const _expandOverflowGroup=(groupMetaEntry)=>{
@@ -3151,7 +3455,7 @@ function renderModelDropdown(){
     // expander gone, search term reapplied.
     const _fullReRender=()=>{
       const _term=(_si&&_si.value)||'';
-      renderModelDropdown();
+      renderModelDropdown(opts);
       const ns=dd.querySelector('.model-search-input');
       if(ns){ ns.value=_term; (ns._listeners&&ns._listeners.input)?ns._listeners.input():ns.dispatchEvent(new Event('input')); }
     };
@@ -3180,7 +3484,7 @@ function renderModelDropdown(){
       for(const m of extraModels){
         if(!m||!m.id) continue;
         if(_alreadyShown.has(esc(m.id))) continue;
-        const row=_buildModelRow({value:m.id,name:m.label||m.id,id:m.id,group:_plainLabel,groupKey,providerId:(og.dataset&&og.dataset.provider)||''},$('modelSelect'),false);
+        const row=_buildModelRow({value:m.id,name:m.label||m.id,id:m.id,group:_plainLabel,groupKey,providerId:(og.dataset&&og.dataset.provider)||''},sel,false);
         wrap.insertBefore(row,moreEl);
         if(!firstNewRow) firstNewRow=row;
       }
@@ -3246,10 +3550,14 @@ function renderModelDropdown(){
     const _underOwnHeading=shouldRenderHeading&&!!(m.groupKey&&_groupWrappers[m.groupKey]);
     const providerChip=(_plainGroup&&!_underOwnHeading)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
     row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-    row.onclick=()=>selectModelFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
+    row.onclick=()=>selectFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
     return row;
   };
   const _filterModels=(term)=>{
+    // Preserve focus across the re-render if the search input already had it — so a
+    // touch user typing a query (where autoFocusSearch is suppressed to avoid the
+    // initial keyboard pop) doesn't lose focus mid-word on each keystroke re-render.
+    const _hadFocus=(typeof document!=='undefined')&&document.activeElement===_si;
     term=term.trim().toLowerCase();
     const hasSearch=!!term;
     // On a fresh search, expand all groups so every match is visible (#collapse).
@@ -3341,7 +3649,7 @@ function renderModelDropdown(){
         }
         const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(badgeLabel)}</span>`:'';
         row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(modelName)}</span>${badgeHtml}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-        row.onclick=()=>selectModelFromDropdown(m.value,(m.badge&&m.badge.provider)||m.providerId||null);
+        row.onclick=()=>selectFromDropdown(m.value,(m.badge&&m.badge.provider)||m.providerId||null);
         dd.appendChild(row);
       }
     }
@@ -3488,7 +3796,7 @@ function renderModelDropdown(){
       noResult.style.textAlign='center';
       dd.appendChild(noResult);
     }
-    _si.focus();
+    if(_autoFocusSearch||_hadFocus) _si.focus();
   };
   _si.addEventListener('input',()=>_filterModels(_si.value));
   // Keyboard navigation through filtered model rows (#2791).
@@ -3509,7 +3817,7 @@ function renderModelDropdown(){
     if(typeof row.scrollIntoView==='function') row.scrollIntoView({block:'nearest'});
   };
   _si.addEventListener('keydown',e=>{
-    if(e.key==='Escape'){closeModelDropdown();return;}
+    if(e.key==='Escape'){closeDropdown();return;}
     if(e.key==='ArrowDown'||e.key==='ArrowUp'||e.key==='Enter'){
       const rows=_visibleModelRows();
       if(!rows.length){if(e.key==='Enter') e.preventDefault();return;}
@@ -3526,9 +3834,9 @@ function renderModelDropdown(){
   _si.addEventListener('click',e=>e.stopPropagation());
   _sc.onclick=()=>{ _si.value=''; _filterModels(''); _si.focus(); };
   _sc.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){ _si.value=''; _filterModels(''); _si.focus(); e.preventDefault(); }});
-  const _applyCustom=()=>{const v=_ci.value.trim();if(!v)return;selectModelFromDropdown(v);_ci.value='';};
+  const _applyCustom=()=>{const v=_ci.value.trim();if(!v)return;selectFromDropdown(v,null);_ci.value='';};
   _cb.onclick=_applyCustom;
-  _ci.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();_applyCustom();}if(e.key==='Escape'){closeModelDropdown();}});
+  _ci.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();_applyCustom();}if(e.key==='Escape'){closeDropdown();}});
   _ci.addEventListener('click',e=>e.stopPropagation());
   dd.appendChild(_scopeNote);
   dd.appendChild(_searchRow);
@@ -3593,12 +3901,113 @@ function closeModelDropdown(){
   if(mobileAction) mobileAction.classList.remove('active');
 }
 
+function closeSettingsModelDropdown(){
+  const dd=$('settingsModelDropdown');
+  const chip=$('settingsModelChip');
+  if(dd) dd.classList.remove('open');
+  if(chip){
+    chip.classList.remove('active');
+    chip.setAttribute('aria-expanded','false');
+  }
+}
+
+function syncSettingsModelChip(){
+  const sel=$('settingsModel');
+  const chip=$('settingsModelChip');
+  if(!sel||!chip) return;
+  const opt=sel.selectedOptions&&sel.selectedOptions[0];
+  const text=(opt&&opt.textContent)||getModelLabel(sel.value||'')||t('settings_label_model')||'Default Model';
+  chip.textContent=text;
+  chip.title=sel.value||text;
+}
+
+function selectSettingsModelFromDropdown(value,preferredProviderId){
+  const sel=$('settingsModel');
+  if(!sel){closeSettingsModelDropdown();return;}
+  const provider=String(preferredProviderId||'').trim()||null;
+  if(typeof _ensureModelOptionInDropdown==='function'){
+    _ensureModelOptionInDropdown(value,sel,provider);
+  }else{
+    sel.value=value;
+    if(typeof syncSettingsModelChip==='function') syncSettingsModelChip();
+  }
+  closeSettingsModelDropdown();
+  try{
+    if(typeof Event==='function') sel.dispatchEvent(new Event('change',{bubbles:true}));
+    else if(typeof sel.onchange==='function') sel.onchange();
+  }catch(_){}
+}
+
+function openSettingsModelDropdown(){
+  const dd=$('settingsModelDropdown');
+  const sel=$('settingsModel');
+  const chip=$('settingsModelChip');
+  if(!dd||!sel) return;
+  // Auto-focus the search on desktop only. On touch (coarse pointer) grabbing focus
+  // pops the on-screen keyboard the instant the chip is tapped — the composer picker
+  // doesn't do it either, so match that behavior on touch. Computed before render so
+  // renderModelDropdown's own initial focus is suppressed too (not just the outer one).
+  const _coarsePointer=(typeof window.matchMedia==='function')&&window.matchMedia('(pointer: coarse)').matches;
+  renderModelDropdown({
+    dropdownId:'settingsModelDropdown',
+    selectId:'settingsModel',
+    forceOpenKey:'settingsModel',
+    closeDropdown:closeSettingsModelDropdown,
+    selectModel:selectSettingsModelFromDropdown,
+    scopeNoteText:t('settings_desc_model')||'Used for new conversations. Existing conversations keep their selected model.',
+    autoFocusSearch:!_coarsePointer,
+  });
+  dd.classList.add('open');
+  if(chip){
+    chip.classList.add('active');
+    chip.setAttribute('aria-expanded','true');
+  }
+  if(!_coarsePointer){
+    setTimeout(()=>{
+      const input=dd.querySelector('.model-search-input');
+      if(input) input.focus();
+    },0);
+  }
+}
+
+function toggleSettingsModelDropdown(){
+  const dd=$('settingsModelDropdown');
+  if(dd&&dd.classList.contains('open')){closeSettingsModelDropdown();return;}
+  openSettingsModelDropdown();
+}
+
+function mountSettingsModelPicker(){
+  const chip=$('settingsModelChip');
+  const sel=$('settingsModel');
+  if(!chip||!sel) return;
+  syncSettingsModelChip();
+  if(!chip._settingsModelPickerBound){
+    chip._settingsModelPickerBound=true;
+    chip.addEventListener('click',e=>{
+      e.preventDefault();
+      e.stopPropagation();
+      toggleSettingsModelDropdown();
+    });
+    chip.addEventListener('keydown',e=>{
+      if(e.key==='Enter'||e.key===' '||e.key==='ArrowDown'){
+        e.preventDefault();
+        toggleSettingsModelDropdown();
+      }
+    });
+  }
+}
+
 document.addEventListener('click',e=>{
   if(
     !e.target.closest('#composerModelChip') &&
     !e.target.closest('#composerMobileModelAction') &&
     !e.target.closest('#composerModelDropdown')
   ) closeModelDropdown();
+  if(
+    !e.target.closest('#settingsModelChip') &&
+    !e.target.closest('#settingsModel') &&
+    !e.target.closest('#settingsModelDropdown')
+  ) closeSettingsModelDropdown();
 });
 window.addEventListener('resize',()=>{
   const dd=$('composerModelDropdown');
@@ -4758,6 +5167,10 @@ if(typeof window!=='undefined'){
       }else if(movedDown&&nearBottom){
         _nearBottomCount=_nearBottomCount+1;
         if(_nearBottomCount>=2){
+          // Only re-pin when the reader has genuinely reached the true bottom
+          // tail (<=80px). nearBottom spans a ~250px band, so proximity alone
+          // must NOT clear the sticky unpin flag (#4295) — a reader scanning the
+          // last lines mid-stream would otherwise get yanked back to the bottom.
           if(!_messageUserUnpinned||bottomDistance<=80){
             _messageUserUnpinned=false;
             _scrollPinned=true;
@@ -5280,6 +5693,26 @@ function _messageBottomDistance(){
   if(!el) return 0;
   return el.scrollHeight-el.scrollTop-el.clientHeight;
 }
+// #5514/#5515: when the composer grows (typing multiple rows, Shift+Enter, a
+// multi-line paste / WisprFlow), the flex:1 `.messages` viewport shrinks by the
+// same delta. A reader pinned to the bottom is then stranded Δpx above it — the
+// transcript appears to "scroll up" one row per composer row, and (the #5515
+// half) it reads as a random upward jump during normal use. autoResize() only
+// resized the textarea; nothing re-pinned the transcript. Re-pin the bottom, but
+// ONLY when the reader is genuinely still pinned (sticky-unpin model: honor
+// _messageUserUnpinned so we never yank a reader who scrolled away, and never
+// fight a stream that already unpinned). Cheap no-op when not pinned.
+function _repinMessagesAfterComposerResize(){
+  if(_messageUserUnpinned || !_scrollPinned) return;
+  const el=$('messages');
+  if(!el) return;
+  // Already at/very near the bottom? nothing to do (avoids needless writes while
+  // idle-reading a short conversation that isn't scrollable).
+  if(_messageBottomDistance()<=1) return;
+  if(typeof _setMessageScrollToBottom==='function') _setMessageScrollToBottom();
+  else { el.scrollTop=el.scrollHeight; }
+}
+if(typeof window!=='undefined') window._repinMessagesAfterComposerResize=_repinMessagesAfterComposerResize;
 function _shouldFollowMessagesOnDomReplace(){
   // Final stream settlement replaces the live DOM with persisted messages. Keep
   // following only for users who are still pinned or effectively at the tail.
@@ -5396,7 +5829,24 @@ function _settleFinalScroll(token){
 }
 function scrollIfPinned(){
   if(!_autoScrollFollow) return;
-  if(_messageUserUnpinned) return;
+  if(_messageUserUnpinned){
+    // Only scrollToBottom() cleared this flag, so one scroll-up permanently
+    // killed auto-follow. Re-pin ONLY when the reader has genuinely returned to
+    // the true bottom tail (<=80px), NOT on mere near-bottom proximity — the
+    // #4295 invariant is that proximity alone (inside the ~250px band) must not
+    // re-pin, or a reader scanning the last few lines gets yanked to the bottom
+    // mid-stream. Also bail on ANY recent message-pane scroll intent (wheel,
+    // key, touch) and non-message intent, so an active scroll-up near the tail
+    // is never overridden. Uses the same _nearBottomCount debounce as the
+    // scroll listener (~4859-4866).
+    if(_recentNonMessageScrollIntent()||_recentMessageScrollIntent()||_recentMessageTouchScrollIntent()||_recentMessageWheelIntent()||_recentMessageKeyScrollIntent()){ _nearBottomCount=0; return; }
+    if(_messageBottomDistance()>80){ _nearBottomCount=0; return; }
+    _nearBottomCount=_nearBottomCount+1;
+    if(_nearBottomCount<2) return;
+    _nearBottomCount=0;
+    _messageUserUnpinned=false;
+    _scrollPinned=true;
+  }
   if(!_scrollPinned) return;
   if(_recentNonMessageScrollIntent()) return;
   if(_messageBottomDistance()>500) _setMessageScrollToBottom();
@@ -8258,6 +8708,38 @@ function toggleUpdateSummaryExpanded(){
   _syncUpdateSummaryExpandButton(expanded);
 }
 const WHATS_NEW_SUMMARY_STORAGE_KEY='hermes-whats-new-generated-summaries';
+const WHATS_NEW_SUMMARY_STORAGE_MAX_BYTES=256*1024;
+function _summaryStorageByteLength(value){
+  const text=typeof value==='string'?value:JSON.stringify(value);
+  if(text==null) return 0;
+  if(typeof TextEncoder==='function') return new TextEncoder().encode(text).length;
+  let bytes=0;
+  for(const ch of text){
+    const code=ch.codePointAt(0);
+    bytes+=code<=0x7f?1:(code<=0x7ff?2:(code<=0xffff?3:4));
+  }
+  return bytes;
+}
+function _summaryCacheEntriesSortedByRecency(entries){
+  return entries.slice().sort((left,right)=>{
+    const leftKey=left[0];
+    const rightKey=right[0];
+    const leftSummary=left[1];
+    const rightSummary=right[1];
+    const leftUpdatedAt=leftSummary&&leftSummary.updatedAt;
+    const rightUpdatedAt=rightSummary&&rightSummary.updatedAt;
+    if(typeof leftUpdatedAt==='number'&&typeof rightUpdatedAt==='number'&&leftUpdatedAt!==rightUpdatedAt){
+      return rightUpdatedAt-leftUpdatedAt;
+    }
+    if(typeof leftUpdatedAt==='number') return -1;
+    if(typeof rightUpdatedAt==='number') return 1;
+    if(leftKey==='webui'&&rightKey!=='webui') return -1;
+    if(rightKey==='webui'&&leftKey!=='webui') return 1;
+    if(leftKey==='agent'&&rightKey!=='agent') return -1;
+    if(rightKey==='agent'&&leftKey!=='agent') return 1;
+    return leftKey<rightKey?-1:(leftKey>rightKey?1:0);
+  });
+}
 function _loadStoredUpdateSummaries(){
   window._whatsNewGeneratedSummaries=window._whatsNewGeneratedSummaries||{};
   try{
@@ -8271,7 +8753,18 @@ function _loadStoredUpdateSummaries(){
   return window._whatsNewGeneratedSummaries;
 }
 function _persistGeneratedSummaries(){
-  try{sessionStorage.setItem(WHATS_NEW_SUMMARY_STORAGE_KEY,JSON.stringify(window._whatsNewGeneratedSummaries||{}));}catch(_e){}
+  const current=window._whatsNewGeneratedSummaries||{};
+  const next={};
+  try{
+    _summaryCacheEntriesSortedByRecency(Object.entries(current)).forEach((entry)=>{
+      const candidate={...next,...Object.fromEntries([entry])};
+      if(_summaryStorageByteLength(JSON.stringify(candidate))<=WHATS_NEW_SUMMARY_STORAGE_MAX_BYTES){
+        Object.assign(next, Object.fromEntries([entry]));
+      }
+    });
+    window._whatsNewGeneratedSummaries=next;
+    sessionStorage.setItem(WHATS_NEW_SUMMARY_STORAGE_KEY,JSON.stringify(next));
+  }catch(_e){}
 }
 function _pruneGeneratedSummaries(data){
   const cache=_loadStoredUpdateSummaries();
@@ -8302,6 +8795,7 @@ function _rememberGeneratedSummary(target,payload,data){
   window._whatsNewGeneratedSummaries[target]={
     signature:_updateSummarySignature(data&&data[target]),
     payload:payload,
+    updatedAt:Date.now(),
   };
   _persistGeneratedSummaries();
 }
@@ -10466,11 +10960,26 @@ function _anchorSceneNodeForRow(row, opts){
   if(row.role==='prose'){
     const text=String(row.text||'').trim();
     if(!text) return null;
-    node=document.createElement('div');
-    node.className='assistant-segment';
-    node.setAttribute('data-anchor-scene-prose','1');
-    node.dataset.rawText=text;
-    node.innerHTML=`<div class="msg-body">${renderMd?renderMd(text):esc(text)}</div>`;
+    // Incremental live rendering: reuse a persistent smd node fed only the delta
+    // instead of re-parsing the whole growing answer on every streamed frame
+    // (O(n^2) -> O(n)). Settled rows and any failure fall through to the full
+    // renderMd path below, which stays the source of truth for the final DOM.
+    const proseKey=row.local_id||row.row_id||'';
+    if(!settled && proseKey && typeof window.__anchorProseIncrementalNode==='function'){
+      const inc=window.__anchorProseIncrementalNode(proseKey,text);
+      // Route the incremental node through the shared row-decoration block below
+      // (data-anchor-scene-row / -row-id / -row-role / -source-event-type) instead
+      // of returning early — otherwise live incremental prose rows lose the
+      // identity attributes the scene reconciler matches on. (Codex gate #5466)
+      if(inc){ node=inc; }
+    }
+    if(!node){
+      node=document.createElement('div');
+      node.className='assistant-segment';
+      node.setAttribute('data-anchor-scene-prose','1');
+      node.dataset.rawText=text;
+      node.innerHTML=`<div class="msg-body">${renderMd?renderMd(text):esc(text)}</div>`;
+    }
   }else if(row.role==='thinking'){
     if(window._showThinking===false) return null;
     const text=String(row.text||row.thinking&&row.thinking.text||'').trim();
@@ -10558,7 +11067,7 @@ function _anchorSceneTransparentNodeForRow(row, opts){
     node=_decorateTransparentEventRow(buildToolCard(toolCall),{
       type:'tool',
       name:toolCall&&toolCall.name,
-      status:_transparentToolStatus(toolCall,true),
+      status:_transparentToolStatus(toolCall,settled),
       toolCall,
       ...meta,
     });
@@ -10840,7 +11349,26 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
   if(!blocks) return false;
   const scrollSnapshot=_captureMessageScrollSnapshot();
   const scrollRebuildGuard=_prepareLiveAnchorScrollRebuildGuard(scrollSnapshot);
-  blocks.querySelectorAll('[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
+  const activeStreamId = String(streamId || S.activeStreamId || '');
+  const activeSessionId = String(S.session && S.session.session_id || '');
+  const preserveByKey = new Map();
+  blocks.querySelectorAll('.transparent-event-row[data-live-stream-owned="1"][data-anchor-row-id]').forEach(node=>{
+    if(!node||!node.getAttribute) return;
+    const rowStream = String(node.getAttribute('data-anchor-stream-id') || '');
+    if(rowStream && rowStream !== activeStreamId) return;
+    const rowSession = String(node.getAttribute('data-session-id') || '');
+    if(rowSession && activeSessionId && rowSession !== activeSessionId) return;
+    const key = _transparentLiveRowKey(node, activeStreamId);
+    if(key && !preserveByKey.has(key)) preserveByKey.set(key, node);
+  });
+  blocks.querySelectorAll('[data-anchor-scene-owner="1"]').forEach(el=>el.remove());
+  blocks.querySelectorAll('[data-anchor-scene-row="1"]').forEach(el=>{
+    if(el.getAttribute('data-live-stream-owned') === '1'){
+      const key = _transparentLiveRowKey(el, activeStreamId);
+      if(key && preserveByKey.get(key) === el) return;
+    }
+    el.remove();
+  });
   // Clear every legacy live activity surface this renderer can replace. The
   // anchor-scene rows are now the source of truth for visible live activity.
   blocks.querySelectorAll(
@@ -10850,7 +11378,6 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     '.tool-card-row[data-live-tid],'+
     '.agent-activity-thinking[data-live-thinking="1"],'+
     '.transparent-event-row[data-live-tid],'+
-    '[data-live-stream-owned="1"],'+
     '.interim-collapse-toggle'
   ).forEach(el=>el.remove());
   // Match the compact path: keep legacy live segments as hidden anchors so
@@ -10862,6 +11389,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
   });
   const liveFooter=blocks.querySelector('#liveRunStatus');
   let wrote=false;
+  const targetRenderedRows=[];
   for(const row of rows){
     const node=_anchorSceneTransparentNodeForRow(row,{
       live:true,
@@ -10870,10 +11398,33 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
       sessionId:S.session&&S.session.session_id,
     });
     if(!node) continue;
-    if(liveFooter&&liveFooter.parentElement===blocks) blocks.insertBefore(node,liveFooter);
-    else blocks.appendChild(node);
+    const key = _transparentLiveRowKey(node, activeStreamId);
+    const existing = key ? preserveByKey.get(key) : null;
+    const renderedNode = existing && _transparentLiveRowsCompatible(existing, node)
+      ? _refreshTransparentLiveRow(existing, node)
+      : node;
+    if(existing) preserveByKey.delete(key);
+    if(!renderedNode) continue;
+    targetRenderedRows.push(renderedNode);
     wrote=true;
   }
+  const transparentLiveRowAlreadyPositioned=(node, expectedNextSibling)=>!!(
+    node &&
+    node.parentElement===blocks &&
+    node.nextSibling===expectedNextSibling
+  );
+  let expectedNextSibling=(liveFooter&&liveFooter.parentElement===blocks) ? liveFooter : null;
+  for(let i=targetRenderedRows.length-1;i>=0;i--){
+    const renderedNode=targetRenderedRows[i];
+    if(transparentLiveRowAlreadyPositioned(renderedNode,expectedNextSibling)){
+      expectedNextSibling=renderedNode;
+      continue;
+    }
+    if(expectedNextSibling&&expectedNextSibling.parentElement===blocks) blocks.insertBefore(renderedNode,expectedNextSibling);
+    else blocks.appendChild(renderedNode);
+    expectedNextSibling=renderedNode;
+  }
+  preserveByKey.forEach(stale=>stale.remove());
   if(wrote) _syncTransparentEventControls(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
@@ -10885,6 +11436,127 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
   }
   if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
   return wrote;
+}
+
+function _transparentLiveRowKey(node, streamId){
+  if(!node || !node.getAttribute) return '';
+  const rowId = String(node.getAttribute('data-anchor-row-id') || '').trim();
+  if(!rowId) return '';
+  const rowStreamId = String(streamId || node.getAttribute('data-anchor-stream-id') || '').trim();
+  const rowRole = String(node.getAttribute('data-anchor-row-role') || 'activity').trim();
+  const rowSource = String(node.getAttribute('data-anchor-source-event-type') || '').trim();
+  return `${rowStreamId}\u0000${rowId}\u0000${rowRole}\u0000${rowSource}`;
+}
+
+function _transparentLiveRowsCompatible(existing, candidate){
+  if(!existing || !candidate) return false;
+  return !!(
+    existing.getAttribute('data-anchor-row-id') === candidate.getAttribute('data-anchor-row-id') &&
+    existing.getAttribute('data-anchor-row-role') === candidate.getAttribute('data-anchor-row-role') &&
+    existing.getAttribute('data-anchor-source-event-type') === candidate.getAttribute('data-anchor-source-event-type')
+  );
+}
+
+function _transparentLiveRowAttributePairs(node){
+  if(!node) return [];
+  if(typeof node.getAttributeNames === 'function'){
+    return node.getAttributeNames().map(name=>[name, node.getAttribute(name)]);
+  }
+  const attrs = node.attributes;
+  if(!attrs || typeof attrs !== 'object') return [];
+  if(typeof attrs.length === 'number'){
+    const pairs = [];
+    for(let i=0;i<attrs.length;i++){
+      const attr = typeof attrs.item === 'function' ? attrs.item(i) : attrs[i];
+      if(!attr || !attr.name) continue;
+      pairs.push([attr.name, attr.value]);
+    }
+    return pairs;
+  }
+  return Object.keys(attrs).map(name=>[name, attrs[name]]);
+}
+
+function _transparentLiveRowInteractiveState(row){
+  const card = row&&row.querySelector ? row.querySelector('.tool-card,.thinking-card') : null;
+  const detail = row&&row.querySelector ? row.querySelector('.tool-card-detail') : null;
+  return {
+    expanded: !!((card&&card.classList&&card.classList.contains('open')) || (row&&row.getAttribute&&row.getAttribute('data-expanded')==='1')),
+    detailMode: detail&&detail.getAttribute ? String(detail.getAttribute('data-transparent-detail-mode') || '') : '',
+  };
+}
+
+function _rehydrateTransparentLiveRow(existing, node, preservedState){
+  if(!existing) return;
+  if(node && Object.prototype.hasOwnProperty.call(node, '_tcData')) existing._tcData = node._tcData;
+  else if(Object.prototype.hasOwnProperty.call(existing, '_tcData')) delete existing._tcData;
+  try{ delete node._tcData; }catch(_){}
+  const header = existing.querySelector ? existing.querySelector('.tool-card-header,.thinking-card-header') : null;
+  if(header){
+    if(typeof _wireTransparentHeaderToggle === 'function') _wireTransparentHeaderToggle(header);
+    if(typeof _attachCopyButton === 'function') _attachCopyButton(header);
+  }
+  const card = existing.querySelector ? existing.querySelector('.tool-card,.thinking-card') : null;
+  if(card){
+    if(typeof _setTransparentCardOpen === 'function') _setTransparentCardOpen(card, !!(preservedState&&preservedState.expanded));
+    else if(card.classList&&typeof card.classList.toggle === 'function') card.classList.toggle('open', !!(preservedState&&preservedState.expanded));
+  }
+  const detail = existing.querySelector ? existing.querySelector('.tool-card-detail') : null;
+  if(detail && preservedState && preservedState.detailMode){
+    detail.setAttribute('data-transparent-detail-mode', preservedState.detailMode);
+    detail.querySelectorAll('.transparent-detail-mode').forEach(el=>{
+      const mode = String(el.getAttribute('data-mode') || '');
+      if(el.classList && typeof el.classList.toggle === 'function') el.classList.toggle('active', mode===preservedState.detailMode);
+    });
+  }
+}
+
+function _refreshTransparentThinkingLiveRow(existing, node){
+  if(!existing || !node || !existing.querySelector || !node.querySelector) return false;
+  const existingType = String(existing.getAttribute('data-event-type') || '');
+  const nodeType = String(node.getAttribute('data-event-type') || '');
+  const existingIsThinking = existingType === 'thinking' || (existing.classList&&existing.classList.contains('transparent-thinking-event'));
+  const nodeIsThinking = nodeType === 'thinking' || (node.classList&&node.classList.contains('transparent-thinking-event'));
+  if(!existingIsThinking || !nodeIsThinking) return false;
+  const existingPre = existing.querySelector('.thinking-card-body pre');
+  const nodePre = node.querySelector('.thinking-card-body pre');
+  if(!existingPre || !nodePre) return false;
+  const nextText = String(nodePre.textContent || '');
+  if(existingPre.textContent !== nextText) existingPre.textContent = nextText;
+  const nodePreview = node.querySelector('.transparent-event-thinking-preview');
+  const previewText = nodePreview ? String(nodePreview.textContent || '') : nextText;
+  if(typeof _decorateTransparentEventRow === 'function'){
+    _decorateTransparentEventRow(existing,{type:'thinking',text:nextText,preview:previewText});
+  }
+  return true;
+}
+
+function _refreshTransparentLiveRow(existing, node){
+  if(!existing || !node || !existing.getAttribute) return node;
+  if(existing===node) return existing;
+  const preservedState = _transparentLiveRowInteractiveState(existing);
+  const pairs = _transparentLiveRowAttributePairs(node);
+  const kept = Object.create(null);
+  for(const pair of pairs){
+    const [name, value] = pair;
+    kept[String(name)] = String(value ?? '');
+  }
+  for(const [name] of _transparentLiveRowAttributePairs(existing)){
+    if(!Object.prototype.hasOwnProperty.call(kept, name)) existing.removeAttribute(name);
+  }
+  for(const pair of pairs){
+    const [name, value] = pair;
+    existing.setAttribute(name, value);
+  }
+  existing.className = node.className || '';
+  if(_refreshTransparentThinkingLiveRow(existing, node)){
+    _rehydrateTransparentLiveRow(existing, node, preservedState);
+    return existing;
+  }
+  const newHtml = node.innerHTML || '';
+  const htmlChanged = existing.innerHTML !== newHtml;
+  if(htmlChanged) existing.innerHTML = newHtml;
+  _rehydrateTransparentLiveRow(existing, node, preservedState);
+  return existing;
 }
 function _renderLiveAnchorActivitySceneForStream(streamId, sessionId, opts){
   const mode=(typeof isTransparentStream==='function'&&isTransparentStream())
@@ -12288,18 +12960,133 @@ function _restoreMessageScrollSnapshot(snapshot){
  * Chromium cannot re-anchor to the topmost row during the innerHTML=''
  * wipe-and-rebuild gap. The rAF callback restores CSS default afterward.
  */
+// Mobile scroll jump-back root fix. On touch devices #messages rests at
+// overflow-anchor:auto, so the browser's native scroll-anchoring engine
+// re-compensates scrollTop in the LAYOUT phase whenever content above the
+// viewport changes height — worklog live→settled collapse, tool-card inserts,
+// media/katex reflow, virtual-scroll topPad recompute, the STREAM_DONE
+// multi-render sequence. That compensation happens in the browser's layout step,
+// INDEPENDENT of which frame our JS wrote scrollTop in, so per-write suppression
+// (a single-rAF guard) could not reach it: the collapse/reflow lands a frame or
+// two later, after the guard already released. Real mobile flight-recorder data
+// (captured jumps with dTop -101/+350/+748/-400, call stack = rAF sampler only =
+// NO JS frame) confirmed the compensation is the browser engine, not our scroll
+// writes.
+//
+// Fix: DEFER the restore AND track CSS animations. Each call re-arms suppression
+// and cancels any pending release, so a burst of renders (STREAM_DONE fires
+// several back-to-back) shares ONE suppression window. The base window is two
+// animation frames + a settle timeout, which covers churn that is NOT a CSS
+// animation (virtual topPad recompute, image-decode, katex measure). But the
+// dominant churn is CSS max-height collapse/expand animations on worklog rows —
+// .activity-body (.34s), .tool-group-body (.3s), .tool-card-detail (.26s) — which
+// run LONGER than a fixed window; a fixed window lifts mid-animation and the rest
+// of the animation still jumps. So we also bind transitionrun/transitionend on
+// #messages: an animation start holds suppression (cancels the pending release);
+// an animation end schedules a short settle after the LAST one. Hard-capped so a
+// looping transition can't pin overflow-anchor:none forever. Desktop rests at
+// none (predicate false) → the whole guard is a no-op.
+const _MOBILE_ANCHOR_BASE_SETTLE_MS=400;
+const _MOBILE_ANCHOR_POST_TRANSITION_MS=90;
+const _MOBILE_ANCHOR_MAX_HOLD_MS=1200;
+let _mobileAnchorSuppressReleaseTimer=null;
+let _mobileAnchorSuppressRafId=0;
+let _mobileAnchorTransitionListenerBound=false;
+let _mobileAnchorSuppressArmedAt=0;
+// Independent hard-cap timer. Unlike the settle/rAF release (which the
+// transitionrun handler CANCELS to hold across an animation), this one is NEVER
+// cancelled by re-arm or by onRun — it is only ever cleared when suppression is
+// actually lifted, and re-armed to a fresh deadline on each _fixMobileScrollJank
+// call. This guarantees overflow-anchor returns to the mobile resting 'auto'
+// even if EVERY transitionend/transitioncancel is missed (animation interrupted,
+// element detached mid-transition, etc.) — the #5338 contract that mobile rests
+// at 'auto' must hold no matter what. (Gate-cert defect: the previous
+// _MOBILE_ANCHOR_MAX_HOLD_MS was only a guard clause inside onRun, so a missed
+// transitionend pinned 'none' forever.)
+let _mobileAnchorMaxHoldTimer=null;
+function _liftMobileAnchorSuppression(el){
+  if(_mobileAnchorSuppressReleaseTimer){ clearTimeout(_mobileAnchorSuppressReleaseTimer); _mobileAnchorSuppressReleaseTimer=null; }
+  if(_mobileAnchorMaxHoldTimer){ clearTimeout(_mobileAnchorMaxHoldTimer); _mobileAnchorMaxHoldTimer=null; }
+  if(_mobileAnchorSuppressRafId&&typeof cancelAnimationFrame==='function'){ cancelAnimationFrame(_mobileAnchorSuppressRafId); }
+  _mobileAnchorSuppressRafId=0;
+  // Only clear the inline value we set; a concurrent path may have legitimately
+  // re-armed it (checked via the 'none' guard).
+  if(el&&el.style&&el.style.overflowAnchor==='none') el.style.overflowAnchor='';
+}
+function _bindMobileAnchorTransitionExtender(el){
+  if(_mobileAnchorTransitionListenerBound||!el||!el.addEventListener) return;
+  _mobileAnchorTransitionListenerBound=true;
+  // Only act while suppression is actually armed (inline 'none') and within the
+  // hard cap, so we never pin overflow-anchor:none indefinitely.
+  const onRun=(e)=>{
+    if(!e||e.propertyName!=='max-height') return;
+    if(el.style.overflowAnchor!=='none') return;
+    if(_mobileAnchorSuppressArmedAt && (performance.now()-_mobileAnchorSuppressArmedAt)>_MOBILE_ANCHOR_MAX_HOLD_MS) return;
+    // An animation is running — cancel the pending SETTLE release so we stay
+    // suppressed until it ends (transitionend re-schedules the settle). The
+    // independent max-hold timer is deliberately NOT cancelled here.
+    if(_mobileAnchorSuppressReleaseTimer){ clearTimeout(_mobileAnchorSuppressReleaseTimer); _mobileAnchorSuppressReleaseTimer=null; }
+    if(_mobileAnchorSuppressRafId&&typeof cancelAnimationFrame==='function'){ cancelAnimationFrame(_mobileAnchorSuppressRafId); }
+    _mobileAnchorSuppressRafId=0;
+  };
+  const onEnd=(e)=>{
+    if(!e||e.propertyName!=='max-height') return;
+    if(el.style.overflowAnchor!=='none') return;
+    // This animation ended; settle shortly after (another may still be running,
+    // in which case its own transitionrun already cancelled this timer).
+    if(_mobileAnchorSuppressReleaseTimer){ clearTimeout(_mobileAnchorSuppressReleaseTimer); }
+    _mobileAnchorSuppressReleaseTimer=setTimeout(()=>{
+      _mobileAnchorSuppressReleaseTimer=null;
+      _liftMobileAnchorSuppression(el);
+    },_MOBILE_ANCHOR_POST_TRANSITION_MS);
+  };
+  el.addEventListener('transitionrun',onRun,{passive:true});
+  el.addEventListener('transitionstart',onRun,{passive:true});
+  el.addEventListener('transitionend',onEnd,{passive:true});
+  el.addEventListener('transitioncancel',onEnd,{passive:true});
+}
 window._fixMobileScrollJank=function _fixMobileScrollJank(){
   const el=document.getElementById('messages');
   if(!el) return;
-  // Route through the same "is the browser scroll-anchor layer active?" predicate
-  // as _suppressBrowserOverflowAnchor so the two guards can't drift (#5338 review).
-  // Desktop rests at overflow-anchor:none (predicate false) → nothing to suppress.
-  // Mobile touch devices rest at auto (predicate true) → temporarily suppress
-  // anchor re-selection during the wipe-and-rebuild gap.
-  if(!_browserOverflowAnchorActive(el)) return;
+  // Engage when the browser scroll-anchor layer is active (mobile auto), OR when
+  // WE are already holding an inline suppression from a prior call in the same
+  // burst. The predicate reads the COMPUTED value, which our own inline
+  // overflow-anchor:none flips to 'none' — so on the 2nd..Nth call of a
+  // STREAM_DONE burst the predicate would say false and short-circuit the re-arm
+  // below, collapsing the whole "consecutive renders extend the window" behavior
+  // to a single first-call window. Treat an inline 'none' WE set as still-armed
+  // so re-arm actually runs. Desktop rests at computed 'none' with EMPTY inline,
+  // so `alreadySuppressed` is false there and this stays a no-op. (Gate-cert
+  // defect: re-arm was dead code without this.)
+  const alreadySuppressed=el.style.overflowAnchor==='none';
+  if(!alreadySuppressed && !_browserOverflowAnchorActive(el)) return;
   el.style.overflowAnchor='none';
-  requestAnimationFrame(()=>{
-    if(el.style.overflowAnchor==='none') el.style.overflowAnchor='';
+  _bindMobileAnchorTransitionExtender(el);
+  _mobileAnchorSuppressArmedAt=performance.now();
+  // Re-arm: cancel any pending release so consecutive renders EXTEND, not shorten,
+  // the suppression window (the STREAM_DONE settle fires renderMessages several
+  // times back-to-back, plus a deferred postProcess reflow).
+  if(_mobileAnchorSuppressReleaseTimer){ clearTimeout(_mobileAnchorSuppressReleaseTimer); _mobileAnchorSuppressReleaseTimer=null; }
+  if(_mobileAnchorSuppressRafId&&typeof cancelAnimationFrame==='function'){ cancelAnimationFrame(_mobileAnchorSuppressRafId); }
+  _mobileAnchorSuppressRafId=0;
+  // Independent hard cap: (re)arm a release that NOTHING cancels except an actual
+  // lift, so a missed transitionend can never pin 'none' past the cap.
+  if(_mobileAnchorMaxHoldTimer){ clearTimeout(_mobileAnchorMaxHoldTimer); }
+  _mobileAnchorMaxHoldTimer=setTimeout(()=>{
+    _mobileAnchorMaxHoldTimer=null;
+    _liftMobileAnchorSuppression(el);
+  },_MOBILE_ANCHOR_MAX_HOLD_MS);
+  const rafHop=(cb)=>{ if(typeof requestAnimationFrame==='function') return requestAnimationFrame(cb); return setTimeout(cb,16); };
+  // Base window: two animation frames (paint + post-render reflow settle) THEN a
+  // settle timeout. CSS max-height animations are covered by the transitionrun/
+  // transitionend extender above; this floor covers non-animated churn.
+  _mobileAnchorSuppressRafId=rafHop(()=>{
+    _mobileAnchorSuppressRafId=rafHop(()=>{
+      _mobileAnchorSuppressReleaseTimer=setTimeout(()=>{
+        _mobileAnchorSuppressReleaseTimer=null;
+        _liftMobileAnchorSuppression(el);
+      },_MOBILE_ANCHOR_BASE_SETTLE_MS);
+    });
   });
 };
 
@@ -12321,6 +13108,22 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
   if(!restoredViaAnchor){
     const maxTop=Math.max(0,el.scrollHeight-el.clientHeight);
     const bottom=Number(snapshot.bottom);
+    // #5637: when the reader has scrolled UP into history (userUnpinned) and the
+    // semantic anchor restore failed, do NOT snap scrollTop to the captured
+    // ABSOLUTE snapshot.top. During streaming, the live activity-scene refresh
+    // fires this every tick; above-viewport height keeps changing, so the old
+    // absolute top no longer maps to the same content and the viewport is nudged
+    // backward by an amount that grows with scrollHeight. Leaving scrollTop
+    // untouched lets the browser's own scroll anchoring hold the reader's
+    // position. Pinned / near-bottom readers still get the tail-relative restore
+    // below (that path is correct and must run).
+    if(snapshot.userUnpinned===true&&snapshot.pinned!==true){
+      _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
+      _messageUserUnpinned=true;
+      _scrollPinned=false;
+      _nearBottomCount=0;
+      return;
+    }
     const target=(snapshot.pinned===true&&Number.isFinite(bottom))
       ? maxTop-Math.max(0,bottom)
       : Number(snapshot.top)||0;
@@ -12949,13 +13752,18 @@ function renderMessages(options){
       const summary=m.provider_details_label||'Provider details';
       bodyHtml += `<details class="provider-error-details"><summary>${esc(String(summary))}</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
     }
+    const recoveryHtml=(!isUser&&m._compressionRecovery) ? _compressionRecoveryHtml(m._compressionRecovery, (S.session&&S.session.session_id)||'') : '';
+    if(recoveryHtml) bodyHtml += recoveryHtml;
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
     const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
     const copyBtn  = `<button class="msg-copy-btn msg-action-btn" title="${t('copy')}" onclick="copyMsg(this)">${li('copy',13)}</button>`;
-    const forkBtn  = `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
+    const readOnlySession=typeof _isReadOnlySession==='function'
+      ? _isReadOnlySession(S.session)
+      : !!(S.session&&(S.session.read_only||S.session.is_read_only));
+    const forkBtn  = readOnlySession ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
     const ttsBtn   = !isUser ? `<button class="msg-action-btn msg-tts-btn" title="${t('tts_listen')||'Listen'}" onclick="speakMessage(this)">${li('volume-2',13)}</button>` : '';
     const tsVal=m._ts||m.timestamp;
     // _formatInServerTz handles fractional-hour offsets (India +0530 etc.)
@@ -13140,7 +13948,7 @@ function renderMessages(options){
       if((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs)) assistantThinking.set(rawIdx, thinkingText);
       else if(window._showThinking!==false) seg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
     }
-    const hasVisibleBody=!!(String(content||'').trim()||filesHtml||statusHtml);
+    const hasVisibleBody=!!(String(content||'').trim()||filesHtml||statusHtml||recoveryHtml);
     if(statusHtml){
       seg.insertAdjacentHTML('beforeend', statusHtml);
     }else if(hasVisibleBody){
@@ -16857,6 +17665,22 @@ function _showFileContextMenu(e, item){
       }
     };
     menu.appendChild(copyPathItem);
+
+    const copyRelPathItem=document.createElement('div');
+    copyRelPathItem.textContent=t('copy_relative_path');
+    copyRelPathItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
+    copyRelPathItem.onmouseenter=()=>copyRelPathItem.style.background='var(--hover-bg)';
+    copyRelPathItem.onmouseleave=()=>copyRelPathItem.style.background='';
+    copyRelPathItem.onclick=async()=>{
+      menu.remove();
+      try{
+        const rel=_normalizeWorkspaceRelPath(item.path)||item.path;
+        await _copyTextWithFallback(rel,t('path_copied'),t('path_copy_failed'));
+      }catch(err){
+        showToast(t('path_copy_failed')+(err.message||err));
+      }
+    };
+    menu.appendChild(copyRelPathItem);
   }
 
   if(isDirLike){
@@ -17073,18 +17897,25 @@ function addFiles(files){
   }
   renderTray();
 }
-async function uploadPendingFiles(){
-  if(!S.pendingFiles.length||!S.session)return[];
+function _uploadPendingFilesCurrentSession(sessionId){
+  return !!(!sessionId||(S.session&&S.session.session_id===sessionId));
+}
+async function uploadPendingFiles(options={}){
+  const opts=options||{};
+  const pendingFiles=Array.isArray(opts.files)?opts.files.filter(Boolean):[...(S.pendingFiles||[])];
+  const sessionId=String(opts.sessionId||(S.session&&S.session.session_id)||'');
+  if(!pendingFiles.length||!sessionId)return[];
+  const clearPending=!(opts&&opts.clearPending===false);
   const names=[];let failures=0;
   const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
   barWrap.classList.add('active');bar.style.width='0%';
-  const total=S.pendingFiles.length;
+  const total=pendingFiles.length;
   for(let i=0;i<total;i++){
-    const f=S.pendingFiles[i];
+    const f=pendingFiles[i];
     try{
       if(f&&f.size>MAX_UPLOAD_BYTES)throw new Error(_uploadTooLargeMessage(f));
       const fd=new FormData();
-      fd.append('session_id',S.session.session_id);fd.append('file',f,f.name);
+      fd.append('session_id',sessionId);fd.append('file',f,f.name);
       const isArchive=_ARCHIVE_EXTS.test(f.name);
       const url=new URL(isArchive?'api/upload/extract':'api/upload',document.baseURI||location.href).href;
       const res=await fetch(url,{method:'POST',credentials:'include',body:fd});
@@ -17094,7 +17925,7 @@ async function uploadPendingFiles(){
       if(data.error)throw new Error(data.error);
       if(isArchive){
         names.push({name: data.dest, path: data.dest, extracted: data.extracted});
-        if(typeof loadDir==='function')loadDir(S.currentDir||'.');
+        if(typeof loadDir==='function'&&_uploadPendingFilesCurrentSession(sessionId))loadDir(S.currentDir||'.');
       }else{
         names.push({name: data.filename, path: data.path, mime: data.mime, size: data.size, is_image: !!data.is_image});
       }
@@ -17102,7 +17933,8 @@ async function uploadPendingFiles(){
     bar.style.width=`${Math.round((i+1)/total*100)}%`;
   }
   barWrap.classList.remove('active');bar.style.width='0%';
-  S.pendingFiles=[];renderTray();
+  if(clearPending&&_uploadPendingFilesCurrentSession(sessionId)){S.pendingFiles=[];renderTray();}
+  else if(typeof renderTray==='function'&&_uploadPendingFilesCurrentSession(sessionId))renderTray();
   if(failures===total&&total>0)throw new Error(t('all_uploads_failed',total));
   // Show extraction summary
   const extracted=names.filter(n=>n.extracted);
