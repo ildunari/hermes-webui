@@ -13418,6 +13418,36 @@ function _assistantTurnAnchorSettledFinalAnswer(message, content, context){
     return null;
   }
 }
+// Re-anchor a pinned/tail-following reader to the settled bottom after a full
+// renderMessages() rebuild, eliminating the one-frame mid-stream jitter. MUST be scheduled
+// in a MICROTASK from the end of renderMessages (see the queueMicrotask call site), NOT run
+// synchronously. Why: the mid-stream re-render bug is that renderMessages wipes #msgInner
+// then rebuilds, and the pinned tail-follow path (scrollIfPinned → scrollToBottom) writes
+// scrollTop while still INSIDE the render sync stack, where the browser reports a TRANSIENT
+// scrollHeight a few px short of the settled value (layout is batched — every geometry read
+// inside the sync stack returns the mid-settle height). So scrollToBottom lands scrollTop a
+// little HIGH (short of the true tail); that intermediate is painted this frame and the
+// settle rAF corrects it the next frame → a fast ~1-row back-and-forth bounce (~82px). A
+// microtask runs AFTER the sync stack unwinds (layout has flushed, so scrollHeight/clientHeight
+// are the settled values) but BEFORE the browser paints — so writing the now-correct settled
+// max here lands the tail exactly and the short intermediate never reaches the screen. Only
+// fires for a pre-wipe tail-follower left short of the settled max, so an unpinned reader
+// parked in history is never moved (orthogonal to the unpinned jump-back class). The
+// _programmaticScroll latch (armed at the wipe) keeps the scroll listener from misreading
+// this write as a manual unpin. Idempotent: a no-op once scrollTop already equals the max.
+function _reanchorPinnedTailAfterRender(wasNearTail){
+  if(!wasNearTail) return;
+  const el=$('messages');
+  if(!el) return;
+  const settledMax=Math.max(0, el.scrollHeight-el.clientHeight);
+  if(el.scrollTop < settledMax-1){
+    _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
+    el.scrollTop=settledMax;
+    _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
+    _nearBottomCount=2;
+    _scrollPinned=true;
+  }
+}
 function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
   // Terminal stream renders can happen after S.activeStreamId is cleared.
   // In that case, preserveScroll asks the normal pin-state helper to decide:
@@ -13611,6 +13641,20 @@ function renderMessages(options){
   // Mobile scroll-jank fix: temporarily disable overflow-anchor so Chromium
   // cannot re-anchor to the topmost row during the DOM wipe-and-rebuild gap.
   if(window._fixMobileScrollJank) window._fixMobileScrollJank();
+  // Capture whether the reader was at/near the tail BEFORE the wipe. A tail-follower
+  // hit by a mid-stream re-render gets a one-frame jitter: the wipe+rebuild lands the
+  // sync scrollTop write against a transient layout whose above-viewport height is a
+  // few px short of the settled value, so the browser clamps scrollTop a little high;
+  // the settle rAF corrects it the next frame, producing a fast ~1-row back-and-forth
+  // bounce. We remember the pre-wipe near-tail state here (geometry, not closure pin
+  // flags — the wipe's clamp scroll event can transiently perturb those) so the tail
+  // of renderMessages can re-anchor to the settled bottom before the intermediate is
+  // painted. See _reanchorPinnedTailAfterRender + its queueMicrotask call site.
+  const _preWipeNearTail=(()=>{
+    const _m=$('messages');
+    if(!_m) return false;
+    return (_m.scrollHeight-_m.scrollTop-_m.clientHeight)<=8;
+  })();
   // The DOM wipe can briefly collapse #msgInner to zero height, causing the
   // browser to clamp #messages.scrollTop to 0 and emit a scroll event.  That
   // event is a render artifact, not user intent; if the scroll listener sees it
@@ -14945,6 +14989,20 @@ function renderMessages(options){
     }
   }
   _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
+  // Kill the pinned/tail-follower mid-stream jitter. Schedule the re-anchor in a MICROTASK,
+  // not synchronously: inside this render sync stack the browser still reports a transient
+  // scrollHeight (layout is batched), so a synchronous re-anchor would read the SAME short
+  // value scrollToBottom already clamped against and be a no-op. The microtask runs after the
+  // stack unwinds (scrollHeight has flushed to the settled value) but before the browser
+  // paints this frame, so writing the settled max lands the tail exactly and the ~1-row high
+  // intermediate never reaches the screen. Only re-anchors a pre-wipe tail-follower left short
+  // of the settled max — an unpinned reader parked in history is never moved (orthogonal to
+  // the unpinned jump-back class). See _reanchorPinnedTailAfterRender for the full rationale.
+  // (typeof guards mirror the _deferClearProgrammaticScroll call below so standalone
+  // renderMessages() test harnesses that don't define these helpers still run.)
+  if(typeof queueMicrotask==='function' && typeof _reanchorPinnedTailAfterRender==='function'){
+    queueMicrotask(()=>_reanchorPinnedTailAfterRender(_preWipeNearTail));
+  }
   _recycleStash.clear();
   if(typeof _deferClearProgrammaticScroll==='function') _deferClearProgrammaticScroll(160);
 }

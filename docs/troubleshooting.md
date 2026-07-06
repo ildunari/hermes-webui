@@ -159,6 +159,24 @@ turn in the exhausted session instead of being blocked with recovery guidance.
 
 ---
 
+## Installed PWA opens to a blank screen after an update
+
+**Symptom.** The installed PWA or home-screen app opens to a blank screen after a WebUI update, while the same URL often works again in a normal browser tab.
+
+**Why.** Reverse proxies are supported, but proxy basic auth can challenge the same-origin `sw.js`, manifest, or versioned `static/*` fetches the installed app needs while its service worker updates the shell.
+
+**Diagnostic.**
+
+1. Open the same WebUI URL in a regular browser tab and confirm whether it loads there.
+2. Check reverse-proxy logs for `401` responses on `/sw.js`, `/manifest.json`, or versioned `/static/*` assets during the update.
+3. Temporarily remove proxy basic auth and use WebUI's built-in password. If the blank screen stops after the next update, the proxy auth challenge was the trigger.
+
+**Fix.** Prefer WebUI's own password for installed PWAs. If you keep proxy basic auth, configure it so the same-origin service-worker and shell update fetches can complete. If the installed shell is already blank, clear site data for the Hermes origin, then reopen or reinstall the PWA after that site-scoped cleanup.
+
+**When to file a bug.** File a WebUI bug if the blank screen still reproduces without proxy basic auth, or after the proxy allows the same-origin service-worker and shell update fetches through.
+
+---
+
 ## Other troubleshooting
 
 This document grows over time. If a recurring failure mode isn't covered here yet, add it via PR. The format for each entry: **Symptom → Why → Diagnostic commands → Fix → When to file a bug**.

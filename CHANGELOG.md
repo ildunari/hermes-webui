@@ -3,6 +3,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **No more mid-stream scroll jitter while following a streaming reply.** When you were pinned to the bottom of a live-streaming answer, every mid-stream re-render (tool completion, activity-scene refresh, clarify echo) caused a brief ~1-row up-and-back bounce, so a long streaming reply visibly shuddered. The tail is now re-anchored to the settled bottom in a microtask after the re-render (after layout flushes, before paint), so the short intermediate never reaches the screen. Only a reader already following the tail is affected — an unpinned reader parked up in history is never moved. Thanks @allenliang2022. (#5685)
+
+### Documentation
+
+- **Documented the reverse-proxy basic-auth caveat for installed PWAs.** README, onboarding, and troubleshooting now explain that proxy basic auth can block the same-origin service-worker/shell update fetches an installed PWA needs (leaving it on a blank screen after an update), and give recovery steps — prefer WebUI's built-in password, or scope proxy auth so `sw.js`/manifest/shell requests complete. Thanks @rodboev. (#5673, #2781)
+
 ### Internal
 
 - **Shared layout-assertion helpers for browser tests.** Added `tests/_layout_helpers.py` (a reusable Playwright layout-lint: overlap / clipping / container-escape / degenerate-box / raw-i18n-key / a11y checks) plus its own coverage, so future per-issue browser tests can assert real rendered geometry without reimplementing the checks each time. Test-only; no production code changes. Thanks @rodboev. (#5668, #5665)
