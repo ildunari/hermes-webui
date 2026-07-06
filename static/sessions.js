@@ -1322,6 +1322,7 @@ async function loadSession(sid){
   // Mark this session as the in-flight load. Subsequent loadSession() calls
   // will overwrite this; stale awaits use the mismatch to bail out (#1060).
   _loadingSessionId = sid;
+  if(currentSid!==sid&&typeof _uploadPendingFilesSyncProgressForSession==='function')_uploadPendingFilesSyncProgressForSession(sid);
   // Reset scroll state for fresh session navigation — the reader expects to
   // land at the bottom of the new transcript, not wherever a stale unpin flag
   // from a prior session or a stray touch event during loading would place them.
@@ -2010,6 +2011,16 @@ async function _openSidebarSession(session, loadOpts={}){
 
 function _isReadOnlySession(session) {
   return !!(session && (session.read_only || session.is_read_only));
+}
+
+function _isBranchableReadOnlySession(session) {
+  if (!_isReadOnlySession(session)) return false;
+  const sources = [
+    session && session.source_tag,
+    session && session.raw_source,
+    session && session.source,
+  ].map(v => String(v || '').trim().toLowerCase());
+  return sources.includes('cron');
 }
 
 function _sourceKeyForSession(session) {

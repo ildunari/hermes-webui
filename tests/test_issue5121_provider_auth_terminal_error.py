@@ -455,6 +455,44 @@ def test_non_auth_silent_failure_still_uses_no_response(tmp_path, monkeypatch):
     assert saved.messages[-1]["_error"] is True
 
 
+def test_live_settlement_empty_hint_does_not_append_empty_emphasis(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "empty_hint_failure",
+        "stream_empty_hint_failure",
+        pending_user_message="Please fail plainly",
+    )
+
+    class EmptyHintFailureAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            return {
+                "status": "failed",
+                "messages": list(kwargs.get("conversation_history") or []),
+                "error": "synthetic hard failure",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_empty_hint_failure",
+        EmptyHintFailureAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("empty_hint_failure")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected apperror for generic terminal failure"
+    assert apperrors[-1]["type"] == "error"
+    assert apperrors[-1].get("hint") in (None, "")
+
+    error_content = saved.messages[-1]["content"]
+    assert saved.messages[-1]["_error"] is True
+    assert error_content == "**Error:** synthetic hard failure"
+    assert "\n\n**" not in error_content
+    assert not error_content.endswith("**")
+
+
 def test_completed_assistant_answer_with_stale_partial_flag_settles_done(tmp_path, monkeypatch):
     session = _prepare_session(
         "completed_answer_stale_partial",

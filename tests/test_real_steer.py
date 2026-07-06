@@ -23,6 +23,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.helpers import source_between as _source_between
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 
@@ -79,14 +81,6 @@ def _captured_status(handler):
     calls = handler.send_response.call_args_list
     assert calls, "no status was sent"
     return calls[-1][0][0]
-
-
-def _source_between(src, start_marker, end_marker):
-    start = src.find(start_marker)
-    assert start >= 0, f"{start_marker} not found"
-    end = src.find(end_marker, start)
-    assert end > start, f"{end_marker} not found after {start_marker}"
-    return src[start:end]
 
 
 # ── Backend: the /api/chat/steer endpoint ─────────────────────────────────
@@ -327,6 +321,119 @@ class TestFrontendWiring:
             "post-await tray/DOM mutations must be guarded by the captured owner session"
         )
 
+    def test_file_steer_upload_status_and_indicator_are_owner_scoped(self):
+        steer_helpers = _source_between(
+            self.cmds,
+            "function _steerOwnerIsCurrent",
+            "\nasync function cmdTitle",
+        )
+        try_body = _source_between(self.cmds, "async function _trySteer(", "\nasync function cmdTitle")
+        assert "function _steerSetComposerStatusForOwner" in steer_helpers
+        assert "_steerSetComposerStatusForOwner(ownerSid,t('uploading')||'Uploading…')" in steer_helpers
+        assert "_steerSetComposerStatusForOwner(ownerSid,'')" in steer_helpers
+        assert "function _steerIndicatorText" in steer_helpers
+        assert "_showSteerIndicator(_steerIndicatorText(originalMsg,pendingFilesSnapshot))" in try_body, (
+            "visible steer indicator must use original text or a file-only display label, not attachment tool instructions"
+        )
+        assert "_showSteerIndicator(steerText)" not in try_body
+
+    def test_file_steer_indicator_omits_attachment_tool_note(self):
+        import json
+        import shutil
+        import subprocess
+        import textwrap
+
+        node = shutil.which("node")
+        if not node:  # pragma: no cover
+            pytest.skip("node not available")
+        assert node is not None
+
+        steer_src = _source_between(
+            self.cmds,
+            "function _steerUploadedAttachmentPaths",
+            "\nasync function cmdTitle",
+        )
+        script = textwrap.dedent(
+            f"""
+            const assert = require('assert');
+            let S = {{session:{{session_id:'A'}}, pendingFiles:[{{name:'a.pdf'}}]}};
+            let apiPayload = null;
+            let indicatorText = null;
+            function t(k){{return k;}}
+            function $(id){{return {{value:'', classList:{{add(){{}}, remove(){{}}}}, style:{{}}}};}}
+            function setComposerStatus(){{}}
+            function showToast(){{}}
+            function renderTray(){{}}
+            function _showSteerIndicator(text){{indicatorText = text;}}
+            function _showSteerRecovery(){{}}
+            function _clearComposerDraft(){{}}
+            async function uploadPendingFiles(){{return [{{path:'/tmp/a.pdf'}}];}}
+            async function api(url, options){{
+              assert.strictEqual(url, '/api/chat/steer');
+              apiPayload = JSON.parse(options.body);
+              return {{accepted:true}};
+            }}
+            eval({json.dumps(steer_src)});
+            (async()=>{{
+              const delivered = await _trySteer('hint', false);
+              assert.strictEqual(delivered, true);
+              assert.strictEqual(indicatorText, 'hint');
+              assert.ok(apiPayload.text.includes('[Attached files for this steer: /tmp/a.pdf]'));
+              assert.ok(!indicatorText.includes('Attached files'));
+              assert.ok(!indicatorText.includes('file tools/read_file'));
+            }})().catch(err=>{{console.error(err); process.exit(1);}});
+            """
+        )
+        subprocess.run([node, "-e", script], check=True, capture_output=True, text=True)
+
+    def test_attachment_only_steer_indicator_uses_file_label(self):
+        import json
+        import shutil
+        import subprocess
+        import textwrap
+
+        node = shutil.which("node")
+        if not node:  # pragma: no cover
+            pytest.skip("node not available")
+        assert node is not None
+
+        steer_src = _source_between(
+            self.cmds,
+            "function _steerUploadedAttachmentPaths",
+            "\nasync function cmdTitle",
+        )
+        script = textwrap.dedent(
+            f"""
+            const assert = require('assert');
+            let S = {{session:{{session_id:'A'}}, pendingFiles:[{{name:'a.pdf'}}]}};
+            let apiPayload = null;
+            let indicatorText = null;
+            function t(k){{return k;}}
+            function $(id){{return {{value:'', classList:{{add(){{}}, remove(){{}}}}, style:{{}}}};}}
+            function setComposerStatus(){{}}
+            function showToast(){{}}
+            function renderTray(){{}}
+            function _showSteerIndicator(text){{indicatorText = text;}}
+            function _showSteerRecovery(){{}}
+            function _clearComposerDraft(){{}}
+            async function uploadPendingFiles(){{return [{{path:'/tmp/a.pdf'}}];}}
+            async function api(url, options){{
+              assert.strictEqual(url, '/api/chat/steer');
+              apiPayload = JSON.parse(options.body);
+              return {{accepted:true}};
+            }}
+            eval({json.dumps(steer_src)});
+            (async()=>{{
+              const delivered = await _trySteer('', false);
+              assert.strictEqual(delivered, true);
+              assert.strictEqual(indicatorText, 'Attached files: a.pdf');
+              assert.ok(apiPayload.text.includes('[Attached files for this steer: /tmp/a.pdf]'));
+              assert.ok(!indicatorText.includes('file tools/read_file'));
+            }})().catch(err=>{{console.error(err); process.exit(1);}});
+            """
+        )
+        subprocess.run([node, "-e", script], check=True, capture_output=True, text=True)
+
     def test_file_steer_targets_captured_session_when_user_switches_mid_upload(self):
         import json
         import shutil
@@ -410,6 +517,94 @@ class TestFrontendWiring:
         assert "fd.append('session_id',sessionId)" in ui
         assert "if(clearPending&&_uploadPendingFilesCurrentSession(sessionId)){S.pendingFiles=[];renderTray();}" in ui
         assert "else if(typeof renderTray==='function'&&_uploadPendingFilesCurrentSession(sessionId))renderTray();" in ui
+
+    def test_upload_pending_files_progress_bar_is_session_scoped(self):
+        ui = (Path(__file__).parent.parent / "static" / "ui.js").read_text(encoding="utf-8")
+        progress_helper = _source_between(
+            ui,
+            "const _uploadPendingFilesProgressBySession",
+            "\nasync function uploadPendingFiles",
+        )
+        upload_body = ui[ui.index("async function uploadPendingFiles") :]
+        sessions = (Path(__file__).parent.parent / "static" / "sessions.js").read_text(encoding="utf-8")
+        load_body = _source_between(sessions, "async function loadSession", "\nfunction _isMessagingSession")
+        assert "_uploadPendingFilesSyncProgressForSession(sid)" in load_body
+        assert "_uploadPendingFilesProgressBySession.set(owner,{percent:clamped})" in progress_helper
+        assert "function _uploadPendingFilesSyncProgressForSession" in progress_helper
+        assert "if(!_uploadPendingFilesCurrentSession(sessionId)){" in progress_helper
+        assert "barWrap.dataset.uploadSessionId=owner" in progress_helper
+        assert "activeForOwner" in progress_helper
+        assert "barWrap.classList.remove('active')" in progress_helper
+        assert "_uploadPendingFilesUpdateProgress(sessionId,0)" in upload_body
+        assert "_uploadPendingFilesUpdateProgress(sessionId,Math.round((i+1)/total*100))" in upload_body
+        assert "_uploadPendingFilesUpdateProgress(sessionId,null)" in upload_body
+        assert "barWrap.classList.add('active');bar.style.width='0%';" not in upload_body
+        assert "barWrap.classList.remove('active');bar.style.width='0%';" not in upload_body
+
+    def test_upload_progress_bar_hides_on_switch_and_reappears_on_owner_return(self):
+        import json
+        import shutil
+        import subprocess
+        import textwrap
+
+        node = shutil.which("node")
+        if not node:  # pragma: no cover
+            pytest.skip("node not available")
+        assert node is not None
+
+        ui = (Path(__file__).parent.parent / "static" / "ui.js").read_text(encoding="utf-8")
+        progress_src = _source_between(
+            ui,
+            "const _uploadPendingFilesProgressBySession",
+            "\nasync function uploadPendingFiles",
+        )
+        script = textwrap.dedent(
+            f"""
+            const assert = require('assert');
+            let S = {{session:{{session_id:'A'}}}};
+            const bar = {{style:{{width:''}}}};
+            const barWrap = {{
+              dataset: {{}},
+              active: false,
+              classList: {{
+                add(cls){{ if(cls === 'active') barWrap.active = true; }},
+                remove(cls){{ if(cls === 'active') barWrap.active = false; }},
+              }},
+            }};
+            function $(id){{
+              if(id === 'uploadBar') return bar;
+              if(id === 'uploadBarWrap') return barWrap;
+              return null;
+            }}
+            eval({json.dumps(progress_src)});
+            _uploadPendingFilesUpdateProgress('A', 0);
+            assert.strictEqual(barWrap.active, true);
+            assert.strictEqual(bar.style.width, '0%');
+            assert.strictEqual(barWrap.dataset.uploadSessionId, 'A');
+
+            S.session = {{session_id:'B'}};
+            _uploadPendingFilesSyncProgressForSession('B');
+            assert.strictEqual(barWrap.active, false);
+            assert.strictEqual(bar.style.width, '0%');
+            assert.strictEqual(barWrap.dataset.uploadSessionId, undefined);
+
+            _uploadPendingFilesUpdateProgress('A', 50);
+            assert.strictEqual(barWrap.active, false);
+            assert.strictEqual(bar.style.width, '0%');
+
+            S.session = {{session_id:'A'}};
+            _uploadPendingFilesSyncProgressForSession('A');
+            assert.strictEqual(barWrap.active, true);
+            assert.strictEqual(bar.style.width, '50%');
+            assert.strictEqual(barWrap.dataset.uploadSessionId, 'A');
+
+            _uploadPendingFilesUpdateProgress('A', null);
+            assert.strictEqual(barWrap.active, false);
+            assert.strictEqual(bar.style.width, '0%');
+            assert.strictEqual(barWrap.dataset.uploadSessionId, undefined);
+            """
+        )
+        subprocess.run([node, "-e", script], check=True, capture_output=True, text=True)
 
     def test_pending_steer_leftover_listener(self):
         """Frontend must listen for pending_steer_leftover SSE events and queue them."""

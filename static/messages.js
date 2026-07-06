@@ -2578,10 +2578,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _streamFadeLastArrivalMs=0;
   let _streamFadeArrivalWps=0;
   let _streamFadeLatestAnimationEndAt=0;
-  let _streamFadeAppendOffset=0;
   let _streamFadeVisibleWords=0;
   let _streamFadeHoldUntilMs=0;
-  let _streamFadeCurrentMs=200;
+  let _streamFadeCurrentMs=620;
+  let _streamFadeDomText='';
   let _streamFadeReduceMotionMql=null;
   let _streamFadeReduceMotion=false;
   let _streamFadeReduceMotionOnChange=null;
@@ -2592,11 +2592,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     ? Number((INFLIGHT[activeSid]&&INFLIGHT[activeSid].lastRunJournalSeq)||0)
     : 0;
   let _lastRunJournalEventId='';
-  const _STREAM_FADE_MS=200;
-  const _STREAM_FADE_MAX_MS=350;
-  const _STREAM_FADE_STAGGER_MS=16;
-  const _STREAM_FADE_DONE_MAX_MS=320;
-  const _STREAM_FADE_DONE_DRAIN_MAX_MS=900;
+  const _STREAM_FADE_MS=620;
+  const _STREAM_FADE_MAX_MS=900;
+  const _STREAM_FADE_DONE_MAX_MS=1000;
+  const _STREAM_FADE_DONE_DRAIN_MAX_MS=1400;
   const _anchorApi=(typeof window!=='undefined'&&window.HermesAssistantTurnAnchors)
     ? window.HermesAssistantTurnAnchors
     : null;
@@ -3701,21 +3700,24 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _anchorProseIncrementalNode(key, text){
     if(!window.smd || !key || typeof _safeSmdRenderer!=='function') return null;
     const value=String(text||'');
+    const fade=typeof _shouldUseLiveProseFade==='function'&&_shouldUseLiveProseFade();
     try{
       let st=_anchorProseSmdCache.get(key);
       // Self-heal desyncs (edit/sanitize made the text no longer a pure append):
       // rebuild the parser+node from scratch, mirroring _smdWrite's guard.
       if(st && st.writtenText && !value.startsWith(st.writtenText)) st=null;
+      if(st && st.fade!==fade) st=null;
       if(!st){
         const node=document.createElement('div');
         node.className='assistant-segment';
         node.setAttribute('data-anchor-scene-prose','1');
         const body=document.createElement('div');
         body.className='msg-body';
+        if(body.classList) body.classList.toggle('stream-fade-active',fade);
         node.appendChild(body);
-        const baseRenderer=_safeSmdRenderer(body);
+        const baseRenderer=fade?_streamFadeRenderer(body):_safeSmdRenderer(body);
         const renderer=_smdRendererWithoutUnderscoreEmphasis(baseRenderer);
-        st={node,parser:window.smd.parser(renderer),writtenText:''};
+        st={node,parser:window.smd.parser(renderer),writtenText:'',fade};
         _anchorProseSmdCache.set(key,st);
         // Bound memory across turns: keys embed the stream id, so stale entries
         // from finished streams age out here.
@@ -3724,6 +3726,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(oldest!==key) _anchorProseSmdCache.delete(oldest);
         }
       }
+      const body=st.node&&st.node.querySelector&&st.node.querySelector('.msg-body');
+      if(body&&body.classList) body.classList.toggle('stream-fade-active',fade);
       const delta=value.slice(st.writtenText.length);
       if(delta){
         window.smd.parser_write(st.parser,delta);
@@ -4146,10 +4150,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _streamFadeLastArrivalMs=0;
     _streamFadeArrivalWps=0;
     _streamFadeLatestAnimationEndAt=0;
-    _streamFadeAppendOffset=0;
     _streamFadeVisibleWords=0;
     _streamFadeHoldUntilMs=0;
     _streamFadeCurrentMs=_STREAM_FADE_MS;
+    _streamFadeDomText='';
   }
   function _cancelAnimationFramePendingStreamRender(){
     if(_pendingRafHandle===null) return;
@@ -4160,6 +4164,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   function _shouldUseStreamFade(){
     return window._fadeTextEffect===true;
+  }
+  function _shouldUseTransparentStreamFade(){
+    return typeof isTransparentStream==='function'&&isTransparentStream();
+  }
+  function _shouldUseLiveProseFade(){
+    return !_streamFadeReduceMotionEnabled() && (_shouldUseStreamFade() || _shouldUseTransparentStreamFade());
   }
   function _streamFadeSkipNode(node){
     if(!node||node.nodeType!==1) return false;
@@ -4219,13 +4229,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const span=document.createElement('span');
         span.className='stream-fade-word is-new';
         const fadeMs=_streamFadeCurrentMs||_STREAM_FADE_MS;
-        const delayMs=_streamFadeAppendOffset*_STREAM_FADE_STAGGER_MS;
-        span.style.animationDelay=delayMs+'ms';
         if(fadeMs!==_STREAM_FADE_MS) span.style.setProperty('--stream-fade-ms',fadeMs+'ms');
         span.textContent=match[1];
         frag.appendChild(span);
-        _streamFadeAppendOffset+=1;
-        _streamFadeLatestAnimationEndAt=Math.max(_streamFadeLatestAnimationEndAt,appendStartedAt+delayMs+fadeMs);
+        _streamFadeLatestAnimationEndAt=Math.max(_streamFadeLatestAnimationEndAt,appendStartedAt+fadeMs);
         if(match[2]) frag.appendChild(document.createTextNode(match[2]));
         last=match.index+match[0].length;
         changed=true;
@@ -4288,6 +4295,39 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _streamFadeWordCountOf(text){
     const m=String(text||'').match(/\S+/g);
     return m?m.length:0;
+  }
+  function _streamFadeAppendText(el, text){
+    if(!el) return;
+    const value=String(text||'');
+    if(!value) return;
+    const reduceMotion=_streamFadeReduceMotionEnabled();
+    const frag=document.createDocumentFragment();
+    const wordRe=/(\S+)(\s*)/g;
+    const appendStartedAt=performance.now();
+    let last=0, match, changed=false;
+    while((match=wordRe.exec(value))){
+      if(match.index>last) frag.appendChild(document.createTextNode(value.slice(last,match.index)));
+      if(reduceMotion){
+        frag.appendChild(document.createTextNode(match[1]));
+      }else{
+        const span=document.createElement('span');
+        span.className='stream-fade-word is-new';
+        const fadeMs=_streamFadeCurrentMs||_STREAM_FADE_MS;
+        if(fadeMs!==_STREAM_FADE_MS) span.style.setProperty('--stream-fade-ms',fadeMs+'ms');
+        span.textContent=match[1];
+        frag.appendChild(span);
+        _streamFadeLatestAnimationEndAt=Math.max(_streamFadeLatestAnimationEndAt,appendStartedAt+fadeMs);
+      }
+      if(match[2]) frag.appendChild(document.createTextNode(match[2]));
+      last=match.index+match[0].length;
+      changed=true;
+    }
+    if(!changed){
+      frag.appendChild(document.createTextNode(value));
+    }else if(last<value.length){
+      frag.appendChild(document.createTextNode(value.slice(last)));
+    }
+    el.appendChild(frag);
   }
   function _streamFadePauseAfter(text, paragraphBreakIndex){
     if(paragraphBreakIndex>=0) return 90;
@@ -4392,17 +4432,36 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const next=_streamFadeNextText(displayText);
     if(!next.changed) return next.caughtUp;
     assistantBody.classList.add('stream-fade-active');
-    if(!_smdParser&&window.smd){
-      if(_smdReconnect){assistantBody.innerHTML='';_smdReconnect=false;}
-      _smdNewParser(assistantBody,true);
+    if(!_shouldUseTransparentStreamFade()){
+      if(!_smdParser&&window.smd){
+        if(_smdReconnect){assistantBody.innerHTML='';_smdReconnect=false;}
+        _smdNewParser(assistantBody,true);
+      }
+      if(_smdParser){
+        _smdWrite(next.text,true);
+      }else{
+        assistantBody.innerHTML=renderMd ? renderMd(next.text||'') : esc(next.text||'');
+        _sanitizeSmdLinks(assistantBody);
+      }
+      _streamFadeDomText=String(next.text||'');
+      return next.caughtUp;
     }
     if(_smdParser){
-      _streamFadeAppendOffset=0;
-      _smdWrite(next.text,true);
-    }else{
-      assistantBody.innerHTML=renderMd ? renderMd(next.text||'') : esc(next.text||'');
-      _sanitizeSmdLinks(assistantBody);
+      _smdEndParser();
+      assistantBody.textContent='';
+      _streamFadeDomText='';
     }
+    _smdReconnect=false;
+    if(!_streamFadeDomText&&assistantBody.textContent){
+      assistantBody.textContent='';
+    }
+    if(!String(next.text||'').startsWith(_streamFadeDomText)){
+      assistantBody.textContent='';
+      _streamFadeDomText='';
+    }
+    const delta=String(next.text||'').slice(_streamFadeDomText.length);
+    if(delta) assistantBody.appendChild(document.createTextNode(delta));
+    _streamFadeDomText=String(next.text||'');
     return next.caughtUp;
   }
   function _streamFadeCurrentDisplayText(){
@@ -4418,6 +4477,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!assistantBody){onDone();return;}
       const target=_streamFadeCurrentDisplayText();
       const caughtUp=_renderStreamingFadeMarkdown(target);
+      const anchorProcessText=_streamFadeDomText||target;
+      if(anchorProcessText) _upsertAnchorProcessProse(anchorProcessText);
       scrollIfPinned();
       if(caughtUp){
         // parser_end can flush pending markdown text; include that final text in
@@ -4792,12 +4853,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const parsed=_cachedParsed&&_cachedParsedText===assistantText&&_cachedParsedReasoning===liveReasoningText ? _cachedParsed : _parseStreamState();
       _cachedParsed=null;
       _renderLiveThinking(parsed);
+      const displayText = segmentStart===0
+        ? parsed.displayText                          // first segment: uses think-tag stripping
+        : _stripXmlToolCalls(assistantText.slice(segmentStart));
+      let anchorProcessText=displayText;
       if(assistantBody){
-        const displayText = segmentStart===0
-          ? parsed.displayText                          // first segment: uses think-tag stripping
-          : _stripXmlToolCalls(assistantText.slice(segmentStart));
-        if(_shouldUseStreamFade()){
+        if(_shouldUseLiveProseFade()){
           const caughtUp=_renderStreamingFadeMarkdown(displayText);
+          anchorProcessText=_streamFadeDomText||'';
           if(!caughtUp&&!_streamFinalized){
             setTimeout(()=>_scheduleRender(), 33);
           }
@@ -4822,13 +4885,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             assistantBody.innerHTML = renderMd ? renderMd(fallbackText) : esc(fallbackText);
           }
         }
-        _upsertAnchorProcessProse(displayText);
         if(typeof _syncLiveWorklogReasonsForAnchor==='function') _syncLiveWorklogReasonsForAnchor(assistantRow, displayText);
       }
+      if(anchorProcessText) _upsertAnchorProcessProse(anchorProcessText);
       scrollIfPinned();
       _throttledSnapshotLiveTurn();
     };
-    const frameIntervalMs=_shouldUseStreamFade()?33:66;
+    const frameIntervalMs=_shouldUseLiveProseFade()?33:66;
     if(sinceLastMs>=frameIntervalMs){
       _pendingRafHandle=requestAnimationFrame(_doRender);
     } else {
@@ -5521,7 +5584,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         });
         sendBrowserNotification('Response complete',_completionPreview||'Task finished',{forceHidden:_wasEverBackgrounded,sid:activeSid});
       };
-      if(_shouldUseStreamFade()&&assistantBody){
+      if(_shouldUseLiveProseFade()&&assistantBody){
         _cancelAnimationFramePendingStreamRender();
         _drainStreamFadeBeforeDone(_finishDone);
         return;

@@ -7625,14 +7625,28 @@ def _load_branch_source_or_refuse(handler, sid: str):
         bad(handler, "Subagent sessions are view-only and cannot be branched from WebUI", 400)
         return None
     try:
-        return get_session(sid)
+        source = get_session(sid)
     except KeyError:
         _foreign_session, _reason = _claim_or_synthesize_cli_session(sid)
-        if _reason == "not_claimable":
-            bad(handler, "Read-only sessions cannot be branched from WebUI", 403)
-            return None
+        _source_kind = str((getattr(_foreign_session, "source_tag", None) or getattr(_foreign_session, "raw_source", None) or getattr(_foreign_session, "source", None) or "")).strip().lower() if _foreign_session is not None else ""
+        if _reason == "not_claimable" and _foreign_session is not None and _source_kind == "cron":
+            _foreign_session._branch_source_readonly = True; return _foreign_session
+        if _reason == "not_claimable": bad(handler, "Read-only sessions cannot be branched from WebUI", 403); return None
         bad(handler, "Session not found", 404)
         return None
+    # A PERSISTED (stored) session can also be read-only (e.g. a cron-owned or
+    # messaging-sourced sidecar). Apply the SAME read-only branch gate as the
+    # synthesized path: allow forking only a canonical-cron read-only source
+    # (server-authoritative source kind, not the id prefix), marking it so the fork
+    # never .save()s the read-only source; refuse every other read-only source.
+    if bool(getattr(source, "read_only", False)):
+        _source_kind = str((getattr(source, "source_tag", None) or getattr(source, "raw_source", None) or getattr(source, "source", None) or "")).strip().lower()
+        if _source_kind == "cron":
+            source._branch_source_readonly = True
+            return source
+        bad(handler, "Read-only sessions cannot be branched from WebUI", 403)
+        return None
+    return source
 
 
 def _resolve_cli_import_metadata(session_id: str, *, requested_profile=None, allow_all_profiles: bool = False) -> dict:
@@ -14086,7 +14100,7 @@ def handle_post(handler, parsed) -> bool:
         # /api/session so frontend keep_count values from merged messaging
         # transcripts do not silently become full sidecar copies.
         try:
-            source.save()
+            if not getattr(source, "_branch_source_readonly", False): source.save()
         except Exception:
             pass
         cli_meta = _lookup_cli_session_metadata(source.session_id) if _session_requires_cli_metadata_lookup(source) else {}

@@ -11,6 +11,8 @@ Issue: #720 (configurable busy-input behaviour)
 """
 from pathlib import Path
 
+from tests.helpers import source_between as _source_between
+
 ROOT = Path(__file__).parent.parent
 CONFIG_PY = (ROOT / "api" / "config.py").read_text(encoding="utf-8")
 COMMANDS_JS = (ROOT / "static" / "commands.js").read_text(encoding="utf-8")
@@ -20,14 +22,6 @@ BOOT_JS = (ROOT / "static" / "boot.js").read_text(encoding="utf-8")
 PANELS_JS = (ROOT / "static" / "panels.js").read_text(encoding="utf-8")
 INDEX_HTML = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
 I18N_JS = (ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
-
-
-def _source_between(src, start_marker, end_marker):
-    start = src.find(start_marker)
-    assert start >= 0, f"{start_marker} not found"
-    end = src.find(end_marker, start)
-    assert end > start, f"{end_marker} not found after {start_marker}"
-    return src[start:end]
 
 
 # ── Backend: setting registration + enum validation ─────────────────────

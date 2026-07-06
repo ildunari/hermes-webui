@@ -1474,8 +1474,22 @@ function _steerOwnerIsCurrent(ownerSid){
   return !!(ownerSid&&typeof S!=='undefined'&&S.session&&S.session.session_id===ownerSid);
 }
 
+function _steerSetComposerStatusForOwner(ownerSid,text){
+  if(_steerOwnerIsCurrent(ownerSid)&&typeof setComposerStatus==='function')setComposerStatus(text);
+}
+
 function _steerRestoreText(originalMsg, explicitSteer){
   return explicitSteer?`/steer ${originalMsg}`:originalMsg;
+}
+
+function _steerIndicatorText(originalMsg, filesSnapshot){
+  const text=String(originalMsg||'').trim();
+  if(text)return text;
+  const names=(Array.isArray(filesSnapshot)?filesSnapshot:[])
+    .map(f=>f&&(f.name||f.filename||f.path||''))
+    .map(v=>String(v||'').trim())
+    .filter(Boolean);
+  return names.length?`Attached files: ${names.join(', ')}`:'Attached files';
 }
 
 async function _steerPersistDraftForOwner(ownerSid, originalMsg, explicitSteer, filesSnapshot){
@@ -1506,14 +1520,14 @@ async function _steerTextWithPendingFiles(msg, ownerSid, filesSnapshot){
   if(_steerUploadCache&&_steerUploadCache.sid===ownerSid&&_steerUploadCache.sig===sig&&Array.isArray(_steerUploadCache.paths)&&_steerUploadCache.paths.length){
     paths=_steerUploadCache.paths;
   }else{
-    if(typeof setComposerStatus==='function')setComposerStatus(t('uploading')||'Uploading…');
+    _steerSetComposerStatusForOwner(ownerSid,t('uploading')||'Uploading…');
     let uploaded=[];
     try{
       // Keep File objects staged until /api/chat/steer confirms acceptance. If
       // steer falls back, the draft and chips stay available for Queue/Interrupt.
       uploaded=await uploadPendingFiles({clearPending:false,sessionId:ownerSid,files:pendingFiles});
     }finally{
-      if(typeof setComposerStatus==='function')setComposerStatus('');
+      _steerSetComposerStatusForOwner(ownerSid,'');
     }
     paths=_steerUploadedAttachmentPaths(uploaded);
     if(paths.length) _steerUploadCache={sid:ownerSid,sig,paths};
@@ -1543,7 +1557,7 @@ async function _trySteer(msg, explicitSteer){
     }else{
       await _steerPersistDraftForOwner(ownerSid,originalMsg,explicitSteer,pendingFilesSnapshot);
     }
-    if(typeof setComposerStatus==='function')setComposerStatus('');
+    _steerSetComposerStatusForOwner(ownerSid,'');
     showToast(`${t('upload_failed')}${e&&e.message?e.message:e}`,3500);
     return false;
   }
@@ -1589,7 +1603,7 @@ async function _trySteer(msg, explicitSteer){
         const _remaining=S.pendingFiles.filter(f=>!_delivered.has(f));
         if(_remaining.length!==S.pendingFiles.length){S.pendingFiles=_remaining;if(typeof renderTray==='function')renderTray();}
       }
-      _showSteerIndicator(steerText);
+      _showSteerIndicator(_steerIndicatorText(originalMsg,pendingFilesSnapshot));
     }
     showToast(t('cmd_steer_delivered'),2500);
     return true;
@@ -1850,7 +1864,10 @@ async function cmdBranch(args){
   const readOnlySession=typeof _isReadOnlySession==='function'
     ? _isReadOnlySession(S.session)
     : !!(S.session&&(S.session.read_only||S.session.is_read_only));
-  if(readOnlySession){showToast('Read-only sessions cannot be forked.',3000);return;}
+  const branchableReadOnlySession=typeof _isBranchableReadOnlySession==='function'
+    ? _isBranchableReadOnlySession(S.session)
+    : false;
+  if(readOnlySession&&!branchableReadOnlySession){showToast('Read-only sessions cannot be forked.',3000);return;}
   const customTitle=(args||'').trim()||null;
   try{
     const data=await api('/api/session/branch',{
@@ -1881,7 +1898,10 @@ async function forkFromMessage(msgIdx){
   const readOnlySession=typeof _isReadOnlySession==='function'
     ? _isReadOnlySession(S.session)
     : !!(S.session&&(S.session.read_only||S.session.is_read_only));
-  if(readOnlySession){showToast('Read-only sessions cannot be forked.',3000);return;}
+  const branchableReadOnlySession=typeof _isBranchableReadOnlySession==='function'
+    ? _isBranchableReadOnlySession(S.session)
+    : false;
+  if(readOnlySession&&!branchableReadOnlySession){showToast('Read-only sessions cannot be forked.',3000);return;}
   const initialSid = S.session.session_id;
   // Capture the absolute keep_count before any async work that may
   // reset _oldestIdx.  _oldestIdx is 0 when the full transcript is

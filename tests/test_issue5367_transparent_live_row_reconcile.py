@@ -55,6 +55,7 @@ function extractFunc(name){{
   return src.slice(start, i);
 }}
 class FakeElement {{
+  static moves = 0;
   constructor(tag='div'){{
     this.tagName = String(tag).toUpperCase();
     this.children = [];
@@ -143,7 +144,15 @@ class FakeElement {{
   }}
   appendChild(child){{
     this.appendChildCount = (this.appendChildCount || 0) + 1;
-    if(child && child.parentNode) child.remove();
+    if(child && child.tagName === '#FRAGMENT'){{
+      child.children.slice().forEach(grandchild=>this.appendChild(grandchild));
+      child.children = [];
+      return child;
+    }}
+    if(child && child.parentNode){{
+      FakeElement.moves += 1;
+      child.remove();
+    }}
     if(!child) return null;
     child.parentNode = this;
     this.children.push(child);
@@ -151,7 +160,10 @@ class FakeElement {{
   }}
   insertBefore(child, refNode){{
     this.insertBeforeCount = (this.insertBeforeCount || 0) + 1;
-    if(child && child.parentNode) child.remove();
+    if(child && child.parentNode){{
+      FakeElement.moves += 1;
+      child.remove();
+    }}
     if(!child) return null;
     const idx = this.children.indexOf(refNode);
     child.parentNode = this;
@@ -218,7 +230,15 @@ function matchesSimple(el, selector){{
 }}
 
 global.window = {{}};
-global.document = {{ createElement:(tag)=>new FakeElement(tag) }};
+global.document = {{
+  createElement:(tag)=>new FakeElement(tag),
+  createTextNode:(text)=>{{
+    const node = new FakeElement('#text');
+    node.textContent = text;
+    return node;
+  }},
+  createDocumentFragment:()=>new FakeElement('#fragment'),
+}};
 global.CSS = {{ escape:(value)=>String(value) }};
 global.requestAnimationFrame = (fn)=>fn();
 
@@ -286,6 +306,9 @@ eval(extractFunc('_transparentLiveRowAttributePairs'));
 eval(extractFunc('_transparentLiveRowInteractiveState'));
 eval(extractFunc('_rehydrateTransparentLiveRow'));
 eval(extractFunc('_refreshTransparentThinkingLiveRow'));
+eval(extractFunc('_bindTransparentFadeCleanup'));
+eval(extractFunc('_appendTransparentFadeText'));
+eval(extractFunc('_refreshTransparentFadeProseRow'));
 eval(extractFunc('_refreshTransparentLiveRow'));
 eval(extractFunc('_renderLiveAnchorActivitySceneTransparent'));
 
@@ -330,6 +353,9 @@ const keptAfterSecond = turn.querySelector('.transparent-event-row[data-anchor-r
 const staleAfterSecond = turn.querySelector('.transparent-event-row[data-anchor-row-id=\"row-stale\"]');
 const newAfterSecond = turn.querySelector('.transparent-event-row[data-anchor-row-id=\"row-new\"]');
 const rows = turn.children.filter((child) => child.classList.contains('transparent-event-row'));
+const movesBeforeStableRender = FakeElement.moves;
+const stableOrderRender = _renderLiveAnchorActivitySceneTransparent('stream-1', secondScene, {{ sessionId:'session-1' }});
+const movesAfterStableRender = FakeElement.moves;
 const idxs = {{
   keptDirect: turn.children.indexOf(keptAfterSecond),
   freshDirect: turn.children.indexOf(newAfterSecond),
@@ -378,10 +404,46 @@ const keylessRowsAfterThird = turn.querySelectorAll('.transparent-event-row[data
 _renderLiveAnchorActivitySceneTransparent('stream-1', fourthScene, {{ sessionId:'session-1' }});
 const keylessRowsAfterFourth = turn.querySelectorAll('.transparent-event-row[data-anchor-row-id=\"\"]');
 
+const fadeParent = new FakeElement('div');
+const fadeExisting = new FakeElement('div');
+fadeExisting.className = 'assistant-segment transparent-event-row';
+fadeExisting.setAttribute('data-anchor-row-role', 'prose');
+fadeExisting.setAttribute('data-anchor-row-id', 'fade-row');
+fadeExisting.setAttribute('data-anchor-source-event-type', 'process_prose');
+const staleBody = new FakeElement('div');
+staleBody.className = 'msg-body stream-fade-active';
+const oldSpan = new FakeElement('span');
+oldSpan.className = 'stream-fade-word is-new';
+oldSpan.textContent = 'old';
+staleBody.appendChild(oldSpan);
+staleBody.appendChild((()=>{{ const n = new FakeElement('#text'); n.textContent = ' '; return n; }})());
+fadeExisting.appendChild(staleBody);
+fadeExisting.setAttribute('data-stream-fade-text', 'old ');
+fadeParent.appendChild(fadeExisting);
+
+const fadeCandidate = new FakeElement('div');
+fadeCandidate.className = 'assistant-segment transparent-event-row';
+fadeCandidate.setAttribute('data-anchor-row-role', 'prose');
+fadeCandidate.setAttribute('data-anchor-row-id', 'fade-row');
+fadeCandidate.setAttribute('data-anchor-source-event-type', 'process_prose');
+fadeCandidate.dataset.rawText = 'old new';
+const fadeBody = new FakeElement('div');
+fadeBody.className = 'msg-body stream-fade-active';
+const fadeSpan = new FakeElement('span');
+fadeSpan.className = 'stream-fade-word is-new';
+fadeSpan.textContent = 'old';
+fadeBody.appendChild(fadeSpan);
+fadeBody.appendChild((()=>{{ const n = new FakeElement('#text'); n.textContent = ' new'; return n; }})());
+fadeCandidate.appendChild(fadeBody);
+const fadeRefresh = _refreshTransparentLiveRow(fadeExisting, fadeCandidate);
+const fadeSpans = fadeParent.querySelectorAll('.stream-fade-word.is-new');
+
 process.stdout.write(JSON.stringify({{
   firstRender,
   secondRender,
+  stableOrderRender,
   sameNode: keptAfterFirst === keptAfterSecond,
+  stableOrderMovedRows: movesAfterStableRender - movesBeforeStableRender,
   keptId: keptAfterSecond && keptAfterSecond.getAttribute('data-anchor-row-id'),
   keptSource: keptAfterSecond && keptAfterSecond.getAttribute('data-anchor-source-event-type'),
   keptText: keptAfterSecond && keptAfterSecond.textContent,
@@ -402,13 +464,23 @@ process.stdout.write(JSON.stringify({{
   keylessAfterFourth: keylessRowsAfterFourth.length,
   keylessTextsAfterFourth: keylessRowsAfterFourth.map((child) => child.textContent),
   totalRowsAfterFourth: turn.children.filter((child) => child.classList.contains('transparent-event-row')).length,
+  fadeKeptExisting: fadeRefresh === fadeExisting,
+  fadeExistingStillParented: fadeExisting.parentNode === fadeParent,
+  fadeCandidateDetached: fadeCandidate.parentNode === null,
+  fadeOldSpanPreserved: fadeSpans[0] === oldSpan,
+  fadeSpanTexts: fadeSpans.map(span=>span.textContent),
+  fadeText: fadeExisting.getAttribute('data-stream-fade-text'),
+  fadeSpanPreserved: !!fadeParent.querySelector('.stream-fade-word.is-new'),
+  fadeBodyActive: !!fadeParent.querySelector('.msg-body.stream-fade-active'),
 }}));
 """
     script = script.replace("{{", "{").replace("}}", "}")
     data = _run_node_script(script, str(ROOT / "static" / "ui.js"))
     assert data["firstRender"] is True
     assert data["secondRender"] is True
+    assert data["stableOrderRender"] is True
     assert data["sameNode"] is True
+    assert data["stableOrderMovedRows"] == 0
     assert data["keptId"] == "row-kept"
     assert data["keptSource"] == "process_prose"
     assert data["keptText"] == "updated progress line"
@@ -438,6 +510,14 @@ process.stdout.write(JSON.stringify({{
     assert data["keylessAfterFourth"] == 1
     assert data["keylessTextsAfterFourth"] == ["keyless row second"]
     assert data["totalRowsAfterFourth"] == 1
+    assert data["fadeKeptExisting"] is True
+    assert data["fadeExistingStillParented"] is True
+    assert data["fadeCandidateDetached"] is True
+    assert data["fadeOldSpanPreserved"] is True
+    assert data["fadeSpanTexts"] == ["old", "new"]
+    assert data["fadeText"] == "old new"
+    assert data["fadeSpanPreserved"] is True
+    assert data["fadeBodyActive"] is True
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")

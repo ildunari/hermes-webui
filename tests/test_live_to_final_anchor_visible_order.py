@@ -306,7 +306,8 @@ def test_process_prose_is_an_anchor_scene_row_not_a_dom_mirror():
     assert "_upsertAnchorProcessProse(displayText,{sealed:force})" in flush
     assert "function _upsertAnchorProcessProse" in MESSAGES_JS
     assert "source_event_type:sourceEventType" in _function_body(MESSAGES_JS, "_applyToAnchor")
-    assert "_upsertAnchorProcessProse(displayText)" in schedule
+    assert "let anchorProcessText=displayText" in schedule
+    assert "_upsertAnchorProcessProse(anchorProcessText)" in schedule
     assert "function _replaceAnchorActivityEventByLocalId" in MESSAGES_JS
     assert "events[i]=next" in MESSAGES_JS
     assert "_renderAnchorLiveScene();" in _function_body(MESSAGES_JS, "_upsertAnchorProcessProse")

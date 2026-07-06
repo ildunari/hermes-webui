@@ -8782,9 +8782,13 @@ def _run_agent_streaming(
                             _snapshot_and_append_partial_on_error(s, stream_id)
                         except Exception:
                             logger.debug("Failed to snapshot partials on error for %s", stream_id, exc_info=True)
+                        _error_content = (
+                            f'**{_err_label}:** {_error_payload.get("message") or _err_label}'
+                            + (f'\n\n*{_err_hint}*' if _err_hint else '')
+                        )
                         _error_message = {
                             'role': 'assistant',
-                            'content': f'**{_err_label}:** {_error_payload.get("message") or _err_label}\n\n*{_err_hint}*',
+                            'content': _error_content,
                             'timestamp': int(time.time()),
                             '_error': True,
                         }

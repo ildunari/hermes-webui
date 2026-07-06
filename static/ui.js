@@ -1458,12 +1458,82 @@ function _dashboardBrowserUrl(status){
   const displayHost=browserHost.includes(':')&&!browserHost.startsWith('[')?'['+browserHost+']':browserHost;
   return source.protocol+'//'+displayHost+':'+status.port;
 }
+function _stripInlineEventHandlers(node){
+  if(!node)return;
+  const strip=el=>{
+    Array.from(el.attributes||[]).forEach(attr=>{
+      if(attr.name&&attr.name.toLowerCase().startsWith('on'))el.removeAttribute(attr.name);
+    });
+    if('onclick' in el)el.onclick=null;
+    Array.from(el.children||[]).forEach(strip);
+  };
+  strip(node);
+}
+function _syncNavActionMirrors(){
+  const rail=document.querySelector('.rail');
+  const sidebar=document.querySelector('.sidebar-nav');
+  if(!rail||!sidebar)return;
+  const sources=Array.from(rail.querySelectorAll('.nav-tab:not([data-panel]):not([data-dashboard-link])')).filter(source=>source.id);
+  const mirrors=Array.from(sidebar.querySelectorAll('[data-nav-action-mirror]'));
+  const sourceIds=new Set(sources.map(source=>source.id));
+  mirrors.forEach(mirror=>{
+    if(!sourceIds.has(mirror.getAttribute('data-nav-action-mirror')))mirror.remove();
+  });
+  sources.forEach(source=>{
+    const sourceVisible=(()=>{
+      if(source.hidden||source.getAttribute('aria-hidden')==='true')return false;
+      if(source.classList.contains('nav-tab-hidden'))return false;
+      if(source.style&&(source.style.display==='none'||source.style.visibility==='hidden'))return false;
+      if(typeof window!=='undefined'&&typeof window.getComputedStyle==='function'){
+        const computed=window.getComputedStyle(source);
+        if(computed&&(computed.display==='none'||computed.visibility==='hidden'))return false;
+      }
+      return true;
+    })();
+    let mirror=mirrors.find(el=>el.getAttribute('data-nav-action-mirror')===source.id);
+    if(!mirror){
+      mirror=source.cloneNode(true);
+      _stripInlineEventHandlers(mirror);
+      mirror.id=source.id+'Mobile';
+      mirror.classList.remove('rail-btn');
+      mirror.classList.add('has-tooltip--bottom');
+      mirror.setAttribute('data-nav-action-mirror',source.id);
+      mirror.addEventListener('click',e=>{
+        e.preventDefault();
+        if(mirror._navActionSource)mirror._navActionSource.click();
+        if(typeof closeMobileSidebar==='function')closeMobileSidebar();
+      });
+      const anchor=sidebar.querySelector('.dashboard-link,[data-dashboard-link]')||sidebar.querySelector('[data-panel="logs"]');
+      sidebar.insertBefore(mirror,anchor||null);
+    }else{
+      mirror.innerHTML=source.innerHTML;
+      _stripInlineEventHandlers(mirror);
+    }
+    mirror._navActionSource=source;
+    mirror.classList.toggle('nav-action-visible',sourceVisible);
+    const label=source.getAttribute('data-tooltip')||source.getAttribute('aria-label')||'';
+    if(label)mirror.setAttribute('data-label',label);
+  });
+}
+function _initNavActionMirrors(){
+  _syncNavActionMirrors();
+  const rail=document.querySelector('.rail');
+  if(rail&&window.MutationObserver)new MutationObserver(_syncNavActionMirrors).observe(rail,{
+    childList:true,
+    subtree:true,
+    attributes:true,
+    attributeFilter:['class','style','hidden','aria-hidden','data-tooltip','aria-label'],
+  });
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_initNavActionMirrors,{once:true});
+else _initNavActionMirrors();
 function _applyDashboardStatus(status){
   const running=!!(status&&status.running);
   const url=running?_dashboardBrowserUrl(status):'';
   const warning=running&&!_dashboardIsBrowserLoopback()?t('dashboard_loopback_warning'):'';
   document.querySelectorAll('[data-dashboard-link]').forEach(btn=>{
     btn.classList.toggle('dashboard-link-visible',running);
+    btn.classList.toggle('nav-action-visible',running);
     btn.style.display=running?'':'none';
     btn.dataset.dashboardUrl=url;
     const tipText=warning||t('tab_dashboard');
@@ -6391,7 +6461,7 @@ function renderMd(raw){
   // Tables: | col | col | header row followed by | --- | --- | separator then data rows
   // NOTE: table pass runs BEFORE outer link pass so [label](url) in table cells
   // is handled by inlineMd() only — prevents double-linking.
-  s=s.replace(/((?:^\|.+\|\n?)+)/gm,block=>{
+  s=s.replace(/((?:^ {0,3}\|.+\|[ \t]*\n?)+)/gm,block=>{
     const rows=block.trim().split('\n').filter(r=>r.trim());
     if(rows.length<2)return block;
     const isSep=r=>/^\|[\s|:-]+\|$/.test(r.trim());
@@ -9556,7 +9626,7 @@ function isTpsDisplayEnabled(){
 function _assistantRoleHtml(tsTitle='', tpsText=''){
   const _bn=assistantDisplayName();
   const tps=(isTpsDisplayEnabled()&&tpsText)?`<span class="msg-tps-inline" title="Tokens per second">${esc(tpsText)}</span>`:'';
-  return `<div class="msg-role assistant" ${tsTitle?`title="${esc(tsTitle)}"`:''}><div class="role-icon assistant">${esc(_bn.charAt(0).toUpperCase())}</div><span style="font-size:12px">${esc(_bn)}</span>${tps}</div>`;
+  return `<div class="msg-role assistant" ${tsTitle?`title="${esc(tsTitle)}"`:''}><div class="role-icon assistant">${esc(_bn.charAt(0).toUpperCase())}</div><span class="msg-role-name">${esc(_bn)}</span>${tps}</div>`;
 }
 function _setAssistantTurnTps(turn, tpsText=''){
   if(!turn) return;
@@ -11388,8 +11458,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     el.hidden=true;
   });
   const liveFooter=blocks.querySelector('#liveRunStatus');
-  let wrote=false;
-  const targetRenderedRows=[];
+  const renderedRows=[];
   for(const row of rows){
     const node=_anchorSceneTransparentNodeForRow(row,{
       live:true,
@@ -11405,8 +11474,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
       : node;
     if(existing) preserveByKey.delete(key);
     if(!renderedNode) continue;
-    targetRenderedRows.push(renderedNode);
-    wrote=true;
+    renderedRows.push(renderedNode);
   }
   const transparentLiveRowAlreadyPositioned=(node, expectedNextSibling)=>!!(
     node &&
@@ -11414,8 +11482,8 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     node.nextSibling===expectedNextSibling
   );
   let expectedNextSibling=(liveFooter&&liveFooter.parentElement===blocks) ? liveFooter : null;
-  for(let i=targetRenderedRows.length-1;i>=0;i--){
-    const renderedNode=targetRenderedRows[i];
+  for(let i=renderedRows.length-1;i>=0;i--){
+    const renderedNode=renderedRows[i];
     if(transparentLiveRowAlreadyPositioned(renderedNode,expectedNextSibling)){
       expectedNextSibling=renderedNode;
       continue;
@@ -11425,7 +11493,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     expectedNextSibling=renderedNode;
   }
   preserveByKey.forEach(stale=>stale.remove());
-  if(wrote) _syncTransparentEventControls(turn);
+  if(renderedRows.length) _syncTransparentEventControls(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
   if(scrollRebuildGuard&&scrollRebuildGuard.release){
@@ -11435,7 +11503,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     });
   }
   if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
-  return wrote;
+  return !!renderedRows.length;
 }
 
 function _transparentLiveRowKey(node, streamId){
@@ -11530,10 +11598,90 @@ function _refreshTransparentThinkingLiveRow(existing, node){
   return true;
 }
 
+function _bindTransparentFadeCleanup(body){
+  if(!body || body._transparentFadeCleanupBound || typeof body.addEventListener !== 'function') return;
+  body._transparentFadeCleanupBound = true;
+  body.addEventListener('animationend', e=>{
+    const span = e.target;
+    if(!span || !span.classList || !span.classList.contains('stream-fade-word')) return;
+    span.replaceWith(document.createTextNode(span.textContent || ''));
+  });
+}
+
+function _appendTransparentFadeText(body, text){
+  if(!body) return;
+  const value = String(text || '');
+  if(!value) return;
+  _bindTransparentFadeCleanup(body);
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const frag = document.createDocumentFragment();
+  const wordRe = /(\S+)(\s*)/g;
+  let last = 0, match, changed = false;
+  while((match = wordRe.exec(value))){
+    if(match.index > last) frag.appendChild(document.createTextNode(value.slice(last, match.index)));
+    if(reduceMotion){
+      frag.appendChild(document.createTextNode(match[1]));
+    }else{
+      const span = document.createElement('span');
+      span.className = 'stream-fade-word is-new';
+      span.textContent = match[1];
+      frag.appendChild(span);
+    }
+    if(match[2]) frag.appendChild(document.createTextNode(match[2]));
+    last = match.index + match[0].length;
+    changed = true;
+  }
+  if(!changed) frag.appendChild(document.createTextNode(value));
+  else if(last < value.length) frag.appendChild(document.createTextNode(value.slice(last)));
+  body.appendChild(frag);
+}
+
+function _refreshTransparentFadeProseRow(existing, node, preservedState){
+  let body = existing.querySelector ? existing.querySelector('.msg-body') : null;
+  const nextText = String((node.dataset && node.dataset.rawText) || (node.textContent || ''));
+  const currentText = String(existing.getAttribute('data-stream-fade-text') || (body && body.textContent) || '');
+  const pairs = _transparentLiveRowAttributePairs(node);
+  const kept = Object.create(null);
+  for(const pair of pairs){
+    const [name, value] = pair;
+    kept[String(name)] = String(value ?? '');
+  }
+  for(const [name] of _transparentLiveRowAttributePairs(existing)){
+    if(!Object.prototype.hasOwnProperty.call(kept, name)) existing.removeAttribute(name);
+  }
+  for(const pair of pairs){
+    const [name, value] = pair;
+    existing.setAttribute(name, value);
+  }
+  existing.className = node.className || '';
+  if(!body){
+    body = document.createElement('div');
+    body.className = 'msg-body';
+    existing.appendChild(body);
+  }
+  if(body.classList) body.classList.add('stream-fade-active');
+  if(!nextText.startsWith(currentText)){
+    body.textContent = '';
+    existing.setAttribute('data-stream-fade-text', '');
+    _appendTransparentFadeText(body, nextText);
+  }else{
+    _appendTransparentFadeText(body, nextText.slice(currentText.length));
+  }
+  existing.setAttribute('data-stream-fade-text', nextText);
+  _rehydrateTransparentLiveRow(existing, node, preservedState);
+  return existing;
+}
+
 function _refreshTransparentLiveRow(existing, node){
   if(!existing || !node || !existing.getAttribute) return node;
   if(existing===node) return existing;
   const preservedState = _transparentLiveRowInteractiveState(existing);
+  const candidateIsFadeProse = node.getAttribute('data-anchor-row-role') === 'prose' &&
+    node.querySelector &&
+    !!node.querySelector('.msg-body.stream-fade-active,.stream-fade-word');
+  if(candidateIsFadeProse){
+    return _refreshTransparentFadeProseRow(existing, node, preservedState);
+  }
   const pairs = _transparentLiveRowAttributePairs(node);
   const kept = Object.create(null);
   for(const pair of pairs){
@@ -13752,7 +13900,10 @@ function renderMessages(options){
       const summary=m.provider_details_label||'Provider details';
       bodyHtml += `<details class="provider-error-details"><summary>${esc(String(summary))}</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
     }
-    const recoveryHtml=(!isUser&&m._compressionRecovery) ? _compressionRecoveryHtml(m._compressionRecovery, (S.session&&S.session.session_id)||'') : '';
+    const recoveryPayload=(!isUser&&m._compressionRecovery)
+      ? m._compressionRecovery
+      : (!isUser&&isLastAssistant&&isTurnFinalAssistant&&typeof _activeCompressionRecoveryPayload==='function' ? _activeCompressionRecoveryPayload() : null);
+    const recoveryHtml=recoveryPayload ? _compressionRecoveryHtml(recoveryPayload, (S.session&&S.session.session_id)||'') : '';
     if(recoveryHtml) bodyHtml += recoveryHtml;
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
@@ -13763,7 +13914,10 @@ function renderMessages(options){
     const readOnlySession=typeof _isReadOnlySession==='function'
       ? _isReadOnlySession(S.session)
       : !!(S.session&&(S.session.read_only||S.session.is_read_only));
-    const forkBtn  = readOnlySession ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
+    const branchableReadOnlySession=typeof _isBranchableReadOnlySession==='function'
+      ? _isBranchableReadOnlySession(S.session)
+      : false;
+    const forkBtn  = (readOnlySession&&!branchableReadOnlySession) ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
     const ttsBtn   = !isUser ? `<button class="msg-action-btn msg-tts-btn" title="${t('tts_listen')||'Listen'}" onclick="speakMessage(this)">${li('volume-2',13)}</button>` : '';
     const tsVal=m._ts||m.timestamp;
     // _formatInServerTz handles fractional-hour offsets (India +0530 etc.)
@@ -17897,8 +18051,49 @@ function addFiles(files){
   }
   renderTray();
 }
+const _uploadPendingFilesProgressBySession=new Map();
 function _uploadPendingFilesCurrentSession(sessionId){
   return !!(!sessionId||(S.session&&S.session.session_id===sessionId));
+}
+function _uploadPendingFilesHideProgressBar(){
+  const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
+  if(!bar||!barWrap)return;
+  barWrap.classList.remove('active');
+  bar.style.width='0%';
+  if(barWrap.dataset)delete barWrap.dataset.uploadSessionId;
+}
+function _uploadPendingFilesShowProgressBar(owner,percent){
+  const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
+  if(!bar||!barWrap)return;
+  if(barWrap.dataset)barWrap.dataset.uploadSessionId=owner;
+  barWrap.classList.add('active');
+  bar.style.width=`${Math.max(0,Math.min(100,Number(percent)||0))}%`;
+}
+function _uploadPendingFilesSyncProgressForSession(sessionId){
+  const owner=String(sessionId||'');
+  const state=owner?_uploadPendingFilesProgressBySession.get(owner):null;
+  if(state){_uploadPendingFilesShowProgressBar(owner,state.percent);return;}
+  _uploadPendingFilesHideProgressBar();
+}
+function _uploadPendingFilesUpdateProgress(sessionId,percent){
+  const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
+  if(!bar||!barWrap)return;
+  const owner=String(sessionId||'');
+  const activeForOwner=barWrap.dataset&&barWrap.dataset.uploadSessionId===owner;
+  if(percent===null){
+    if(owner)_uploadPendingFilesProgressBySession.delete(owner);
+    if(activeForOwner){
+      _uploadPendingFilesHideProgressBar();
+    }
+    return;
+  }
+  const clamped=Math.max(0,Math.min(100,Number(percent)||0));
+  if(owner)_uploadPendingFilesProgressBySession.set(owner,{percent:clamped});
+  if(!_uploadPendingFilesCurrentSession(sessionId)){
+    if(activeForOwner)_uploadPendingFilesHideProgressBar();
+    return;
+  }
+  _uploadPendingFilesShowProgressBar(owner,clamped);
 }
 async function uploadPendingFiles(options={}){
   const opts=options||{};
@@ -17907,8 +18102,7 @@ async function uploadPendingFiles(options={}){
   if(!pendingFiles.length||!sessionId)return[];
   const clearPending=!(opts&&opts.clearPending===false);
   const names=[];let failures=0;
-  const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
-  barWrap.classList.add('active');bar.style.width='0%';
+  _uploadPendingFilesUpdateProgress(sessionId,0);
   const total=pendingFiles.length;
   for(let i=0;i<total;i++){
     const f=pendingFiles[i];
@@ -17930,9 +18124,9 @@ async function uploadPendingFiles(options={}){
         names.push({name: data.filename, path: data.path, mime: data.mime, size: data.size, is_image: !!data.is_image});
       }
     }catch(e){failures++;setStatus(`\u274c ${t('upload_failed')}${f.name} \u2014 ${e.message}`);}
-    bar.style.width=`${Math.round((i+1)/total*100)}%`;
+    _uploadPendingFilesUpdateProgress(sessionId,Math.round((i+1)/total*100));
   }
-  barWrap.classList.remove('active');bar.style.width='0%';
+  _uploadPendingFilesUpdateProgress(sessionId,null);
   if(clearPending&&_uploadPendingFilesCurrentSession(sessionId)){S.pendingFiles=[];renderTray();}
   else if(typeof renderTray==='function'&&_uploadPendingFilesCurrentSession(sessionId))renderTray();
   if(failures===total&&total>0)throw new Error(t('all_uploads_failed',total));
