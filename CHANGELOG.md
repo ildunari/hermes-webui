@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Self-update recovers when a `.git/index.lock` is blocking it.** If "Update Now" failed because a stale `.git/index.lock` was present (a previous git process left it behind), the WebUI gave no in-UI way out — you were stuck on an un-updatable install. The update banner now detects that specific failure, shows the exact `rm -f …/.git/index.lock` command to run on the host, and offers a "Retry update" button that re-runs the normal update once the lock is gone. The server never deletes anything under `.git` itself (fail-closed — git's lock can't be safely auto-cleared without racing), so this is purely a detect-and-guide recovery. Thanks @b3nw. (#5688, #5687)
+
 ### Internal
 
 - **Fixed the last 2 chronic local full-suite test-isolation flakes.** `test_tls_support::test_tls_startup_failure_fallback_to_http` and `test_v050259_sessiondb_fd_leak::test_session_db_close_is_idempotent` failed only in a full local suite run (they skip on CI, where the agent package isn't co-located). Root cause was the same "simulate agent package unavailable" antipattern shipped-fixed for the profile cluster: `test_custom_provider_prefix_collisions` clobbered `sys.modules['agent']` at collection time (never restored), and several helpers emptied real package `__path__` lists in place. Fixed at the source — the collection-time shim is now guarded on `importlib.util.find_spec` (only installed when the real package is genuinely absent), the in-place `__path__` mutations use `monkeypatch.setattr(..., raising=False)`, and `test_issue1574`'s fake-agent helper restores the env/`sys.path` it mutates. Full local suite now 0 failed (was 2); `test_title_aux_routing` unaffected. Test-only.
