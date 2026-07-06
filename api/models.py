@@ -1408,19 +1408,25 @@ class Session:
             return cls.load(sid)
 
     @staticmethod
-    def _compute_user_message_count_lazy(sid: str) -> int:
+    def _compute_user_message_count_lazy(sid: str, messages=None) -> int:
         """perf(session-load-latency) Priority 1: cheap SQL-only user count.
 
-        Returns the number of messages with role='user' for a given session,
-        computed via a single indexed SQLite query (~5ms even for 2,500+ msg
-        sessions because idx_messages_session covers the WHERE filter). The
-        role='user' predicate is a second filter on the small index range, so
-        it is bounded by the index lookup, not a full table scan.
+        Returns the number of messages with role='user' for a given session.
+        Fast path is a single indexed SQLite query (~5ms even for 2,500+ msg
+        sessions because idx_messages_session covers the WHERE filter); the
+        role='user' predicate is a second filter on the small index range.
 
-        The compact() output previously did an O(N) Python walk over
-        self.messages for the same value. compact() now emits user_message_count
-        as None; callers needing an exact count call this helper. The frontend
-        does not use the field, so no caller is broken today.
+        If the SQLite query fails for any reason (DB locked, file missing,
+        schema drift), the helper falls back to an O(N) walk over the
+        ``messages`` argument passed in by the caller. The caller always has
+        ``self.messages`` in memory by the time compact() runs (Session.load()
+        populates it from the sidecar), so the fallback is bounded by the
+        already-loaded Python list, not a fresh disk read.
+
+        The previous O(N) walk inside compact() did not handle a missing
+        self.messages either, falling back to 0 in that case. The fallback
+        here therefore preserves the prior behavior on every input the prior
+        code accepted.
         """
         try:
             import sqlite3 as _sqlite3
@@ -1444,9 +1450,16 @@ class Session:
             finally:
                 conn.close()
         except Exception:
-            # Never let the helper break a response -- return 0 like the old code did
-            # when self.messages wasn't a list.
-            return 0
+            # DB unavailable or schema mismatch — fall back to the in-memory
+            # walk. This is what the pre-patch compact() did unconditionally,
+            # so callers see the same number they'd have seen before for any
+            # session where Session.load() populated self.messages.
+            if not isinstance(messages, list):
+                return 0
+            from api.models import _message_role
+            return sum(
+                1 for m in messages if _message_role(m) == 'user'
+            )
 
     def compact(self, include_runtime=False, active_stream_ids=None) -> dict:
         active_stream_ids = active_stream_ids if active_stream_ids is not None else set()
@@ -1506,7 +1519,10 @@ class Session:
                 'worktree_repo_root': self.worktree_repo_root,
                 'worktree_created_at': self.worktree_created_at,
             } if self.worktree_path else {}),
-            'user_message_count': Session._compute_user_message_count_lazy(self.session_id),
+            'user_message_count': Session._compute_user_message_count_lazy(
+                self.session_id,
+                self.messages,
+            ),
             'active_stream_id': self.active_stream_id,
             'pending_user_message': self.pending_user_message,
             'has_pending_user_message': has_pending_user_message,

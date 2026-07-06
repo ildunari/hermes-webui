@@ -139,12 +139,11 @@ class RequestDiagnostics:
         if (method.upper(), clean_path) not in {
             ("GET", "/api/sessions"),
             ("POST", "/api/chat/start"),
-            # perf(session-load-latency): Phase 0 instrumentation gaps.
+            # perf(session-load-latency) Phase 0 instrumentation gaps.
             # These endpoints fire on every session click and were the source
             # of the multi-second waterfalls in the slow-request logs.
             ("GET", "/api/profiles"),
             ("GET", "/api/models"),
-            ("GET", "/api/session"),
         }:
             return None
         return cls(method, clean_path, logger=logger)
