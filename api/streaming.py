@@ -6798,6 +6798,7 @@ def _run_agent_streaming(
     _checkpoint_stop = None
     _ckpt_thread = None
     _agent_lock = None
+    _turn_pending_source = 'webui'
     try:
         # Bind THIS turn's session identity to the worker thread/context BEFORE
         # any agent work (so every mid-turn notify_on_complete background spawn
@@ -6806,6 +6807,7 @@ def _run_agent_streaming(
         # in the outer finally next to _clear_thread_env().
         _turn_session_identity_tokens = _set_turn_session_identity(session_id)
         s = get_session(session_id)
+        _turn_pending_source = getattr(s, 'pending_user_source', None) or 'webui'
         update_active_run(stream_id, phase="running", session_id=session_id)
         s.workspace = str(Path(workspace).expanduser().resolve())
         _last_persisted_model = None
@@ -9821,6 +9823,22 @@ def _run_agent_streaming(
             _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
             with _lock_ctx:
                 if not ephemeral and not _stream_writeback_is_current(s, stream_id):
+                    if _turn_pending_source == 'process_wakeup':
+                        _pause = record_process_wakeup_provider_unavailable_pause(
+                            s,
+                            classification=_exc_type,
+                            model=getattr(s, 'model', None) or resolved_model or model,
+                            provider=getattr(s, 'model_provider', None) or resolved_provider,
+                        )
+                        if _pause is not None:
+                            try:
+                                s.save(touch_updated_at=False)
+                            except Exception:
+                                logger.debug(
+                                    "Failed to persist stale-stream process_wakeup pause for session %s",
+                                    getattr(s, 'session_id', session_id),
+                                    exc_info=True,
+                                )
                     logger.info(
                         "Skipping stale stream error writeback for session %s stream %s; active_stream_id=%s",
                         getattr(s, 'session_id', session_id),

@@ -111,8 +111,8 @@ class _CredentialPoolEmptyAgent(_MockAgent):
         raise RuntimeError("All 0 credential(s) exhausted for test-provider")
 
 
-def _run_failing_process_wakeup(session: Session, tmp_path):
-    stream_id = str(session.active_stream_id)
+def _run_failing_process_wakeup(session: Session, tmp_path, *, stream_id=None):
+    stream_id = str(stream_id or session.active_stream_id)
     fake_queue = queue.Queue()
     streaming.STREAMS[stream_id] = fake_queue
     config.STREAM_PARTIAL_TEXT[stream_id] = ""
@@ -303,3 +303,34 @@ def test_process_wakeup_pause_does_not_suppress_explicit_non_wakeup_turn(tmp_pat
     assert saved is not None
     assert saved.process_wakeup_pause["suppressed_count"] == 2
     assert "last_suppressed_at" not in saved.process_wakeup_pause
+
+
+def test_stale_credential_empty_process_wakeup_still_records_pause(tmp_path):
+    session = Session(
+        session_id="wakeup_pause_stale_stream",
+        title="Wakeup pause stale",
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider="test-provider",
+        messages=[{"role": "user", "content": "Earlier prompt", "timestamp": 1}],
+        context_messages=[{"role": "user", "content": "Earlier prompt"}],
+        active_stream_id="newer-stream",
+        pending_user_message="[IMPORTANT: Background process completed on stale stream.]",
+        pending_started_at=1234.0,
+        pending_user_source="process_wakeup",
+    )
+    session.save()
+    models.SESSIONS[session.session_id] = session
+
+    events = _run_failing_process_wakeup(session, tmp_path, stream_id="stale-stream")
+
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert saved.messages == [{"role": "user", "content": "Earlier prompt", "timestamp": 1}]
+    assert saved.context_messages == [{"role": "user", "content": "Earlier prompt"}]
+    assert not any(event == "apperror" for event, _data in events)
+    assert saved.active_stream_id == "newer-stream"
+    assert saved.pending_user_source == "process_wakeup"
+    assert saved.process_wakeup_pause["paused"] is True
+    assert saved.process_wakeup_pause["classification"] == "credential_pool_empty"
+    assert saved.process_wakeup_pause["suppressed_count"] == 0
