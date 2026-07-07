@@ -1389,6 +1389,40 @@ def _agent_result_tool_limit_reached(result) -> bool:
     return False
 
 
+def _maybe_inject_max_iteration_summary_fallback(messages, result) -> list:
+    """Append the agent's graceful summary text as an assistant turn when one is missing.
+
+    When ``AIAgent`` exhausts its iteration budget, ``agent.handle_max_iterations``
+    always returns a non-empty ``final_response`` — either the model-generated
+    summary or a graceful fallback (e.g. ``"I reached the iteration limit and
+    couldn't generate a summary."``). Hermes Agent surfaces that string as the
+    final answer to the user; the WebUI, by contrast, reads only ``messages``,
+    so an empty summary (common with reasoning-only responses) left the user
+    with a bare ``tool_limit_reached`` error instead of any closure text.
+
+    When ``_tool_limit_reached`` is true and ``messages`` ends without a final
+    assistant answer, inject ``result['final_response']`` as a new assistant
+    turn so ``_mark_latest_assistant_tool_limit_status`` can attach the status
+    card in the normal flow and the user sees the same closure text as
+    hermes-agent. Returns the (possibly new) messages list; does nothing when
+    a usable assistant answer already exists or when ``result`` carries no
+    graceful fallback text.
+    """
+    if not isinstance(result, dict):
+        return list(messages or [])
+    fallback = result.get('final_response')
+    if not isinstance(fallback, str) or not fallback.strip():
+        return list(messages or [])
+    out = list(messages or [])
+    if not _session_lacks_final_assistant_answer(out):
+        return out
+    # Append a synthetic summary turn. Tag it so downstream consumers can
+    # distinguish it from model-emitted assistant turns if needed; mirrors the
+    # synthetic-scaffolding flag convention already used elsewhere (#5334).
+    out.append({"role": "assistant", "content": fallback, "_max_iteration_summary_fallback": True})
+    return out
+
+
 def _mark_latest_assistant_tool_limit_status(messages) -> bool:
     """Annotate the latest usable assistant final answer as limit-stopped."""
     for msg in reversed(list(messages or [])):
@@ -4090,6 +4124,10 @@ def _sanitize_messages_for_api(
                 # Orphaned tool result — skip to avoid 400 from strict providers.
                 continue
         sanitized = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS}
+        # Drop empty tool_calls — strict providers (DeepSeek, newer OpenAI)
+        # reject tool_calls: [] with HTTP 400 even when no orphaned calls exist.
+        if 'tool_calls' in sanitized and not sanitized['tool_calls']:
+            del sanitized['tool_calls']
         # Provider-aware reasoning_content stripping from model-facing history.
         # Historical assistant reasoning_content is stripped only when the user
         # explicitly requests strip mode or auto mode identifies a local/generic
@@ -4201,6 +4239,8 @@ def _api_safe_message_positions(messages):
             if not tid or tid not in valid_tool_call_ids:
                 continue
         sanitized = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS}
+        if 'tool_calls' in sanitized and not sanitized['tool_calls']:
+            del sanitized['tool_calls']
         if is_recovered:
             sanitized['_recovered'] = True  # temporary marker — stripped before return
         if 'content' in sanitized:
@@ -4380,6 +4420,12 @@ def _restore_reasoning_metadata(previous_messages, updated_messages):
         if not isinstance(msg, dict):
             return None
         projected = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS and msg.get('role')}
+        # Mirror the empty-tool_calls drop applied by _api_safe_message_positions
+        # (#5737) so this projection matches the API-safe positions it's aligned
+        # against — otherwise a row stored with tool_calls: [] projects
+        # differently here than in prev_safe and loses its metadata carry-forward.
+        if 'tool_calls' in projected and not projected['tool_calls']:
+            del projected['tool_calls']
         if 'content' in projected:
             projected['content'] = _strip_oob_blocks(projected['content'])
         return projected
@@ -8346,6 +8392,24 @@ def _run_agent_streaming(
                         _result_messages,
                         enabled=_tool_limit_reached,
                     )
+                    # #5494 — parity with hermes-agent's handle_max_iterations() return
+                    # value. When the agent produced no usable summary assistant
+                    # message but result['final_response'] carries a graceful fallback
+                    # string, inject it as a final assistant turn so the user sees
+                    # closure text instead of a bare tool_limit_reached error. Apply
+                    # the synthesis to result['messages'] AND _result_messages so the
+                    # downstream _all_result_messages checks (silent-failure detection
+                    # at api/streaming.py:_assistant_reply_added_after_current_turn)
+                    # see the fallback too. `finalize_turn` in the agent always returns
+                    # messages as a list, but we write back unconditionally so the
+                    # contract is "if we built a result-messages list, the silent-failure
+                    # classifier reads the augmented version."
+                    if _tool_limit_reached:
+                        _result_messages = _maybe_inject_max_iteration_summary_fallback(
+                            _result_messages, result
+                        )
+                        if isinstance(result, dict):
+                            result = {**result, 'messages': _result_messages}
                     if cancel_event.is_set():
                         _finalize_cancelled_turn(s, ephemeral=False)
                         try:

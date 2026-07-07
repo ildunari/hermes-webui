@@ -7866,36 +7866,119 @@ def _models_cache_file_age_seconds(cache_path: Path, now: float) -> float | None
 
 
 def get_available_models_for_session_visit() -> dict:
-    """Return /api/models with a short session-visit freshness horizon."""
+    """Return /api/models with a short session-visit freshness horizon.
+
+    perf(session-load-latency) Phase 0: this function is the source of the
+    multi-second `/api/models?freshness=session_visit` latency. Stage markers
+    feed into RequestDiagnostics when called from /api/models; standalone
+    callers get the same envelope via the local _stagelog dict.
+    """
+    import time as _time
+    import logging as _logging
+    _stagelog: list[tuple[str, float]] = [("enter", _time.monotonic())]
+    def _mark(name: str) -> None:
+        _stagelog.append((name, _time.monotonic()))
+    _logger = _logging.getLogger("api.config")
+    # HERMES_DEBUG_SLOW: a numeric value sets the slow-log threshold in ms; any
+    # other non-empty (truthy) value — e.g. the documented `HERMES_DEBUG_SLOW=1`
+    # / `=true` — means "always log stage timing" (0ms threshold); unset/empty
+    # keeps the default 500ms. Must be non-throwing: a nonnumeric truthy value
+    # like `true` previously raised ValueError here and 500'd this hot path.
+    _slow_raw = (os.environ.get("HERMES_DEBUG_SLOW", "") or "").strip()
+    if not _slow_raw:
+        _slow_threshold_ms = 500.0
+    else:
+        try:
+            _slow_threshold_ms = float(_slow_raw) or 500.0
+        except ValueError:
+            # Non-numeric truthy flag (e.g. "true"): always emit stage timing.
+            _slow_threshold_ms = 0.0
+
     global _available_models_cache, _available_models_cache_ts, _available_models_cache_source_fingerprint
     cache_path = _get_models_cache_path()
     cache_age = _models_cache_file_age_seconds(cache_path, time.time())
+    _mark(f"disk_age_check:{cache_age}")
     disk_cached = None
     if cache_age is not None and cache_age < _SESSION_VISIT_MODELS_FRESHNESS_SECONDS:
+        _mark("cache_age_within_ttl")
         now_mono = time.monotonic()
         with _available_models_cache_lock:
             cached = _get_fresh_memory_models_cache(now_mono)
             if cached is not None:
+                _mark("memory_cache_hit")
+                _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
                 return cached
+        _mark("memory_cache_miss_loading_disk")
         disk_cached = _load_models_cache_from_disk()
         if disk_cached is not None:
             with _available_models_cache_lock:
                 cached = _get_fresh_memory_models_cache(time.monotonic())
                 if cached is not None:
+                    _mark("disk_then_memory_cache_hit")
+                    _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
                     return cached
                 _available_models_cache = copy.deepcopy(disk_cached)
                 _available_models_cache_ts = time.monotonic()
                 _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+            _mark("disk_cache_returned")
+            _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
             return copy.deepcopy(disk_cached)
 
+    _mark("cache_age_stale_or_missing")
     stale_cached = disk_cached or _load_stale_models_cache_from_disk()
+    _mark(f"stale_cached_loaded:{bool(stale_cached)}")
     try:
-        return get_available_models(force_refresh=True)
+        _mark("force_refresh_start")
+        result = get_available_models(force_refresh=True)
+        _mark("force_refresh_done")
+        _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
+        return result
     except Exception:
+        _mark("force_refresh_failed")
         logger.debug("session-visit models refresh failed", exc_info=True)
         if stale_cached is not None:
+            _mark("stale_fallback_return")
+            _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
             return copy.deepcopy(stale_cached)
+        _mark("prefer_cache_fallback")
+        _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
         return get_available_models(prefer_cache=True)
+
+
+def _maybe_log_slow_stages(
+    logger_obj: "logging.Logger",
+    stagelog: "list[tuple[str, float]]",
+    threshold_ms: float,
+    tag: str,
+) -> None:
+    """perf(session-load-latency) Phase 0: per-stage timing reporter.
+
+    Emits a single log line listing every stage with its delta in ms when
+    the function's total wall time crosses ``threshold_ms``. Lives next to
+    the model cache code so it has zero coupling with the WebUI request
+    layer; called from both ``get_available_models_for_session_visit`` and
+    (Phase 1) the chat session load path.
+    """
+    if len(stagelog) < 2:
+        return
+    total_ms = (stagelog[-1][1] - stagelog[0][1]) * 1000.0
+    if total_ms < threshold_ms:
+        return
+    parts: list[str] = []
+    for i in range(1, len(stagelog)):
+        prev_t = stagelog[i - 1][1]
+        cur_t = stagelog[i][1]
+        parts.append(f"{stagelog[i][0]}={((cur_t - prev_t) * 1000.0):.1f}ms")
+    try:
+        logger_obj.warning(
+            "[SLOW] %s total=%.1fms stages: %s",
+            tag,
+            total_ms,
+            " ".join(parts),
+        )
+    except Exception:
+        # Logging must never break a response path.
+        pass
 
 
 # ── Static file path ─────────────────────────────────────────────────────────

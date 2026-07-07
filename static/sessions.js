@@ -1299,6 +1299,51 @@ function _rearmActiveSessionStream(){
   if(activeSid) startSessionStream(activeSid);
 }
 
+function _sessionProfileMismatchFromError(e){
+  if(!e || e.status!==409 || !e.body) return null;
+  try{
+    const body=JSON.parse(e.body);
+    if(body && body.code==='session_profile_mismatch' && body.profile){
+      return {profile:String(body.profile), session_id:String(body.session_id||'')};
+    }
+  }catch(_){ }
+  return null;
+}
+
+async function _switchProfileForSessionLoad(profile){
+  const name=String(profile||'').trim();
+  if(!name) throw new Error('missing profile');
+  if(name===S.activeProfile) return;
+  if(typeof _invalidateSessionListRenders==='function') _invalidateSessionListRenders();
+  if(typeof _setProfileSwitchListEmbargo==='function') _setProfileSwitchListEmbargo(true);
+  if(typeof showSessionListSkeleton==='function') showSessionListSkeleton(name);
+  try{
+    const data=await api('/api/profile/switch',{method:'POST',body:JSON.stringify({name}),timeoutToast:false});
+    S.activeProfile=data.active||name;
+    S.activeProfileIsDefault=!!data.is_default;
+    if(typeof _clearPersistedModelState==='function') _clearPersistedModelState();
+    else localStorage.removeItem('hermes-webui-model');
+    if(data.default_model) window._defaultModel=data.default_model;
+    if(data.default_model_provider) window._activeProvider=data.default_model_provider;
+    if(typeof startGatewaySSE==='function') startGatewaySSE();
+    if(typeof syncTopbar==='function') syncTopbar();
+    if(typeof _setProfileSwitchListEmbargo==='function') _setProfileSwitchListEmbargo(false);
+    if(typeof renderSessionList==='function') await renderSessionList();
+  }catch(switchErr){
+    // The switch POST failed, so we're still on the previous profile and its
+    // caches are intact. Clear the up-front skeleton and re-render the real
+    // list so the sidebar doesn't strand on the skeleton (the #4671 strand bug
+    // — _sessionListSkeletonActive hard-gates renderSessionListFromCache + the
+    // SSE/poll repaints until an unrelated full render fires). Mirror the
+    // canonical switch's catch in panels.js, then rethrow so loadSession's
+    // catch(switchErr) still routes into the generic error handler.
+    if(typeof _setProfileSwitchListEmbargo==='function') _setProfileSwitchListEmbargo(false);
+    _sessionListSkeletonActive=false;
+    if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
+    throw switchErr;
+  }
+}
+
 async function loadSession(sid){
   const opts = arguments[1] || {};
   if(!opts.skipLineageResolve && typeof _resolveSessionIdFromSidebarLineage==='function'){
@@ -1428,6 +1473,30 @@ async function loadSession(sid){
   try {
     data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
   } catch(e) {
+    const profileMismatch=_sessionProfileMismatchFromError(e);
+    if(profileMismatch && profileMismatch.profile && !opts.skipProfileResolve){
+      if (_loadingSessionId !== sid) {
+        _rearmActiveSessionStream();
+        return;
+      }
+      try{
+        if(typeof showToast==='function') showToast(`Switching to ${profileMismatch.profile} profile for this session…`,2200);
+        await _switchProfileForSessionLoad(profileMismatch.profile);
+        // Post-await stale-load guard (Codex): the profile switch above does a
+        // network POST + session-list re-render, during which the user may have
+        // navigated to a different session. If we no longer own the load, bail
+        // before clearing _loadingSessionId or retrying so the stale
+        // continuation can't hijack the UI back to the old target.
+        if (_loadingSessionId !== sid) {
+          _rearmActiveSessionStream();
+          return;
+        }
+        if (_loadingSessionId === sid) _loadingSessionId = null;
+        return loadSession(sid,{...opts,skipProfileResolve:true,force:true});
+      }catch(switchErr){
+        e=switchErr;
+      }
+    }
     const _msgInner = $('msgInner');
     // Stale-load guard (Codex): a newer loadSession() may have started while this
     // request was awaiting (e.g. the user clicked a healthy session during a
@@ -5887,6 +5956,11 @@ function _sessionLineageContainsSession(s, sid){
   return false;
 }
 
+function _authoritativeLineageTipId(s){
+  if(!s) return null;
+  return s._lineage_tip_id||s._parent_lineage_tip_id||null;
+}
+
 function _resolveSessionIdFromSidebarLineage(sid){
   sid=String(sid||'').trim();
   if(!sid||!Array.isArray(_allSessions)||!_allSessions.length) return sid||null;
@@ -5966,7 +6040,11 @@ function _pruneLineageReportCacheToVisibleSessions(sessions){
 }
 
 function _lineageReportCacheKey(s,lineageKey){
-  return lineageKey||_sidebarLineageKeyForRow(s)||null;
+  const key=lineageKey||_sidebarLineageKeyForRow(s)||null;
+  const tip=typeof _authoritativeLineageTipId==='function'
+    ? _authoritativeLineageTipId(s)
+    : s&&(s._lineage_tip_id||s._parent_lineage_tip_id)||null;
+  return key&&tip&&tip!==key?`${key}::${tip}`:key;
 }
 
 function _lineageLocalSegmentCount(s){
@@ -5978,11 +6056,21 @@ function _lineageLocalSegmentCount(s){
 function _lineageReportNeedsFetch(s,lineageKey,segmentCount){
   const key=_lineageReportCacheKey(s,lineageKey);
   if(!s||!s.session_id||!key) return false;
-  if(_lineageReportCache.has(key)||_lineageReportInflight.has(key)) return false;
+  const cached=_lineageReportCache.get(key);
+  const expectedCount=Number(segmentCount||0);
+  if(cached){
+    const cachedCount=Array.isArray(cached.segments)?cached.segments.length:0;
+    if(!cached.error&&expectedCount>0&&cachedCount>0&&cachedCount!==expectedCount){
+      _lineageReportCache.delete(key);
+    } else {
+      return false;
+    }
+  }
+  if(_lineageReportInflight.has(key)) return false;
   return Number(segmentCount||0)>_lineageLocalSegmentCount(s);
 }
 
-function _lineageSegmentsForRender(s,lineageKey){
+function _lineageSegmentsForRender(s,lineageKey,skipCached){
   const segments=[];
   const seen=new Set();
   const currentSid=s&&s.session_id;
@@ -5993,9 +6081,11 @@ function _lineageSegmentsForRender(s,lineageKey){
     segments.push({...seg});
   };
   for(const seg of (Array.isArray(s&&s._lineage_segments)?s._lineage_segments:[])) addSegment(seg);
-  const cached=_lineageReportCache.get(_lineageReportCacheKey(s,lineageKey));
-  if(cached&&Array.isArray(cached.segments)){
-    for(const seg of cached.segments) addSegment(seg);
+  if(!skipCached){
+    const cached=_lineageReportCache.get(_lineageReportCacheKey(s,lineageKey));
+    if(cached&&Array.isArray(cached.segments)){
+      for(const seg of cached.segments) addSegment(seg);
+    }
   }
   return segments;
 }
@@ -6202,6 +6292,9 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       parentRow=resolved.row;
       parentSegment=resolved.seg;
     }
+    if(!parentRow&&child._parent_lineage_tip_id){
+      parentRow=visibleBySid.get(child._parent_lineage_tip_id)||null;
+    }
     if(!parentRow&&child._parent_lineage_root_id){
       parentRow=visibleByLineageKey.get(child._parent_lineage_root_id)||null;
     }
@@ -6306,7 +6399,10 @@ function _collapseSessionLineageForSidebar(sessions){
       if(bSnapshot!==aSnapshot) return aSnapshot-bSnapshot;
       return _sessionTimestampMs(b)-_sessionTimestampMs(a);
     });
-    const chosen=sorted[0];
+    const tipIds=new Set(items.map(item=>typeof _authoritativeLineageTipId==='function'
+      ? _authoritativeLineageTipId(item)
+      : item&&(item._lineage_tip_id||item._parent_lineage_tip_id)||null).filter(Boolean));
+    const chosen=sorted.find(item=>tipIds.has(item&&item.session_id))||sorted[0];
     result.push({...chosen,_lineage_key:key,_lineage_collapsed_count:items.length,_lineage_segments:sorted});
   }
   return result;
@@ -7254,8 +7350,8 @@ function renderSessionListFromCache(){
     const showLineageMetadata=density==='detailed';
     const lineageKey=_sidebarLineageKeyForRow(s);
     const segmentCount=showLineageMetadata?_sessionSegmentCount(s):0;
-    const lineageSegments=showLineageMetadata?_lineageSegmentsForRender(s,lineageKey):[];
     const needsLineageReport=showLineageMetadata?_lineageReportNeedsFetch(s,lineageKey,segmentCount):false;
+    const lineageSegments=showLineageMetadata?_lineageSegmentsForRender(s,lineageKey,needsLineageReport):[];
     const lineageReportKey=showLineageMetadata?_lineageReportCacheKey(s,lineageKey):null;
     const canExpandLineageSegments=showLineageMetadata&&Boolean(lineageKey&&segmentCount>1&&(lineageSegments.length>0||needsLineageReport||_lineageReportInflight.has(lineageReportKey)));
     const lineageSegmentsExpanded=canExpandLineageSegments&&_expandedLineageKeys.has(lineageKey);

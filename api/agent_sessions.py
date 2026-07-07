@@ -1133,6 +1133,9 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
                 parent_root = _continuation_root_id(rows, parent_id)
                 if parent_root:
                     entry['_parent_lineage_root_id'] = parent_root
+                    if parent_root not in lineage_tip_cache:
+                        lineage_tip_cache[parent_root] = freshest_continuation_tip(parent_root)
+                    entry['_parent_lineage_tip_id'] = lineage_tip_cache[parent_root][0]
                 continue
 
         root_id, segment_count = continuation_root_and_depth(sid)

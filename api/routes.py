@@ -579,6 +579,11 @@ def _session_visible_to_active_profile(session_profile, handler=None) -> bool:
 def _request_session_visibility_exempt(method: str, path: str | None) -> bool:
     if not path:
         return False
+    if method == "GET" and path == "/api/session":
+        # Detail-load owns profile mismatch handling so the frontend can switch
+        # to the session's profile instead of treating a valid cross-profile
+        # deep link as a deleted/stale session.
+        return True
     if method != "POST":
         return False
     # Import routes create/claim sessions before normal ownership exists, and
@@ -9136,6 +9141,7 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "_compression_segment_count",
     "_lineage_collapsed_count",
     "_parent_lineage_root_id",
+    "_parent_lineage_tip_id",
     "_cross_surface_child_session",
     "match_type",
     "match_preview",
@@ -9303,6 +9309,15 @@ _LOGIN_LOCALE = {
         "btn": "\u0110\u0103ng nh\u1eadp",
         "invalid_pw": "M\u1eadt kh\u1ea9u kh\u00f4ng h\u1ee3p l\u1ec7",
         "conn_failed": "K\u1ebft n\u1ed1i th\u1ea5t b\u1ea1i",
+    },
+    "cs": {
+        "lang": "cs-CZ",
+        "title": "P\u0159ihl\u00e1sit se",
+        "subtitle": "Zadejte heslo pro pokra\u010dov\u00e1n\u00ed",
+        "placeholder": "Heslo",
+        "btn": "P\u0159ihl\u00e1sit se",
+        "invalid_pw": "Neplatn\u00e9 heslo",
+        "conn_failed": "P\u0159ipojen\u00ed selhalo",
     },
 }
 
@@ -11589,11 +11604,19 @@ def handle_get(handler, parsed) -> bool:
         # which the request-thread wrapper could not reach. See
         # api.config.get_available_models cold path + profile_scope_for_detached_worker.
         freshness = parse_qs(parsed.query or "").get("freshness", [""])[0].strip().lower()
-        if freshness == "session_visit":
-            return j(handler, get_available_models_for_session_visit())
-        if freshness:
-            return bad(handler, f"unknown models freshness: {freshness}", status=400)
-        return j(handler, get_available_models())
+        diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger)
+        try:
+            diag.stage(f"enter:freshness={freshness or 'default'}") if diag else None
+            if freshness == "session_visit":
+                result = get_available_models_for_session_visit()
+                diag.stage("response_serialize") if diag else None
+                return j(handler, result)
+            if freshness:
+                return bad(handler, f"unknown models freshness: {freshness}", status=400)
+            return j(handler, get_available_models())
+        finally:
+            if diag:
+                diag.finish()
 
     if parsed.path == "/api/models/live":
         from api.profiles import profile_env_for_active_request
@@ -11813,6 +11836,20 @@ def handle_get(handler, parsed) -> bool:
             s = get_session(sid, metadata_only=(not load_messages))
             _session_profile = getattr(s, 'profile', None) or None
             if not _session_visible_to_active_profile(_session_profile, handler):
+                if _session_profile:
+                    # Valid session owned by a KNOWN other profile: 409 so the
+                    # client can offer to switch to it (#5419).
+                    return j(handler, {
+                        "error": "Session belongs to a different profile",
+                        "code": "session_profile_mismatch",
+                        "session_id": sid,
+                        "profile": _session_profile,
+                    }, status=409)
+                # Unknown/legacy None-profile sidecar: keep the original 404 so
+                # the frontend's self-heal (clear stale URL + localStorage) still
+                # fires. _profiles_match coerces None->'default', so a truly
+                # missing/legacy session under a non-default active profile would
+                # otherwise emit a useless 409 with profile=null.
                 return bad(handler, "Session not found", 404)
             original_stream_id = getattr(s, "active_stream_id", None)
             _clear_stale_stream_state(s)
@@ -12129,13 +12166,17 @@ def handle_get(handler, parsed) -> bool:
             _t5 = _time.monotonic()
             resp = j(handler, {"session": redact})
             _t6 = _time.monotonic()
-            if _debug_slow:
+            _total_ms = (_t6 - _t0) * 1000
+            # Always log when slow (>2s) so we don't need HERMES_DEBUG_SLOW env var
+            # to diagnose latency regressions. Opt-in env var still forces
+            # logging on every request for development.
+            if _debug_slow or _total_ms >= 2000:
                 logger.warning(
                     "[SLOW] session_id=%s get_session=%.1fms model_resolve=%.1fms "
                     "compact=%.1fms redact=%.1fms json_write=%.1fms total=%.1fms",
                     sid,
                     (_t2-_t1)*1000, (_t3-_t2)*1000, (_t4-_t3)*1000,
-                    (_t5-_t4)*1000, (_t6-_t5)*1000, (_t6-_t0)*1000,
+                    (_t5-_t4)*1000, (_t6-_t5)*1000, _total_ms,
                 )
             return resp
         except KeyError:
@@ -12149,6 +12190,20 @@ def handle_get(handler, parsed) -> bool:
             cli_meta = _lookup_cli_session_metadata(sid)
             _session_profile = (cli_meta or {}).get("profile") or None
             if not _session_visible_to_active_profile(_session_profile, handler):
+                if _session_profile:
+                    # Valid CLI/foreign session owned by a KNOWN other profile:
+                    # 409 so the client can offer to switch to it (#5419).
+                    return j(handler, {
+                        "error": "Session belongs to a different profile",
+                        "code": "session_profile_mismatch",
+                        "session_id": sid,
+                        "profile": _session_profile,
+                    }, status=409)
+                # Missing session (cli_meta={} -> profile=None): keep the 404
+                # self-heal path. _profiles_match coerces None->'default', so a
+                # truly-missing session under a non-default active profile would
+                # otherwise emit a useless 409 with profile=null and skip the
+                # frontend self-heal + spin the SSE reconnect against a dead sid.
                 return bad(handler, "Session not found", 404)
             synth, reason = _claim_or_synthesize_cli_session(sid, cli_meta=cli_meta or {})
             if reason == "was_webui":
@@ -12772,15 +12827,24 @@ def handle_get(handler, parsed) -> bool:
     # ── Profile API (GET) ──
     if parsed.path == "/api/profiles":
         from api import profiles as profiles_api
-
-        return j(
-            handler,
-            {
-                "profiles": profiles_api.list_profiles_api(),
-                "active": profiles_api.get_active_profile_name(),
-                "single_profile_mode": _is_isolated_profile_mode(),
-            },
-        )
+        diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger)
+        try:
+            diag.stage("list_profiles_api") if diag else None
+            profiles_payload = profiles_api.list_profiles_api()
+            diag.stage("active_profile_lookup") if diag else None
+            active = profiles_api.get_active_profile_name()
+            diag.stage("isolated_mode_check") if diag else None
+            return j(
+                handler,
+                {
+                    "profiles": profiles_payload,
+                    "active": active,
+                    "single_profile_mode": _is_isolated_profile_mode(),
+                },
+            )
+        finally:
+            if diag:
+                diag.finish()
 
     if parsed.path == "/api/profile/active":
         from api import profiles as profiles_api
@@ -15188,6 +15252,21 @@ def handle_post(handler, parsed) -> bool:
         from api.updates import apply_force_update
 
         return j(handler, apply_force_update(target))
+
+    if parsed.path == "/api/updates/clear_lock":
+        # Manual-instruction recovery for the .git/index.lock case. The
+        # endpoint NEVER removes a lock file from the server -- it returns
+        # the diagnostic + the exact 'rm' command for the operator, and on
+        # a re-click with the lock already gone, it re-runs the normal
+        # non-destructive apply path. See apply_clear_lock for the v2.2
+        # design rationale (round-2 gate cert: fcntl-flock cannot detect
+        # git's O_CREAT|O_EXCL locks, so any auto-delete path races).
+        target = body.get("target", "")
+        if target not in ("webui", "agent"):
+            return bad(handler, 'target must be "webui" or "agent"')
+        from api.updates import apply_clear_lock
+
+        return j(handler, apply_clear_lock(target))
 
     if parsed.path == "/api/updates/summary":
         from api.updates import summarize_update_payload
