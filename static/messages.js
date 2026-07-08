@@ -2295,6 +2295,48 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _pendingStreamEndRecovery=false;
     _streamEndRecoveryAttempts=0;
   }
+  function _finishRestartCompletion(source, completion){
+    const payload=completion&&typeof completion==='object'?completion:{};
+    const message=String(payload.message||'Hermes restart finished.');
+    const exitCode=Number(payload.exit_code||0);
+    const finalText=exitCode===0
+      ? message
+      : `**Restart finished with errors:** ${message}`;
+    _clearStreamEndRecovery();
+    if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+    _cancelThrottledSnapshotTimer();
+    _terminalStateReached=true;
+    _streamFinalized=true;
+    _cancelAnimationFramePendingStreamRender();
+    _streamFadeCleanupReduceMotionListener();
+    _smdEndParser();
+    if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
+    if(_isActiveSession()){
+      if(!Array.isArray(S.messages)) S.messages=[];
+      const last=S.messages[S.messages.length-1];
+      if(!(last&&last.role==='assistant'&&String(last.content||'')===finalText)){
+        S.messages.push({role:'assistant',content:finalText});
+      }
+      if(S.session){
+        S.session.messages=S.messages;
+        S.session.active_stream_id=null;
+        S.session.pending_user_message=null;
+        S.session.pending_started_at=null;
+      }
+      S.activeStreamId=null;
+      renderMessages({preserveScroll:true});
+    }
+    _clearOwnerInflightState();
+    _clearStreamHidden(activeSid, streamId);
+    _clearStreamNotificationBackground(activeSid, streamId);
+    _scheduleAnchorRegistryCleanup();
+    _clearApprovalForOwner();
+    _clearClarifyForOwner('terminal');
+    renderSessionList();
+    _setActivePaneIdleIfOwner();
+    _closeSource(source);
+    return 'restored';
+  }
   function _liveStreamEndScenePresent(){
     if(assistantText||assistantRow) return true;
     if(String(liveReasoningText||reasoningText||'').trim()) return true;
@@ -2525,6 +2567,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       try{
         if(streamId){
           const st=await api(`/api/chat/stream/status?stream_id=${encodeURIComponent(streamId)}`);
+          if(st&&st.restart_completion){
+            _finishRestartCompletion(source, st.restart_completion);
+            return;
+          }
           if(st.active){
             setComposerStatus('Reconnected');
             _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}`,document.baseURI||location.href).href,{withCredentials:true}));

@@ -12578,6 +12578,9 @@ def handle_get(handler, parsed) -> bool:
             return True
         active = stream_id in STREAMS
         payload = {"active": active, "stream_id": stream_id, "replay_available": False}
+        restart_completion = _read_webui_restart_completion(stream_id) if stream_id else None
+        if restart_completion:
+            payload["restart_completion"] = restart_completion
         try:
             journal = find_run_summary(stream_id) if stream_id else None
         except Exception:
@@ -20366,6 +20369,149 @@ def _webui_moa_command_prompt(message: str) -> tuple[bool, str]:
     return False, text
 
 
+_WEBUI_RESTART_COMMANDS = {
+    "/restart-hermes": "hermes",
+    "/restart_hermes": "hermes",
+    "/restart-gateways": "gateways",
+    "/restart_gateways": "gateways",
+}
+
+
+def _webui_restart_command_scope(message: str) -> str | None:
+    """Return restart scope for exact WebUI restart slash commands."""
+    parts = str(message or "").strip().split()
+    if len(parts) != 1:
+        return None
+    return _WEBUI_RESTART_COMMANDS.get(parts[0].lower())
+
+
+def _webui_restart_marker_path(stream_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(stream_id or ""))[:128]
+    return STATE_DIR / "restart_completions" / f"{safe}.json"
+
+
+def _read_webui_restart_completion(stream_id: str) -> dict | None:
+    path = _webui_restart_marker_path(stream_id)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _start_webui_detached_restart_stream(s, *, msg: str, scope: str) -> dict:
+    """Start a durable restart-helper stream for WebUI-origin slash commands.
+
+    The WebUI process is one of the restart targets for /restart-hermes, so the
+    in-memory stream may die before completion. The detached helper writes a
+    completion marker keyed by stream_id; the new WebUI process exposes it via
+    /api/chat/stream/status so the browser can render the final assistant row
+    after reconnect.
+    """
+    stream_id = f"restart_{uuid.uuid4().hex}"
+    stream = create_stream_channel()
+    started_at = time.time()
+    marker_path = _webui_restart_marker_path(stream_id)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.unlink(missing_ok=True)
+
+    with _get_session_agent_lock(s.session_id):
+        s.active_stream_id = stream_id
+        s.pending_user_message = msg
+        s.pending_attachments = []
+        s.pending_started_at = started_at
+        s.pending_user_source = "webui"
+        if _is_default_or_empty_session_title(getattr(s, "title", None)):
+            s.title = "/restart-hermes" if scope == "hermes" else "/restart-gateways"
+        if get_webui_session_save_mode() == "eager":
+            _checkpoint_user_message_for_eager_session_save(
+                s,
+                msg,
+                [],
+                started_at,
+                source="webui",
+            )
+        s.save()
+    register_stream_owner(stream_id, s.session_id)
+    with STREAMS_LOCK:
+        STREAMS[stream_id] = stream
+
+    def _run_restart() -> None:
+        queued = ""
+        try:
+            from hermes_cli.restart_surfaces import enqueue_detached_restart
+            queued = enqueue_detached_restart(
+                scope,
+                delay=1.0,
+                completion_marker=str(marker_path),
+            )
+            stream.put_nowait(("token", {"text": queued + "\n\n"}))
+            stream.put_nowait(("token", {"text": "Waiting for the detached helper to finish…"}))
+            deadline = time.monotonic() + 10 * 60
+            payload = None
+            while time.monotonic() < deadline:
+                payload = _read_webui_restart_completion(stream_id)
+                if payload and payload.get("status") == "complete":
+                    break
+                time.sleep(1.0)
+            if not payload:
+                payload = {
+                    "status": "complete",
+                    "scope": scope,
+                    "exit_code": 1,
+                    "message": f"Hermes {scope} restart did not report completion before the WebUI watcher timed out.",
+                }
+            message = str(payload.get("message") or queued or "Hermes restart finished.")
+            stream.put_nowait(("token", {"text": "\n\n" + message}))
+            stream.put_nowait(("done", {"session_id": s.session_id, "restart_completion": payload}))
+        except BaseException as exc:
+            message = f"Hermes {scope} restart failed before it could be queued: {exc}"
+            try:
+                marker_path.write_text(
+                    json.dumps(
+                        {
+                            "status": "complete",
+                            "scope": scope,
+                            "exit_code": 1,
+                            "message": message,
+                        },
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            stream.put_nowait(("apperror", {"message": message}))
+        finally:
+            try:
+                current = Session.load(s.session_id) or s
+                current.active_stream_id = None
+                current.pending_user_message = None
+                current.pending_attachments = []
+                current.pending_started_at = None
+                current.save()
+            except Exception:
+                logger.debug("failed to clear WebUI restart stream state", exc_info=True)
+            with STREAMS_LOCK:
+                STREAMS.pop(stream_id, None)
+            unregister_stream_owner(stream_id)
+
+    threading.Thread(
+        target=_run_restart,
+        daemon=True,
+        name=f"webui-restart-{stream_id[:12]}",
+    ).start()
+    return {
+        "stream_id": stream_id,
+        "session_id": s.session_id,
+        "pending_started_at": started_at,
+        "title": s.title,
+        "restart_scope": scope,
+    }
+
+
 def _handle_chat_start(handler, body, diag=None):
     try:
         diag.stage("validate_session_id") if diag else None
@@ -20474,6 +20620,16 @@ def _handle_chat_start(handler, body, diag=None):
             if force_moa_turn:
                 return bad(handler, "message is required after /moa")
             return bad(handler, "message is required")
+        restart_scope = None if force_moa_turn else _webui_restart_command_scope(msg)
+        if restart_scope:
+            diag.stage("start_webui_restart") if diag else None
+            response = _start_webui_detached_restart_stream(
+                s,
+                msg=msg,
+                scope=restart_scope,
+            )
+            diag.stage("response_write") if diag else None
+            return j(handler, response)
         diag.stage("normalize_attachments") if diag else None
         attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
         recovery = compression_recovery_payload_for_session(s)
