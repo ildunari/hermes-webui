@@ -16,8 +16,8 @@ WebUI Python process climbing from ~100 MB to ~1.5 GB RSS over 3 days and holdin
 These tests pin the fixes for all three:
   * ``session_lifecycle.discard_session`` bounds the dict, safely.
   * ``config._env_int`` makes the caps env-overridable with safe fallback.
-  * ``gateway_watcher._cheap_change_fingerprint`` is a sound, cheaper change
-    signal that the poll loop uses to skip the expensive projection.
+  * ``gateway_watcher._cheap_change_fingerprint`` is a small change signal
+    that avoids scanning the full messages table on every idle poll.
 """
 from __future__ import annotations
 
@@ -218,23 +218,35 @@ def test_cheap_fingerprint_stable_and_sensitive(tmp_path):
     assert fp4 != fp3
 
 
-def test_cheap_fingerprint_ignores_excluded_sources(tmp_path):
-    """cron/webui churn must not invalidate the fingerprint (matches projection scope)."""
+def test_cheap_fingerprint_excludes_sources_from_session_aggregate(tmp_path):
+    """cron/webui session rows are excluded, while global message appends still count."""
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
     _add_session(conn, "tg1", "telegram", mc=2)
     fp1 = gw._cheap_change_fingerprint(db)
 
-    # A cron session churns heavily — but cron is excluded from the sidebar, so
-    # the fingerprint (and thus the expensive projection) must NOT fire.
-    _add_session(conn, "cron1", "cron", mc=50)
+    # A cron session row with no messages is outside the sidebar projection, so
+    # the sessions aggregate should not move.
+    conn.execute(
+        "INSERT INTO sessions (id, source, model, started_at, message_count, title) "
+        "VALUES ('cron1', 'cron', 'm', ?, 0, 'cron')",
+        (time.time(),),
+    )
+    conn.commit()
     fp2 = gw._cheap_change_fingerprint(db)
-    assert fp2 == fp1, "cron-only churn must not trigger a re-projection"
+    assert fp2 == fp1, "excluded-source session rows must not move the sessions aggregate"
 
-    # A webui session likewise excluded.
-    _add_session(conn, "webui1", "webui", mc=20)
+    # MAX(messages.id) is intentionally global and catches appends even if a
+    # visible session row's message_count lags; excluded-source message appends
+    # are accepted false positives.
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp) "
+        "VALUES ('cron1', 'user', 'x', ?)",
+        (time.time(),),
+    )
+    conn.commit()
     fp3 = gw._cheap_change_fingerprint(db)
-    assert fp3 == fp1
+    assert fp3 != fp2
 
 
 def test_cheap_fingerprint_detects_source_change(tmp_path):
@@ -277,14 +289,63 @@ def test_cheap_fingerprint_detects_same_count_message_rewrite(tmp_path):
     assert conn.execute("SELECT message_count FROM sessions WHERE id='s1'").fetchone()[0] == 3
     fp2 = gw._cheap_change_fingerprint(db)
     assert fp2 != fp1, (
-        "a same-count transcript rewrite moves MAX(messages.timestamp) and must "
-        "invalidate the fingerprint so the watcher re-projects"
+        "delete+insert transcript rewrites advance MAX(messages.id) and must "
+        "invalidate the fingerprint even when message_count is unchanged"
     )
 
 
-def test_cheap_fingerprint_detects_lineage_only_change(tmp_path):
-    """Lineage/visibility fields the projection uses for collapse (parent_session_id,
-    end_reason, ended_at) must be part of the fingerprint."""
+def test_cheap_fingerprint_does_not_detect_same_row_message_update(tmp_path):
+    """A same-count in-place content/timestamp update does not move the cheap signal."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    _add_session(conn, "s1", "telegram", mc=3)
+    fp1 = gw._cheap_change_fingerprint(db)
+
+    conn.execute(
+        "UPDATE messages SET content = 'rewritten', timestamp = timestamp + 1000 "
+        "WHERE session_id = 's1'"
+    )
+    conn.commit()
+    fp2 = gw._cheap_change_fingerprint(db)
+    assert fp2 == fp1, (
+        "same-count in-place rewrites are outside the O(small) fingerprint"
+    )
+
+
+def test_cheap_fingerprint_detects_lagging_message_count_append(tmp_path):
+    """MAX(messages.id) catches new messages before sessions.message_count updates."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    _add_session(conn, "s1", "telegram", mc=1)
+    fp1 = gw._cheap_change_fingerprint(db)
+
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'late', ?)",
+        ("s1", time.time() + 1000),
+    )
+    conn.commit()
+    assert conn.execute("SELECT message_count FROM sessions WHERE id='s1'").fetchone()[0] == 1
+    fp2 = gw._cheap_change_fingerprint(db)
+    assert fp2 != fp1
+
+
+def test_cheap_fingerprint_detects_message_delete_or_prune(tmp_path):
+    """COUNT(messages) catches deletes/prunes even when MAX(messages.id) is unchanged."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    _add_session(conn, "s1", "telegram", mc=3)
+    fp1 = gw._cheap_change_fingerprint(db)
+
+    conn.execute(
+        "DELETE FROM messages WHERE id = (SELECT MIN(id) FROM messages WHERE session_id = 's1')"
+    )
+    conn.commit()
+    fp2 = gw._cheap_change_fingerprint(db)
+    assert fp2 != fp1
+
+
+def test_cheap_fingerprint_does_not_track_metadata_only_session_updates(tmp_path):
+    """The O(small) signal tracks row existence/source counts, not every metadata column."""
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
     _add_session(conn, "s1", "telegram", mc=2)
@@ -293,17 +354,17 @@ def test_cheap_fingerprint_detects_lineage_only_change(tmp_path):
     conn.execute("UPDATE sessions SET parent_session_id = 'p-root' WHERE id = 's1'")
     conn.commit()
     fp1 = gw._cheap_change_fingerprint(db)
-    assert fp1 != fp0, "parent_session_id change (compression lineage) must be detected"
+    assert fp1 == fp0, "metadata-only lineage changes are outside the cheap aggregate"
 
     conn.execute("UPDATE sessions SET end_reason = 'compressed' WHERE id = 's1'")
     conn.commit()
     fp2 = gw._cheap_change_fingerprint(db)
-    assert fp2 != fp1, "end_reason change must be detected"
+    assert fp2 == fp1, "metadata-only end_reason changes are outside the cheap aggregate"
 
     conn.execute("UPDATE sessions SET ended_at = 1234567890.0 WHERE id = 's1'")
     conn.commit()
     fp3 = gw._cheap_change_fingerprint(db)
-    assert fp3 != fp2, "ended_at change must be detected"
+    assert fp3 == fp2, "metadata-only ended_at changes are outside the cheap aggregate"
 
 
 def test_cheap_fingerprint_handles_missing_db(tmp_path):
@@ -355,6 +416,21 @@ def test_cheap_fingerprint_returns_none_without_source_column(tmp_path):
     conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, started_at REAL)")
     conn.commit()
     assert gw._cheap_change_fingerprint(db) is None
+
+
+def test_gateway_watcher_poll_interval_env_override(tmp_path, monkeypatch):
+    gw = importlib.import_module("api.gateway_watcher")
+    monkeypatch.setenv("HERMES_WEBUI_POLL_INTERVAL", "2.5")
+    watcher = gw.GatewayWatcher(state_db_path=tmp_path / "state.db")
+    assert watcher._poll_interval == 2.5
+
+    monkeypatch.setenv("HERMES_WEBUI_POLL_INTERVAL", "0.1")
+    watcher = gw.GatewayWatcher(state_db_path=tmp_path / "state.db")
+    assert watcher._poll_interval == 1.0
+
+    monkeypatch.setenv("HERMES_WEBUI_POLL_INTERVAL", "not-a-number")
+    watcher = gw.GatewayWatcher(state_db_path=tmp_path / "state.db")
+    assert watcher._poll_interval == gw.GatewayWatcher.POLL_INTERVAL
 
 
 def test_poll_loop_skips_projection_when_unchanged(tmp_path, monkeypatch):
