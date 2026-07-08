@@ -363,3 +363,70 @@ def test_subscribe_after_stop_gets_sentinel_immediately():
     q = watcher.subscribe()
     # The late subscriber must find the sentinel already queued (no block / hang).
     assert q.get_nowait() is None
+
+
+def test_subscribe_wakes_idle_backoff_immediately():
+    from api import gateway_watcher as gw
+
+    watcher = gw.GatewayWatcher(profile_name="wake")
+    assert not watcher._subscriber_wake_event.is_set()
+    watcher.subscribe()
+    assert watcher._subscriber_wake_event.is_set()
+
+
+def test_stop_replaces_full_subscriber_queue_with_sentinel():
+    from api import gateway_watcher as gw
+
+    watcher = gw.GatewayWatcher(profile_name="full")
+    q = watcher.subscribe()
+    while not q.full():
+        q.put_nowait({"type": "stale"})
+
+    watcher.stop()
+
+    queued = []
+    while not q.empty():
+        queued.append(q.get_nowait())
+    assert None in queued
+
+
+def test_profile_restart_does_not_wait_for_retiring_watcher(tmp_path, monkeypatch):
+    from api import gateway_watcher as gw
+    from api import profiles
+
+    target_home = (tmp_path / "target").resolve()
+    stop_entered = threading.Event()
+    release_stop = threading.Event()
+
+    class FakeWatcher:
+        def __init__(self, *, profile_name="", hermes_home=None, state_db_path=None):
+            self.profile_name = profile_name
+            self.hermes_home = hermes_home
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return self.started
+
+        def stop(self):
+            stop_entered.set()
+            assert release_stop.wait(timeout=5)
+            self.started = False
+
+    old = FakeWatcher(profile_name="target", hermes_home=target_home)
+    old.started = True
+    monkeypatch.setattr(gw, "_watchers", {str(target_home): old})
+    monkeypatch.setattr(gw, "_retiring_watchers", set())
+    monkeypatch.setattr(gw, "GatewayWatcher", FakeWatcher)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda _name: target_home)
+
+    replacement = gw.restart_watcher_for_profile("target")
+
+    assert replacement is gw._watchers[str(target_home)]
+    assert replacement is not old
+    assert stop_entered.wait(timeout=1)
+    with gw._retiring_watcher_lock:
+        assert old in gw._retiring_watchers
+    release_stop.set()

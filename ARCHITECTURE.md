@@ -140,6 +140,9 @@ Environment variables controlling behavior:
     HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT Optional command that prints JSON messages or plain-text user prefill context
     HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT_TIMEOUT Optional script timeout in seconds (default 5, max 30)
     HERMES_WEBUI_PREFILL_CONTEXT_MAX_CHARS Optional parsed prefill budget in characters (default 12000, 0 disables)
+    HERMES_WEBUI_AGENT_CACHE_MAX Optional live-agent LRU bound (default 25)
+    HERMES_WEBUI_POLL_INTERVAL   Gateway watcher poll seconds (default 5, minimum 1)
+    HERMES_WEBUI_POLL_IDLE_BACKOFF Idle no-subscriber multiplier (default 4, minimum 1)
     HERMES_HOME                    Base directory for Hermes state (~/.hermes by default)
 
 Test isolation environment variables (set by conftest.py):

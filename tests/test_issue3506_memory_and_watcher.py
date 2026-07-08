@@ -433,6 +433,21 @@ def test_gateway_watcher_poll_interval_env_override(tmp_path, monkeypatch):
     assert watcher._poll_interval == gw.GatewayWatcher.POLL_INTERVAL
 
 
+def test_gateway_watcher_idle_backoff_env_override(tmp_path, monkeypatch):
+    gw = importlib.import_module("api.gateway_watcher")
+    monkeypatch.setenv("HERMES_WEBUI_POLL_IDLE_BACKOFF", "7.5")
+    watcher = gw.GatewayWatcher(state_db_path=tmp_path / "state.db")
+    assert watcher._idle_backoff_multiplier == 7.5
+
+    monkeypatch.setenv("HERMES_WEBUI_POLL_IDLE_BACKOFF", "0")
+    watcher = gw.GatewayWatcher(state_db_path=tmp_path / "state.db")
+    assert watcher._idle_backoff_multiplier == 1.0
+
+    monkeypatch.setenv("HERMES_WEBUI_POLL_IDLE_BACKOFF", "invalid")
+    watcher = gw.GatewayWatcher(state_db_path=tmp_path / "state.db")
+    assert watcher._idle_backoff_multiplier == watcher.IDLE_BACKOFF_MULTIPLIER
+
+
 def test_poll_loop_skips_projection_when_unchanged(tmp_path, monkeypatch):
     """The poll body must call the expensive projection only when the cheap fp changes."""
     gw = importlib.import_module("api.gateway_watcher")

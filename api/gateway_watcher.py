@@ -9,11 +9,9 @@ This enables real-time session list updates in the sidebar without
 requiring any changes to hermes-agent.
 """
 import hashlib
-import json
 import logging
 import os
 import queue
-import sqlite3
 import threading
 import time
 from contextlib import closing
@@ -38,109 +36,80 @@ def _snapshot_hash(sessions: list) -> str:
 
 # Sources excluded from the WebUI sidebar projection. Must match the default
 # ``exclude_sources`` used by ``read_importable_agent_session_rows`` so the
-# cheap change-detection scan below sees exactly the same row set as the
-# expensive projection (otherwise cron message churn would defeat the gate).
+# sessions-table aggregate tracks the same row set as the expensive projection.
 _WATCHER_EXCLUDED_SOURCES = ("cron", "webui")
 
 
 def _cheap_change_fingerprint(db_path: Path) -> str | None:
-    """Compute a cheap change-detection fingerprint without the messages JOIN.
+    """Compute a small change-detection fingerprint without scanning messages.
 
-    The expensive projection (``read_importable_agent_session_rows``) runs a CTE
-    plus a per-session ``MAX(messages.timestamp)`` aggregation over an oversampled
-    candidate set every poll. On a large ``state.db`` (hundreds of sessions, tens
-    of thousands of messages) that is ~10x the cost of a single ``sessions``-table
-    scan, and the watcher runs it forever on a 5s timer even when nothing changed
-    (issue #3506).
-
-    This computes a fingerprint from a ``sessions``-table-only scan (no messages
-    JOIN), scoped to the same non-cron/webui rows as the projection. To guarantee
-    it never skips a change the projection would reflect, it hashes **every
-    sessions-table column the projection reads or uses for visibility/collapse**
-    -- not just the columns surfaced to the sidebar. That matters because the
-    projection collapses compression lineage and hides/shows rows based on
-    ``parent_session_id`` / ``ended_at`` / ``end_reason`` / ``source``, so a change
-    to one of those alters *which rows* appear even when no displayed field on a
-    given row moved.
-
-    The one projection input that does not live in the ``sessions`` table is the
-    per-session message aggregate (``COUNT`` / ``MAX(messages.timestamp)`` ->
-    ``last_activity``). That is fully proxied by ``sessions.message_count``: the
-    agent's state layer bumps ``message_count`` on every appended message and
-    rewrites it to the absolute count on truncate/rewind/compaction, so a message
-    insert or delete (the only events that can move ``MAX(timestamp)``) always
-    changes ``message_count``. The fingerprint is therefore a strict superset of
-    the projection's change surface (it also fires on out-of-order inserts that
-    would not raise ``MAX(timestamp)``).
+    The watcher only needs to know whether it should pay for the full sidebar
+    projection. Use covering-index aggregates over ``sessions`` and
+    ``messages``: visible session counts/max rowids by source, plus message
+    count and ``MAX(messages.id)``. In current Hermes state DBs, ``messages.id``
+    is an INTEGER PRIMARY KEY/rowid, so SQLite can answer the max from the table
+    btree instead of aggregating every message row.
 
     Returns the fingerprint string, or ``None`` on any error / a pre-source
     schema so the caller falls back to running the expensive projection rather
     than risk skipping a change.
     """
-    # Columns the projection reads from the ``sessions`` table. ``id``/``source``
-    # are always present (``source`` is required for the projection to run at
-    # all); the rest are optional on older agent schemas and filtered below.
-    _PROJECTION_SESSION_COLS = (
-        'id', 'source', 'session_source', 'title', 'model', 'message_count',
-        'started_at', 'ended_at', 'end_reason', 'parent_session_id', 'archived',
-        'user_id', 'chat_id', 'chat_type', 'thread_id', 'session_key',
-        'origin_chat_id', 'origin_user_id', 'platform',
-    )
     try:
         with closing(open_state_db_readonly(db_path)) as conn:
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
-            cols = {row[1] for row in cur.fetchall()}
-            if 'source' not in cols:
+            session_cols = {row[1] for row in cur.fetchall()}
+            if not session_cols:
                 return None
-            selectable = [c for c in _PROJECTION_SESSION_COLS if c in cols]
+            if 'source' not in session_cols:
+                return None
+
             placeholders = ", ".join("?" for _ in _WATCHER_EXCLUDED_SOURCES)
             cur.execute(
-                f"SELECT {', '.join(selectable)} FROM sessions "
+                "SELECT source, COUNT(*), COALESCE(MAX(rowid), 0) "
+                f"FROM sessions "
                 f"WHERE source IS NOT NULL AND source NOT IN ({placeholders}) "
-                f"ORDER BY id",
+                "GROUP BY source ORDER BY source",
                 list(_WATCHER_EXCLUDED_SOURCES),
             )
             h = hashlib.md5(usedforsecurity=False)
             for row in cur.fetchall():
                 h.update(repr(row).encode('utf-8', 'replace'))
                 h.update(b'\x1e')
-            # A same-count transcript rewrite (SessionDB.replace_messages used by
-            # /retry, /undo, /compress) deletes + reinserts messages with new
-            # timestamps but can leave sessions.message_count unchanged — so the
-            # sessions-only scan above would miss it and the watcher would skip a
-            # projection whose last_activity (MAX(messages.timestamp)) actually
-            # moved. Fold in a PER-SESSION message aggregate, scoped to the same
-            # non-excluded sessions as the projection. It must be per-session
-            # (grouped), NOT a single global MAX: rewriting an OLDER, non-newest
-            # session moves that session's last_activity but not the global max,
-            # so a global aggregate would still miss it (#3536 review round 2).
-            # cron/webui churn is excluded by the JOIN filter so it still does
-            # NOT trigger a re-projection. This is one GROUP BY over the already-
-            # filtered set — far cheaper than the projection's oversampled
-            # correlated CTE — so it preserves the cheap-fingerprint property.
-            if 'messages' in {r[0] for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}:
-                try:
-                    msg_rows = conn.execute(
-                        "SELECT s.id, COUNT(m.id), "
-                        "COUNT(CASE WHEN LOWER(m.role) = 'user' THEN 1 END), "
-                        "COALESCE(MAX(m.timestamp), 0) "
-                        "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
-                        f"WHERE s.source IS NOT NULL AND s.source NOT IN ({placeholders}) "
-                        "GROUP BY s.id ORDER BY s.id",
-                        list(_WATCHER_EXCLUDED_SOURCES),
-                    ).fetchall()
-                    for mrow in msg_rows:
-                        h.update(repr(mrow).encode('utf-8', 'replace'))
-                        h.update(b'\x1e')
-                except sqlite3.Error:
-                    # messages table shape unknown → don't trust the fingerprint;
-                    # signal the caller to run the full projection.
+
+            table_names = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if 'messages' in table_names:
+                cur.execute("PRAGMA table_info(messages)")
+                message_cols = {row[1]: row for row in cur.fetchall()}
+                id_info = message_cols.get('id')
+                if id_info is None:
                     return None
+                id_type = str(id_info[2] or "").upper()
+                if int(id_info[5] or 0) != 1 or "INT" not in id_type:
+                    return None
+                msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                msg_max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
+            else:
+                msg_count = 0
+                msg_max_id = 0
+            h.update(repr(("messages", msg_count, msg_max_id)).encode('utf-8', 'replace'))
             return h.hexdigest()
     except Exception:
         return None
+
+
+def _positive_float_from_env(name: str, default: float, *, minimum: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return float(default)
+    try:
+        return max(minimum, float(raw))
+    except (TypeError, ValueError):
+        return float(default)
 
 
 # ── DB resolution (shared pattern with state_sync.py) ──────────────────────
@@ -199,7 +168,9 @@ class GatewayWatcher:
         watcher.stop()
     """
 
-    POLL_INTERVAL = 5  # seconds between polls
+    # HERMES_WEBUI_POLL_INTERVAL overrides this per watcher instance; minimum 1s.
+    POLL_INTERVAL = 5.0  # seconds between polls
+    IDLE_BACKOFF_MULTIPLIER = 4.0
     SUBSCRIBER_TIMEOUT = 30  # seconds before sending keepalive comment
 
     def __init__(
@@ -212,6 +183,7 @@ class GatewayWatcher:
         self._subscribers: list[queue.Queue] = []
         self._sub_lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._subscriber_wake_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._hermes_home = Path(hermes_home).expanduser().resolve() if hermes_home else None
         self._state_db_path = (
@@ -220,6 +192,14 @@ class GatewayWatcher:
             else _get_state_db_path(self._hermes_home) if self._hermes_home is not None else _get_state_db_path()
         )
         self.profile_name = profile_name or ""
+        self._poll_interval = _positive_float_from_env(
+            "HERMES_WEBUI_POLL_INTERVAL", self.POLL_INTERVAL, minimum=1.0
+        )
+        self._idle_backoff_multiplier = _positive_float_from_env(
+            "HERMES_WEBUI_POLL_IDLE_BACKOFF",
+            self.IDLE_BACKOFF_MULTIPLIER,
+            minimum=1.0,
+        )
         self._last_hash: str = ''
         self._last_sessions: list = []
         # Cheap sessions-only fingerprint from the previous poll. When it is
@@ -251,16 +231,26 @@ class GatewayWatcher:
     def stop(self):
         """Stop the watcher thread."""
         self._stop_event.set()
+        self._subscriber_wake_event.set()
         # Wake up any subscribers
         with self._sub_lock:
             for q in self._subscribers:
                 try:
-                    q.put(None)  # sentinel
+                    q.put_nowait(None)  # sentinel
+                except queue.Full:
+                    # Never block profile switching behind a slow SSE client.
+                    # Drop one stale event and replace it with the terminal marker.
+                    try:
+                        q.get_nowait()
+                        q.put_nowait(None)
+                    except (queue.Empty, queue.Full):
+                        pass
                 except Exception:
                     logger.debug("Failed to send sentinel to subscriber")
         if self._thread:
             self._thread.join(timeout=3)
-            self._thread = None
+            if not self._thread.is_alive():
+                self._thread = None
 
     def subscribe(self) -> queue.Queue:
         """Subscribe to change events. Returns a queue.Queue.
@@ -270,6 +260,7 @@ class GatewayWatcher:
         q = queue.Queue(maxsize=10)
         with self._sub_lock:
             self._subscribers.append(q)
+            self._subscriber_wake_event.set()
             # Stop-race safety: if stop() already ran (set _stop_event and drained
             # the then-current subscriber list) before we appended, this queue would
             # never receive the sentinel and the SSE loop would hang open with
@@ -289,6 +280,10 @@ class GatewayWatcher:
                 self._subscribers.remove(q)
             except ValueError:
                 pass
+
+    def _has_subscribers(self) -> bool:
+        with self._sub_lock:
+            return bool(self._subscribers)
 
     def _notify_subscribers(self, sessions: list):
         """Push change event to all subscribers."""
@@ -320,6 +315,7 @@ class GatewayWatcher:
     def _poll_loop(self):
         """Main polling loop. Runs in a daemon thread."""
         while not self._stop_event.is_set():
+            has_subscribers = self._has_subscribers()
             try:
                 # Phase 1: cheap sessions-only fingerprint. The expensive
                 # messages-JOIN projection (_get_agent_sessions_from_db) only
@@ -349,9 +345,17 @@ class GatewayWatcher:
                 logger.debug("Error in gateway watcher poll loop", exc_info=True)
 
             # Sleep in small increments so we can stop promptly
-            for _ in range(self.POLL_INTERVAL * 10):
+            sleep_for = (
+                self._poll_interval
+                if has_subscribers
+                else self._poll_interval * self._idle_backoff_multiplier
+            )
+            for _ in range(max(1, int(sleep_for * 10))):
                 if self._stop_event.is_set():
                     return
+                if self._subscriber_wake_event.is_set():
+                    self._subscriber_wake_event.clear()
+                    break
                 time.sleep(0.1)
 
 
@@ -359,6 +363,35 @@ class GatewayWatcher:
 
 _watchers: dict[str, GatewayWatcher] = {}
 _watcher_lock = threading.Lock()
+_retiring_watchers: set[GatewayWatcher] = set()
+_retiring_watcher_lock = threading.Lock()
+
+
+def _retire_watcher_async(watcher: GatewayWatcher | None) -> None:
+    """Stop a replaced watcher off the profile-switch request thread.
+
+    Keep a strong reference until ``stop`` has joined (or timed out) so a live
+    retiring watcher/thread is never lost merely because the registry swapped.
+    """
+    if watcher is None:
+        return
+    with _retiring_watcher_lock:
+        if watcher in _retiring_watchers:
+            return
+        _retiring_watchers.add(watcher)
+
+    def _retire() -> None:
+        try:
+            watcher.stop()
+        finally:
+            with _retiring_watcher_lock:
+                _retiring_watchers.discard(watcher)
+
+    threading.Thread(
+        target=_retire,
+        daemon=True,
+        name=f"gateway-watcher-retire-{watcher.profile_name or 'default'}",
+    ).start()
 
 def _resolve_watcher_target(
     *,
@@ -419,15 +452,16 @@ def start_watcher(*, profile_name: str | None = None, hermes_home: Path | None =
         hermes_home=hermes_home,
     )
     key = _watcher_registry_key(resolved_profile, resolved_home)
+    retiring = None
     with _watcher_lock:
         watcher = _watchers.get(key)
         if watcher is None or not watcher.is_alive():
-            if watcher is not None:
-                watcher.stop()
+            retiring = watcher
             watcher = GatewayWatcher(profile_name=resolved_profile, hermes_home=resolved_home)
             watcher.start()
             _watchers[key] = watcher
-        return watcher
+    _retire_watcher_async(retiring)
+    return watcher
 
 
 def stop_watcher(*, profile_name: str | None = None, hermes_home: Path | None = None):
@@ -461,7 +495,7 @@ def restart_watcher_for_profile(name: str):
         stale_watchers = [] if existing is not None else _pop_idle_watchers_locked(exclude_key=key)
         _watchers[key] = watcher
     for old_watcher in ([existing] if existing is not None else stale_watchers):
-        old_watcher.stop()
+        _retire_watcher_async(old_watcher)
     return watcher
 
 
