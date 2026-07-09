@@ -14291,7 +14291,10 @@ function renderMessages(options){
     // preserved user message as a fresh turn. Deliberately NOT automatic —
     // recovery must never silently re-run a turn whose tools may have had
     // side effects; the user stays in the loop with one click.
-    const resumeBtnHtml = (!isUser && m.type==='interrupted'
+    // ONLY on the last assistant message: resume truncates everything after
+    // the marker, so offering it on an older mid-transcript marker (a session
+    // the user already continued past) would silently delete newer turns.
+    const resumeBtnHtml = (!isUser && m.type==='interrupted' && isLastAssistant
         && !(typeof _isReadOnlySession==='function' && _isReadOnlySession(S.session)))
       ? `<div class="interrupted-resume-row"><button class="update-btn update-primary interrupted-resume-btn" onclick="continueInterruptedTurn(this)">${li('rotate-ccw',13)} Resume this turn</button></div>`
       : '';
