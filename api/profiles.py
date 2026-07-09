@@ -1914,6 +1914,11 @@ def _build_profile_rows_fast() -> list | None:
         for entry in sorted(profiles_root.iterdir()):
             if not entry.is_dir():
                 continue
+            if entry.name == 'default':
+                # Match upstream list_profiles(): the base Hermes home is already
+                # represented by the hardcoded "default" row above. A stray
+                # profiles/default directory must not render as a second Default.
+                continue
             if not _UPSTREAM_PROFILE_ID_RE.match(entry.name):
                 continue
             rows.append(_row(entry, entry.name, False))

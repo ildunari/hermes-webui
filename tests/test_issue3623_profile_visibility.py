@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 import types
 from pathlib import Path
@@ -83,6 +84,35 @@ def test_default_profile_fallback_stays_visible(monkeypatch):
     monkeypatch.setattr(profiles, "_get_profile_skills_stats", lambda _path: (0, 0))
 
     assert profiles._default_profile_dict()["visible"] is True
+
+
+def test_fast_profile_rows_skip_stray_named_default(monkeypatch, tmp_path):
+    import api.profiles as profiles
+
+    base = tmp_path / ".hermes"
+    profiles_root = base / "profiles"
+    default_child = profiles_root / "default"
+    gpt_child = profiles_root / "gpt"
+    default_child.mkdir(parents=True)
+    gpt_child.mkdir()
+
+    hermes_cli = types.ModuleType("hermes_cli")
+    profiles_mod = types.ModuleType("hermes_cli.profiles")
+    setattr(profiles_mod, "_get_default_hermes_home", lambda: base)
+    setattr(profiles_mod, "_get_profiles_root", lambda: profiles_root)
+    setattr(profiles_mod, "_read_config_model", lambda _home: (None, None))
+    setattr(profiles_mod, "_check_gateway_running", lambda _home: False)
+    setattr(profiles_mod, "_PROFILE_ID_RE", re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$"))
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.profiles", profiles_mod)
+    monkeypatch.setattr(profiles, "_get_profile_skills_stats", lambda _path: (0, 0))
+
+    rows = profiles._build_profile_rows_fast()
+
+    assert rows is not None
+    assert [row["name"] for row in rows] == ["default", "gpt"]
+    assert rows[0]["path"] == str(base)
+    assert all(row["path"] != str(default_child) for row in rows)
 
 
 def _panels_js() -> str:
