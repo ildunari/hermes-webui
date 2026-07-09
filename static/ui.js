@@ -14285,6 +14285,17 @@ function renderMessages(options){
     const recoveryHtml=recoveryPayload ? _compressionRecoveryHtml(recoveryPayload, (S.session&&S.session.session_id)||'') : '';
     if(recoveryHtml) bodyHtml += recoveryHtml;
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
+    // Interrupted-turn resume affordance (#restart-drain follow-up): a server
+    // restart that killed this turn leaves a type:'interrupted' marker. Offer
+    // an explicit one-tap resume that truncates the marker and re-sends the
+    // preserved user message as a fresh turn. Deliberately NOT automatic —
+    // recovery must never silently re-run a turn whose tools may have had
+    // side effects; the user stays in the loop with one click.
+    const resumeBtnHtml = (!isUser && m.type==='interrupted'
+        && !(typeof _isReadOnlySession==='function' && _isReadOnlySession(S.session)))
+      ? `<div class="interrupted-resume-row"><button class="update-btn update-primary interrupted-resume-btn" onclick="continueInterruptedTurn(this)">${li('rotate-ccw',13)} Resume this turn</button></div>`
+      : '';
+    if(resumeBtnHtml) bodyHtml += resumeBtnHtml;
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
@@ -16421,6 +16432,23 @@ async function regenerateResponse(btn) {
   const row = btn.closest('[data-msg-idx]');
   if(!row) return;
   const assistantIdx = parseInt(row.dataset.msgIdx, 10);
+  return _truncateAndResendFrom(assistantIdx, {failMsgKey:'regen_failed'});
+}
+
+// One-tap resume for a turn killed by a server restart. The interrupted
+// marker's preserved user message is re-sent as a FRESH turn (the dead
+// worker's in-RAM state cannot be resumed; see turn-journal RFC — recovery
+// must not silently resume a provider call). Reuses the regenerate path:
+// truncate at the marker, put the user text back, send.
+async function continueInterruptedTurn(btn) {
+  if(!S.session || S.busy) return;
+  const row = btn.closest('[data-msg-idx]');
+  if(!row) return;
+  const markerIdx = parseInt(row.dataset.msgIdx, 10);
+  return _truncateAndResendFrom(markerIdx, {failMsgKey:'regen_failed'});
+}
+
+async function _truncateAndResendFrom(assistantIdx, opts) {
   const absoluteKeepCount = _oldestIdx + assistantIdx;
   const initialSid = S.session.session_id;
   let lastUserText = '';
@@ -16442,7 +16470,7 @@ async function regenerateResponse(btn) {
     renderMessages();
     $('msg').value = lastUserText;
     await send();
-  } catch(e) { setStatus(t('regen_failed') + e.message); }
+  } catch(e) { setStatus(t((opts&&opts.failMsgKey)||'regen_failed') + e.message); }
 }
 
 // postProcessRenderedMessages() runs one frame AFTER the render + JS scroll
