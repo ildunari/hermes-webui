@@ -59,55 +59,6 @@ from api.gateway_restart import restart_active_profile_gateway
 logger = logging.getLogger(__name__)
 
 
-def _is_internal_wakeup_source(source) -> bool:
-    """Return True for server-internal wakeup prompts, not human-authored chat."""
-    return str(source or "").strip() == "process_wakeup"
-
-
-def _is_internal_wakeup_text(text) -> bool:
-    """Return True for legacy wakeup prompts that were persisted before _source tags."""
-    value = str(text or "").lstrip()
-    return (
-        value.startswith("[IMPORTANT: Background process")
-        or value.startswith("[IMPORTANT: Watch-pattern")
-        or value.startswith("[IMPORTANT: Watch patterns")
-        or value.startswith("[ASYNC DELEGATION")
-    )
-
-
-def _is_internal_wakeup_message_for_display(msg) -> bool:
-    """Return True for server-internal wakeup prompts that clients must not render."""
-    if not isinstance(msg, dict) or msg.get("role") != "user":
-        return False
-    if _is_internal_wakeup_source(msg.get("_source")):
-        return True
-    return _is_internal_wakeup_text(msg.get("content"))
-
-
-def _visible_messages_for_client(messages) -> list:
-    """Filter internal process/subagent wakeup rows out of API-visible transcripts."""
-    return [m for m in list(messages or []) if not _is_internal_wakeup_message_for_display(m)]
-
-
-def _pending_user_message_for_client(session):
-    """Hide server-internal wakeup prompts while preserving active stream metadata."""
-    pending = getattr(session, "pending_user_message", None)
-    if not pending:
-        return pending
-    if _is_internal_wakeup_source(getattr(session, "pending_user_source", None)):
-        return None
-    if _is_internal_wakeup_text(pending):
-        return None
-    return pending
-
-
-def _pending_user_source_for_client(session):
-    """Hide the source tag when the pending message itself is hidden."""
-    if _pending_user_message_for_client(session) is None:
-        return None
-    return getattr(session, "pending_user_source", None)
-
-
 def _publish_session_list_changed(
     reason: str,
     *,
@@ -1941,9 +1892,8 @@ def _session_list_cache_key(
     active_profile: str | None,
     all_profiles: bool,
     show_cli_sessions: bool,
-    show_messaging_sessions: bool = False,
-    show_previous_messaging_sessions: bool = False,
-    show_cron_sessions: bool = False,
+    show_previous_messaging_sessions: bool,
+    show_cron_sessions: bool,
     include_archived: bool = False,
     exclude_hidden: bool = False,
     visible_only: bool = False,
@@ -1958,7 +1908,6 @@ def _session_list_cache_key(
         active_profile=active_profile,
         all_profiles=all_profiles,
         show_cli_sessions=show_cli_sessions,
-        show_messaging_sessions=show_messaging_sessions,
         show_previous_messaging_sessions=show_previous_messaging_sessions,
         show_cron_sessions=show_cron_sessions,
         include_archived=include_archived,
@@ -2215,7 +2164,6 @@ def _build_session_list_cache_payload(
     archived_limit: int | None = None,
     archived_offset: int = 0,
     diag=None,
-    show_messaging_sessions: bool = False,
 ) -> dict:
     diag_stage = diag.stage if diag is not None else lambda *_a, **_k: None
 
@@ -2259,7 +2207,6 @@ def _build_session_list_cache_payload(
         webui_sessions = _all_sessions_for_sidebar()
     diag_stage("normalize_cli_rows")
     show_cli_sessions = bool(show_cli_sessions)
-    show_messaging_sessions = bool(show_messaging_sessions)
     show_previous_messaging_sessions = bool(show_previous_messaging_sessions)
     show_cron_sessions = bool(show_cron_sessions)
     show_webhook_sessions = bool(show_webhook_sessions)
@@ -2453,15 +2400,6 @@ def _build_session_list_cache_payload(
     else:
         scoped = [s for s in merged if _profiles_match(s.get("profile"), active_profile)]
         other_profile_count = 0 if _is_isolated_profile_mode() else len(merged) - len(scoped)
-    diag_stage("source_visibility")
-    scoped = [
-        s for s in scoped
-        if _session_allowed_by_webui_source_visibility(
-            s,
-            show_messaging_sessions=show_messaging_sessions,
-            show_cron_sessions=show_cron_sessions,
-        )
-    ]
     diag_stage("messaging_dedupe")
     archived_scoped = _keep_latest_messaging_session_per_source(
         list(scoped),
@@ -2587,7 +2525,6 @@ def _build_session_list_cache_payload(
         "other_profile_count": other_profile_count,
         "settings": {
             "show_cli_sessions": show_cli_sessions,
-            "show_messaging_sessions": show_messaging_sessions,
             "show_previous_messaging_sessions": show_previous_messaging_sessions,
             "show_cron_sessions": show_cron_sessions,
             "show_claude_code_sessions": show_claude_code_sessions if show_cli_sessions else False,
@@ -2849,7 +2786,6 @@ from api.config import (
     STREAM_LAST_EVENT_ID,
     SERVER_START_TIME,
     _resolve_cli_toolsets,
-    _INDEX_HTML_PATH,
     get_available_models,
     get_available_models_for_session_visit,
     _provider_is_known_or_configured,
@@ -2885,9 +2821,11 @@ from api.config import (
     _load_yaml_config_file,
     _save_yaml_config_file,
     reload_config,
+    get_config_for_profile_home,
     _cfg_lock,
     PENDING_BG_TASK_COMPLETIONS,
 )
+from api import config as api_config
 from api.helpers import (
     require,
     bad,
@@ -6324,6 +6262,15 @@ def _read_profile_model_config(
     does not override the session provider. ``profile_default_model`` is still
     returned for suffix repair (#5127) only when the profile's configured
     provider matches ``requested_provider`` after normalization.
+
+    perf(webui/session-load-latency) tier2a: the parse is wrapped in a
+    per-process LRU keyed by (profile_name, config_mtime, size). The
+    function fires on every chat-open for sessions under a named
+    profile (resolve_model=1 path), and the YAML parse alone is
+    hundreds of µs to single-digit ms on the Chromebook. Cache TTL
+    60s is a backstop in case mtime resolution is poor on a given
+    filesystem; under normal edits the mtime changes and invalidates
+    immediately.
     """
     if not getattr(session, "profile", None):
         return None, None, None
@@ -6331,15 +6278,13 @@ def _read_profile_model_config(
     try:
         from api.profiles import get_hermes_home_for_profile
 
-        _profile_home = get_hermes_home_for_profile(session.profile)
+        _profile_name = str(session.profile or "")
+        _profile_home = get_hermes_home_for_profile(_profile_name)
         _profile_cfg_path = os.path.join(str(_profile_home), "config.yaml")
         if not os.path.isfile(_profile_cfg_path):
             return None, None, None
-        import yaml
-
-        with open(_profile_cfg_path, encoding="utf-8") as _f:
-            _pcfg = yaml.safe_load(_f) or {}
-        if not isinstance(_pcfg, dict):
+        _pcfg = _read_profile_config_cached(_profile_name, _profile_cfg_path)
+        if _pcfg is None:
             return None, None, None
         _model_cfg = _pcfg.get("model") or {}
         if not isinstance(_model_cfg, dict):
@@ -6361,6 +6306,89 @@ def _read_profile_model_config(
             return None, None, _pcfg
         return None, _default, _pcfg
     return _provider, _default, _pcfg
+
+
+# perf(webui/session-load-latency) tier2a: process-wide cache for parsed
+# profile config.yaml. Key = (profile_name, inode, mtime, size); value = parsed
+# dict. inode tracks atomic-rename edits (most editors replace files, giving a
+# new inode on Linux). mtime+size auto-invalidates on in-place edits; a 60s TTL
+# is the backstop in case of coarse mtime resolution (some network filesystems
+# round mtime to whole seconds — the size guard catches a write of equal-length
+# bytes within the same second). On cache hit, a full-content comparison catches
+# any in-place rewrite that inode+mtime+size missed (Greptile P1, PR#5803
+# discussion_r3548477915). Reading and comparing the full file content (~1-10KB)
+# is much cheaper than yaml.safe_load(). Reads are guarded by a single Lock to
+# keep the hot path simple; the underlying yaml.safe_load is the slow step, not
+# the lock, so contention is bounded.
+_PROFILE_CONFIG_CACHE: "dict[tuple, tuple[float, str, dict]]" = {}
+_PROFILE_CONFIG_CACHE_TTL_SECONDS = 60.0
+_PROFILE_CONFIG_CACHE_LOCK = threading.Lock()
+
+
+def _read_profile_config_cached(profile_name: str, cfg_path: str) -> dict | None:
+    """Return parsed profile config, caching by (inode, mtime, size) with
+    TTL backstop and full-content verification.
+
+    The full-content comparison reads the current file and compares it to a
+    copy stored in the cache entry. This catches any in-place rewrite where
+    inode+mtime+size are identical, regardless of where in the file the change
+    occurs — unlike a fixed-length prefix comparison, edits to fields after the
+    first N characters are always detected. Reading and comparing the full file
+    content (~1-10KB for a typical config.yaml) is much cheaper than
+    yaml.safe_load().
+
+    NOTE: The cache key uses inode+mtime+size to handle the common cases
+    (atomic-rename editors -> new inode; in-place editors -> mtime/size
+    change). The full-content comparison is a backstop for the rare case where
+    all three collide (e.g., sed -i on a filesystem with coarse mtime
+    resolution, writing the same byte count).
+    """
+    try:
+        st = os.stat(cfg_path)
+    except OSError:
+        return None
+    mtime = float(getattr(st, "st_mtime", 0.0) or 0.0)
+    size = int(getattr(st, "st_size", 0) or 0)
+    inode = int(getattr(st, "st_ino", 0) or 0)
+    key = (str(profile_name or ""), inode, mtime, size)
+    now = time.monotonic()
+    with _PROFILE_CONFIG_CACHE_LOCK:
+        cached = _PROFILE_CONFIG_CACHE.get(key)
+        if cached is not None:
+            cached_at, cached_content, cached_dict = cached
+            if (now - cached_at) <= _PROFILE_CONFIG_CACHE_TTL_SECONDS:
+                # Full content comparison catches any in-place rewrite where
+                # inode+mtime+size are identical but the file content changed.
+                # Reading and comparing the full file (~1-10KB) is cheaper than
+                # yaml.safe_load(). Unlike a fixed-length prefix, this detects
+                # edits anywhere in the file. Greptile P1 (PR#5803).
+                _current_content = None
+                try:
+                    with open(cfg_path, "r", encoding="utf-8") as _f:
+                        _current_content = _f.read()
+                except Exception:
+                    pass
+                if _current_content == cached_content:
+                    return cached_dict
+                # Content changed while key collided — fall through to re-parse
+    import yaml
+    try:
+        with open(cfg_path, encoding="utf-8") as _f:
+            content = _f.read()
+            parsed = yaml.safe_load(content) or {}
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    with _PROFILE_CONFIG_CACHE_LOCK:
+        _PROFILE_CONFIG_CACHE[key] = (now, content, parsed)
+        # Cap the cache at 32 entries; profiles are bounded in practice
+        # and unbounded growth would be a leak.
+        if len(_PROFILE_CONFIG_CACHE) > 32:
+            # Drop the oldest entry by insertion order (dict is ordered).
+            for old_key in list(_PROFILE_CONFIG_CACHE.keys())[:max(0, len(_PROFILE_CONFIG_CACHE) - 32)]:
+                _PROFILE_CONFIG_CACHE.pop(old_key, None)
+    return parsed
 
 
 def _load_profile_config_dict(session) -> dict | None:
@@ -7211,7 +7239,7 @@ def _session_index_marks_was_webui(sid: str) -> bool:
     if not SESSION_INDEX_FILE.exists():
         return False
     try:
-        entries = json.loads(SESSION_INDEX_FILE.read_text(encoding="utf-8"))
+        entries = json.loads(SESSION_INDEX_FILE.read_bytes())
     except Exception:
         return False
     for entry in entries if isinstance(entries, list) else []:
@@ -7822,30 +7850,6 @@ def _is_messaging_session_record(session) -> bool:
         session.get("source_label") if isinstance(session, dict) else None,
     )
     return _is_known_messaging_source(raw)
-
-
-def _is_cron_session_record(session) -> bool:
-    """Return true for rows backed by scheduled cron-job runs."""
-    if not session:
-        return False
-    values = []
-    for key in ("raw_source", "source_tag", "source", "session_source", "source_label"):
-        values.append(getattr(session, key, None) if not isinstance(session, dict) else session.get(key))
-    return any(_normalized_source_marker(value) == "cron" for value in values)
-
-
-def _session_allowed_by_webui_source_visibility(
-    session,
-    *,
-    show_messaging_sessions: bool = False,
-    show_cron_sessions: bool = False,
-) -> bool:
-    """Default WebUI history policy: local/WebUI/terminal rows yes, messaging+cron no."""
-    if not show_messaging_sessions and _is_messaging_session_record(session):
-        return False
-    if not show_cron_sessions and _is_cron_session_record(session):
-        return False
-    return True
 
 
 def _messages_include_tool_metadata(messages) -> bool:
@@ -8516,17 +8520,6 @@ def _is_api_server_sidecar_row(session: dict) -> bool:
     return bool(markers & {"api", "api_server"})
 
 
-def _is_subagent_sidebar_row(session: dict) -> bool:
-    """Return True for delegated subagent sessions hidden from the main sidebar."""
-    if not isinstance(session, dict):
-        return False
-    markers = {
-        _normalized_source_marker(session.get(key))
-        for key in ("source", "source_tag", "raw_source", "session_source", "source_label")
-    }
-    return "subagent" in markers
-
-
 def _session_lineage_ids(session: dict) -> set[str]:
     """Return known ids that identify one logical sidebar lineage."""
     if not isinstance(session, dict):
@@ -8577,7 +8570,6 @@ def _dedupe_cli_sidebar_sessions_for_api(
         s for s in cli
         if s["session_id"] not in represented_webui_ids
         and not _is_duplicate_webui_state_projection(s, represented_webui_ids)
-        and not _is_subagent_sidebar_row(s)
         and is_cli_session_row_visible(s)
     ]
     visible = [
@@ -8820,7 +8812,7 @@ def _pre_compression_continuation_session_id(session) -> str | None:
         if not SESSION_INDEX_FILE.exists():
             return None
         try:
-            entries = json.loads(SESSION_INDEX_FILE.read_text(encoding="utf-8"))
+            entries = json.loads(SESSION_INDEX_FILE.read_bytes())
         except Exception:
             return None
         if not isinstance(entries, list):
@@ -11191,7 +11183,7 @@ def _serve_manifest(handler) -> bool:
     routes so Firefox Android can fetch the manifest when installing from
     a /session/<id> page.  See #2226.
     """
-    static_root = Path(__file__).parent.parent / "static"
+    static_root = api_config.get_static_root()
     manifest_path = (static_root / "manifest.json").resolve()
     if manifest_path.exists():
         data = manifest_path.read_bytes()
@@ -11252,8 +11244,9 @@ def _render_index_shell_base() -> str:
     """
     from api.updates import WEBUI_VERSION
 
-    st = _INDEX_HTML_PATH.stat()
-    sig = (st.st_size, st.st_mtime_ns)
+    index_path = api_config.get_index_html_path()
+    st = index_path.stat()
+    sig = (index_path, st.st_size, st.st_mtime_ns)
     with _INDEX_SHELL_CACHE_LOCK:
         cached = _INDEX_SHELL_CACHE.get("base")
         if cached and cached[0] == sig:
@@ -11262,7 +11255,7 @@ def _render_index_shell_base() -> str:
 
     version_token = quote(WEBUI_VERSION, safe="")
     base = (
-        _INDEX_HTML_PATH.read_text(encoding="utf-8")
+        index_path.read_text(encoding="utf-8")
         .replace("__WEBUI_VERSION__", version_token)
         .replace("__MAX_UPLOAD_BYTES__", str(MAX_UPLOAD_BYTES))
     )
@@ -11432,11 +11425,11 @@ def handle_get(handler, parsed) -> bool:
             "auth_disabled_acknowledged": bool(load_settings().get("auth_disabled_acknowledged")) if not auth_enabled else False,
         })
 
-    if parsed.path in ("/manifest.json", "/manifest.webmanifest") or parsed.path.endswith(("/manifest.json", "/manifest.webmanifest")):
+    if parsed.path in ("/manifest.json", "/manifest.webmanifest"):
         return _serve_manifest(handler)
 
-    if parsed.path == "/sw.js" or parsed.path.endswith("/sw.js"):
-        static_root = Path(__file__).parent.parent / "static"
+    if parsed.path == "/sw.js":
+        static_root = api_config.get_static_root()
         sw_path = (static_root / "sw.js").resolve()
         if sw_path.exists():
             # Inject the current git-derived version as the cache name so the
@@ -11459,7 +11452,7 @@ def handle_get(handler, parsed) -> bool:
         return j(handler, {"error": "not found"}, status=404)
 
     if parsed.path == "/favicon.ico":
-        static_root = Path(__file__).parent.parent / "static"
+        static_root = api_config.get_static_root()
         ico_path = (static_root / "favicon.ico").resolve()
         if ico_path.exists() and ico_path.is_file():
             data = ico_path.read_bytes()
@@ -11604,7 +11597,7 @@ def handle_get(handler, parsed) -> bool:
         # which the request-thread wrapper could not reach. See
         # api.config.get_available_models cold path + profile_scope_for_detached_worker.
         freshness = parse_qs(parsed.query or "").get("freshness", [""])[0].strip().lower()
-        diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger)
+        diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
         try:
             diag.stage(f"enter:freshness={freshness or 'default'}") if diag else None
             if freshness == "session_visit":
@@ -11726,6 +11719,16 @@ def handle_get(handler, parsed) -> bool:
             settings["agent_version"] = AGENT_VERSION
         except Exception:
             pass
+        # Channel-scoped display badge — SEPARATE from webui_version (which is
+        # load-bearing for asset cache-busting / SW cache / skew detection and
+        # must stay channel-neutral). update_channel_version is display-only.
+        try:
+            from api.updates import channel_version_badge, _read_update_channel
+            channel = _read_update_channel()
+            settings["update_channel"] = channel
+            settings["update_channel_version"] = channel_version_badge(channel)
+        except Exception:
+            pass
         return j(handler, settings)
 
     if parsed.path == "/api/transcribe/capability":
@@ -11798,9 +11801,22 @@ def handle_get(handler, parsed) -> bool:
         import time as _time
         _t0 = _time.monotonic()
         _debug_slow = os.environ.get("HERMES_DEBUG_SLOW", "")
+        # perf(webui/session-load-latency) tier2c: per-stage breakdown via
+        # RequestDiagnostics. maybe_start() returns None for paths not in
+        # the allowlist, in which case the existing _tN-driven [SLOW] log
+        # is the only signal — same as before.
+        _diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
+        # perf(webui/session-load-latency) tier2c-followup: every early-return
+        # in this handler calls `_diag.finish()` before returning so the
+        # watchdog's _watchdog_pending dict stays bounded to in-flight requests.
+        # Greptile flagged this in PR review — finish() unregisters the
+        # pending watchdog entry; without it the entry stays for the full
+        # 5s slow-request timeout and emits a spurious "Slow WebUI request
+        # still running" log. Idempotent — finish() no-ops if already called.
         query = parse_qs(parsed.query)
         sid = query.get("session_id", [""])[0]
         if not sid:
+            if _diag: _diag.finish()
             return j(handler, {"error": "session_id is required"}, status=400)
         # ?messages=0 skips the message payload for fast session switching.
         # The frontend uses this when switching conversations in the sidebar
@@ -11833,12 +11849,14 @@ def handle_get(handler, parsed) -> bool:
         expand_renderable = str(_expand_renderable).strip() in ("1", "true", "True")
         try:
             _t1 = _time.monotonic()
+            if _diag: _diag.stage("t1_after_get_session_check")
             s = get_session(sid, metadata_only=(not load_messages))
             _session_profile = getattr(s, 'profile', None) or None
             if not _session_visible_to_active_profile(_session_profile, handler):
                 if _session_profile:
                     # Valid session owned by a KNOWN other profile: 409 so the
                     # client can offer to switch to it (#5419).
+                    if _diag: _diag.finish()
                     return j(handler, {
                         "error": "Session belongs to a different profile",
                         "code": "session_profile_mismatch",
@@ -11850,6 +11868,7 @@ def handle_get(handler, parsed) -> bool:
                 # fires. _profiles_match coerces None->'default', so a truly
                 # missing/legacy session under a non-default active profile would
                 # otherwise emit a useless 409 with profile=null.
+                if _diag: _diag.finish()
                 return bad(handler, "Session not found", 404)
             original_stream_id = getattr(s, "active_stream_id", None)
             _clear_stale_stream_state(s)
@@ -11887,6 +11906,7 @@ def handle_get(handler, parsed) -> bool:
                 # honor #2827's TLS-vs-thread fix.
                 metadata_summary = _metadata_only_message_summary(sid, profile=_session_profile)
             _t2 = _time.monotonic()
+            if _diag: _diag.stage("t2_after_state_db_load")
             effective_model = (
                 _resolve_effective_session_model_for_display(s)
                 if resolve_model
@@ -11898,6 +11918,7 @@ def handle_get(handler, parsed) -> bool:
                 else None
             )
             _t3 = _time.monotonic()
+            if _diag: _diag.stage("t3_after_model_resolve")
             if load_messages:
                 if is_messaging_session and cli_messages:
                     # Recovery/aggregate sidecars can intentionally contain a
@@ -11952,9 +11973,8 @@ def handle_get(handler, parsed) -> bool:
                 _summary_message_count = None
                 _summary_last_message_at = None
             if load_messages:
-                _display_all_msgs = _visible_messages_for_client(_all_msgs)
                 _truncated_msgs, _messages_offset = _message_window_for_display(
-                    _display_all_msgs,
+                    _all_msgs,
                     msg_limit=msg_limit,
                     msg_before=msg_before,
                     expand_renderable=expand_renderable,
@@ -11968,7 +11988,6 @@ def handle_get(handler, parsed) -> bool:
                     tool_calls=getattr(s, "tool_calls", None),
                 )
             else:
-                _display_all_msgs = []
                 _truncated_msgs = []
                 _messages_offset = 0
             # Index of the first returned message in the full message array.
@@ -12046,14 +12065,7 @@ def handle_get(handler, parsed) -> bool:
                     _messages_offset,
                     len(_truncated_msgs),
                 )
-            _visible_all_msgs = _display_all_msgs if load_messages else _visible_messages_for_client(_all_msgs)
-            _visible_truncated_msgs = _truncated_msgs
-            _summary_count_value = locals().get("_summary_message_count")
-            _merged_message_count = (
-                len(_visible_all_msgs)
-                if _visible_all_msgs or _all_msgs
-                else (_summary_count_value if _summary_count_value is not None else 0)
-            )
+            _merged_message_count = _summary_message_count if _summary_message_count is not None else len(_all_msgs)
             _merged_last_message_at = _summary_last_message_at if _summary_last_message_at is not None else 0
             if _summary_last_message_at is None and _all_msgs:
                 try:
@@ -12073,14 +12085,14 @@ def handle_get(handler, parsed) -> bool:
             except TypeError:
                 compact_session = s.compact()
             raw = compact_session | {
-                "messages": _visible_truncated_msgs,
+                "messages": _truncated_msgs,
                 "message_count": _merged_message_count,
                 "tool_calls": _session_tool_calls,
                 "active_stream_id": getattr(s, "active_stream_id", None),
-                "pending_user_message": _pending_user_message_for_client(s),
+                "pending_user_message": getattr(s, "pending_user_message", None),
                 "pending_attachments": getattr(s, "pending_attachments", []) if load_messages else [],
                 "pending_started_at": getattr(s, "pending_started_at", None),
-                "pending_user_source": _pending_user_source_for_client(s),
+                "pending_user_source": getattr(s, "pending_user_source", None),
                 "context_length": _persisted_cl,
                 "threshold_tokens": _threshold_tokens,
                 "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
@@ -12149,6 +12161,7 @@ def handle_get(handler, parsed) -> bool:
             raw["_messages_truncated"] = _truncated
             raw["_messages_offset"] = _messages_offset
             _t4 = _time.monotonic()
+            if _diag: _diag.stage("t4_after_compact_and_merge")
             if effective_model:
                 raw["model"] = effective_model
             if effective_provider:
@@ -12164,22 +12177,42 @@ def handle_get(handler, parsed) -> bool:
                 raw["read_only"] = True
             redact = redact_session_data(raw)
             _t5 = _time.monotonic()
+            if _diag: _diag.stage("t5_after_redact")
             resp = j(handler, {"session": redact})
             _t6 = _time.monotonic()
+            if _diag: _diag.stage("t6_after_json_write")
             _total_ms = (_t6 - _t0) * 1000
             # Always log when slow (>2s) so we don't need HERMES_DEBUG_SLOW env var
             # to diagnose latency regressions. Opt-in env var still forces
             # logging on every request for development.
             if _debug_slow or _total_ms >= 2000:
-                logger.warning(
+                # perf(webui/session-load-latency) tier2c: route the [SLOW] line
+                # through handler._safe_webui_print() rather than logger.warning().
+                # The WebUI process starts the root logger without any handler, so
+                # logger.warning() calls are silently dropped (the [SLOW] line
+                # previously worked only on PIDs that happened to have a logger
+                # handler set up by an earlier run; today the line is invisible).
+                # _safe_webui_print writes to the systemd journal socket directly,
+                # same as the per-request ms line — which is why THAT line keeps
+                # working.
+                handler._safe_webui_print(
                     "[SLOW] session_id=%s get_session=%.1fms model_resolve=%.1fms "
-                    "compact=%.1fms redact=%.1fms json_write=%.1fms total=%.1fms",
-                    sid,
-                    (_t2-_t1)*1000, (_t3-_t2)*1000, (_t4-_t3)*1000,
-                    (_t5-_t4)*1000, (_t6-_t5)*1000, _total_ms,
+                    "compact=%.1fms redact=%.1fms json_write=%.1fms total=%.1fms" % (
+                        sid,
+                        (_t2-_t1)*1000, (_t3-_t2)*1000, (_t4-_t3)*1000,
+                        (_t5-_t4)*1000, (_t6-_t5)*1000, _total_ms,
+                    )
                 )
+            if _diag: _diag.finish()
             return resp
         except KeyError:
+            # perf(webui/session-load-latency) tier2c-followup: fire
+            # _diag.finish() in the exception branch too. Greptile flagged
+            # this in PR review — finish() unregisters the pending watchdog
+            # entry; without it the entry stays for the full 5s slow-request
+            # timeout and emits a spurious "Slow WebUI request still
+            # running" log. Idempotent — finish() no-ops if already called.
+            if _diag: _diag.finish()
             # No WebUI sidecar. Delegate to the shared foreign-session
             # synthesizer so GET and POST have symmetric writeable/read-only
             # behaviour for CLI/TUI/Desktop sessions. The helper enforces the
@@ -12311,14 +12344,13 @@ def handle_get(handler, parsed) -> bool:
         return j(handler, {"results": get_results(sid)})
 
     if parsed.path == "/api/sessions":
-        diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger)
+        diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
         try:
             from api import profiles as profiles_api
 
             diag.stage("load_settings")
             settings = load_settings()
             show_cli_sessions = bool(settings.get("show_cli_sessions"))
-            show_messaging_sessions = bool(settings.get("show_messaging_sessions"))
             show_claude_code_sessions = bool(settings.get("show_claude_code_sessions"))
             show_previous_messaging_sessions = bool(
                 settings.get("show_previous_messaging_sessions")
@@ -12341,7 +12373,6 @@ def handle_get(handler, parsed) -> bool:
                 active_profile=active_profile,
                 all_profiles=all_profiles,
                 show_cli_sessions=show_cli_sessions,
-                show_messaging_sessions=show_messaging_sessions,
                 show_claude_code_sessions=show_claude_code_sessions,
                 show_previous_messaging_sessions=show_previous_messaging_sessions,
                 show_cron_sessions=show_cron_sessions,
@@ -12364,7 +12395,6 @@ def handle_get(handler, parsed) -> bool:
                     active_profile=active_profile,
                     all_profiles=all_profiles,
                     show_cli_sessions=show_cli_sessions,
-                    show_messaging_sessions=show_messaging_sessions,
                     show_claude_code_sessions=show_claude_code_sessions,
                     show_previous_messaging_sessions=show_previous_messaging_sessions,
                     show_cron_sessions=show_cron_sessions,
@@ -12507,20 +12537,6 @@ def handle_get(handler, parsed) -> bool:
         from api.commands import list_commands
         return j(handler, {"commands": list_commands()})
 
-    if parsed.path == "/api/commands/restart-status":
-        from api.commands import read_restart_status
-
-        qs = parse_qs(parsed.query)
-        status_id = str((qs.get("id") or [""])[0] or "").strip()
-        if not status_id:
-            return bad(handler, "id is required")
-        try:
-            return j(handler, read_restart_status(status_id))
-        except ValueError as e:
-            return bad(handler, str(e), 400)
-        except RuntimeError as e:
-            return bad(handler, _sanitize_error(e), 500)
-
     if parsed.path == "/api/commands/bundles":
         from api.commands import list_command_bundles
         return j(handler, {"bundles": list_command_bundles()})
@@ -12578,9 +12594,6 @@ def handle_get(handler, parsed) -> bool:
             return True
         active = stream_id in STREAMS
         payload = {"active": active, "stream_id": stream_id, "replay_available": False}
-        restart_completion = _read_webui_restart_completion(stream_id) if stream_id else None
-        if restart_completion:
-            payload["restart_completion"] = restart_completion
         try:
             journal = find_run_summary(stream_id) if stream_id else None
         except Exception:
@@ -12830,7 +12843,7 @@ def handle_get(handler, parsed) -> bool:
     # ── Profile API (GET) ──
     if parsed.path == "/api/profiles":
         from api import profiles as profiles_api
-        diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger)
+        diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
         try:
             diag.stage("list_profiles_api") if diag else None
             profiles_payload = profiles_api.list_profiles_api()
@@ -13086,7 +13099,7 @@ def _validate_session_toolsets_shape(toolsets):
 
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
-    diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger)
+    diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
     if parsed.path == "/api/csp-report":
         if diag:
             diag.stage("csp_report")
@@ -13199,9 +13212,18 @@ def handle_post(handler, parsed) -> bool:
             return j(handler, {"disabled": True})
         include_agent_updates = not bool(settings.get("ignore_agent_updates"))
         force = bool(body.get("force", False))
+        # Allow the client to pass the channel explicitly in the POST body. This
+        # avoids a race on channel switch: the Settings dropdown re-checks
+        # immediately, but its autosave PUT (debounced) may not have landed
+        # server-side yet, so reading the saved setting here could answer for the
+        # OLD channel. An explicit body channel (validated against the enum) wins;
+        # otherwise fall back to the saved setting. (Fable UX gate.)
+        channel = body.get("channel") if isinstance(body, dict) else None
+        if channel not in ("stable", "experimental"):
+            channel = settings.get("update_channel")
         from api.updates import check_for_updates
 
-        return j(handler, check_for_updates(force=force, include_agent=include_agent_updates))
+        return j(handler, check_for_updates(force=force, include_agent=include_agent_updates, channel=channel))
 
     if parsed.path == "/api/extensions/toggle":
         from api.extensions import ExtensionToggleError, set_extension_user_enabled
@@ -13406,7 +13428,7 @@ def handle_post(handler, parsed) -> bool:
                 profile=getattr(s, "profile", None),
                 session_id=getattr(s, "session_id", None),
             )
-        return j(handler, {"session": s.compact() | {"messages": _visible_messages_for_client(s.messages)}})
+        return j(handler, {"session": s.compact() | {"messages": s.messages}})
 
     if parsed.path == "/api/session/compression-recovery/start":
         return _handle_session_compression_recovery_start(handler, body)
@@ -13498,7 +13520,7 @@ def handle_post(handler, parsed) -> bool:
                 session_id=getattr(copied_session, "session_id", None),
             )
 
-            return j(handler, {"session": copied_session.compact() | {"messages": _visible_messages_for_client(copied_session.messages)}})
+            return j(handler, {"session": copied_session.compact() | {"messages": copied_session.messages}})
         except Exception as e:
             return bad(handler, str(e))
 
@@ -13758,6 +13780,13 @@ def handle_post(handler, parsed) -> bool:
         # GET ?session_id=X  → return current draft
         # POST body          → save draft { session_id, text?, files? }
         # HTTP method is in handler.command (e.g. "POST", "GET"), parsed has no .method
+        import time as _draft_time
+        _draft_t0 = _draft_time.monotonic()
+        _draft_stages = []
+
+        def _draft_mark(name):
+            _draft_stages.append((name, _draft_time.monotonic()))
+        _draft_mark("enter")
         if handler.command == "GET":
             query = parse_qs(parsed.query)
             sid = query.get("session_id", [""])[0] if parsed.query else ""
@@ -13797,8 +13826,10 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
+        _draft_mark("after_get_session")
         unchanged = False
         with _get_session_agent_lock(sid):
+            _draft_mark("acquired_lock")
             current_draft = dict(getattr(s, "composer_draft", {}) or {})
             next_draft = dict(current_draft)
             if text is not None:
@@ -13814,12 +13845,29 @@ def handle_post(handler, parsed) -> bool:
                 # here makes the active-session external-refresh poll force-reload the
                 # current chat every few seconds while the user is typing, and that
                 # delayed reload can restore an older draft over newer local input.
+                _draft_mark("before_save")
                 s.save(touch_updated_at=False, skip_index=True)
+                _draft_mark("after_save")
                 saved_draft = s.composer_draft
+        _draft_mark("released_lock")
         payload = {"ok": True, "draft": saved_draft}
         if unchanged:
             payload["unchanged"] = True
+        _draft_mark("before_json")
         j(handler, payload)
+        _draft_mark("after_json")
+        _draft_stages.append(("end", _draft_time.monotonic()))
+        if _draft_stages[-1][1] - _draft_t0 > 0.2:
+            parts = " ".join(
+                f"{n}={((t - prev[1]) * 1000):.1f}ms"
+                for (n, t), prev in zip(_draft_stages[1:], _draft_stages[:-1], strict=True)
+            )
+            handler._safe_webui_print(
+                "[SLOW] /api/session/draft total=%.1fms stages: %s" % (
+                    (_draft_stages[-1][1] - _draft_t0) * 1000,
+                    parts,
+                )
+            )
         return True
 
     if parsed.path == "/api/session/update":
@@ -13872,7 +13920,7 @@ def handle_post(handler, parsed) -> bool:
             except Exception:
                 logger.debug("Failed to close workspace terminal after workspace update")
         set_last_workspace(new_ws)
-        return j(handler, {"session": s.compact() | {"messages": _visible_messages_for_client(s.messages)}})
+        return j(handler, {"session": s.compact() | {"messages": s.messages}})
     if parsed.path == "/api/session/worktree/remove":
         sid = body.get("session_id", "")
         if not sid or not isinstance(sid, str) or not sid.strip():
@@ -13976,6 +14024,15 @@ def handle_post(handler, parsed) -> bool:
         # Lock entries in SESSION_AGENT_LOCKS forever.
         with SESSION_AGENT_LOCKS_LOCK:
             SESSION_AGENT_LOCKS.pop(sid, None)
+        # Prune the completion-dedup entry too. The reaper sweeps it once the
+        # completion is delivered (drained from PENDING); a session deleted
+        # while a completion is still pending would otherwise keep its entry.
+        try:
+            from api.background_process import forget_bg_task_completion_dedup
+
+            forget_bg_task_completion_dedup(sid)
+        except Exception:
+            logger.debug("Failed to prune bg-task dedup entry for deleted session %s", sid)
         try:
             from api.terminal import close_terminal
             close_terminal(sid)
@@ -14125,7 +14182,7 @@ def handle_post(handler, parsed) -> bool:
         from api.config import _evict_session_agent
         _evict_session_agent(body["session_id"])
         return j(
-            handler, {"ok": True, "session": s.compact() | {"messages": _visible_messages_for_client(s.messages)}}
+            handler, {"ok": True, "session": s.compact() | {"messages": s.messages}}
         )
 
     if parsed.path == "/api/session/branch":
@@ -14500,22 +14557,6 @@ def handle_post(handler, parsed) -> bool:
         except RuntimeError as e:
             return bad(handler, _sanitize_error(e), 500)
 
-    if parsed.path == "/api/commands/skills/resolve":
-        from api.commands import resolve_skill_command
-
-        command = str(body.get("command", "") or "").strip()
-        if not command:
-            return bad(handler, "command is required")
-
-        try:
-            return j(handler, resolve_skill_command(command))
-        except KeyError:
-            return bad(handler, "Skill command not found", 404)
-        except ValueError as e:
-            return bad(handler, str(e), 400)
-        except RuntimeError as e:
-            return bad(handler, _sanitize_error(e), 500)
-
     if parsed.path == "/api/commands/exec":
         from api.commands import execute_agent_command, execute_plugin_command
 
@@ -14524,10 +14565,7 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "command is required")
 
         try:
-            result = execute_agent_command(command)
-            if isinstance(result, dict):
-                return j(handler, result)
-            return j(handler, {"output": result})
+            return j(handler, {"output": execute_agent_command(command)})
         except KeyError:
             pass
         except ValueError as e:
@@ -15199,7 +15237,7 @@ def handle_post(handler, parsed) -> bool:
         # update so one slow/failing session can't abort the whole request.
         if SESSION_INDEX_FILE.exists():
             try:
-                index = json.loads(SESSION_INDEX_FILE.read_text(encoding="utf-8"))
+                index = json.loads(SESSION_INDEX_FILE.read_bytes())
                 active_ids = _active_stream_ids()
                 deferred_to_stream = []
                 for entry in index:
@@ -15244,17 +15282,27 @@ def handle_post(handler, parsed) -> bool:
         target = body.get("target", "")
         if target not in ("webui", "agent"):
             return bad(handler, 'target must be "webui" or "agent"')
+        # Honor an explicit validated body channel (the client sends the channel
+        # the banner was offering) so a channel switch whose debounced autosave
+        # hasn't landed can't make apply read the OLD saved channel (Codex gate).
+        # Fall back to the saved setting when absent/invalid.
+        _apply_channel = body.get("channel") if isinstance(body, dict) else None
+        if _apply_channel not in ("stable", "experimental"):
+            _apply_channel = None
         from api.updates import apply_update
 
-        return j(handler, apply_update(target))
+        return j(handler, apply_update(target, _apply_channel))
 
     if parsed.path == "/api/updates/force":
         target = body.get("target", "")
         if target not in ("webui", "agent"):
             return bad(handler, 'target must be "webui" or "agent"')
+        _force_channel = body.get("channel") if isinstance(body, dict) else None
+        if _force_channel not in ("stable", "experimental"):
+            _force_channel = None
         from api.updates import apply_force_update
 
-        return j(handler, apply_force_update(target))
+        return j(handler, apply_force_update(target, _force_channel))
 
     if parsed.path == "/api/updates/clear_lock":
         # Manual-instruction recovery for the .git/index.lock case. The
@@ -15444,13 +15492,15 @@ def handle_post(handler, parsed) -> bool:
             _record_login_attempt(client_ip)
             return bad(handler, str(e), status=401)
         cookie_val = create_session()
+        body = json.dumps({"ok": True}).encode()
         handler.send_response(200)
         handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
         handler.send_header("Cache-Control", "no-store")
         _security_headers(handler)
         set_auth_cookie(handler, cookie_val)
         handler.end_headers()
-        handler.wfile.write(json.dumps({"ok": True}).encode())
+        handler.wfile.write(body)
         return True
 
     if parsed.path == "/api/auth/passkey/register/options":
@@ -15666,7 +15716,7 @@ _STATIC_CACHE_LOCK = threading.Lock()
 
 
 def _serve_static(handler, parsed):
-    static_root = (Path(__file__).parent.parent / "static").resolve()
+    static_root = api_config.get_static_root().resolve()
     # Strip the leading '/static/' prefix, then resolve and sandbox
     rel = parsed.path[len("/static/") :]
     static_file = (static_root / rel).resolve()
@@ -18656,17 +18706,48 @@ def _handle_live_models(handler, parsed):
                 ids = ids[:_MODEL_PICKER_VISIBLE_TARGET]
 
         # Normalise to {id, label} — provider_model_ids() returns plain string IDs.
-        # Reuse api.config's formatter so the initial /api/models payload and
-        # background live enrichment agree on labels like Claude Opus 4.8.
-        from api.config import _format_ollama_label as _fmt_ollama, _get_label_for_model as _fmt_model
+        # For ollama-cloud use the shared Ollama formatter (handles `:variant` suffix).
+        # For all other providers use a simpler hyphen-split capitaliser.
+        from api.config import (
+            _format_ollama_label as _fmt_ollama,
+            _is_openai_family_provider as _is_fast_tier_provider,
+            _model_supports_fast_tier_for_provider,
+        )
 
         def _make_label(mid):
             """Best-effort human label from a model ID string."""
             if provider in ("ollama", "ollama-cloud"):
                 return _fmt_ollama(mid)
-            return _fmt_model(mid, [])
+            # Preserve slashes for router IDs like "anthropic/claude-sonnet-4.6"
+            display = mid.split("/")[-1] if "/" in mid else mid
+            parts = display.split("-")
+            result = []
+            for p in parts:
+                pl = p.lower()
+                if pl == "gpt":
+                    result.append("GPT")
+                elif pl in ("claude", "gemini", "gemma", "llama", "mistral",
+                            "qwen", "deepseek", "grok", "kimi", "glm"):
+                    result.append(p.capitalize())
+                elif p[:1].isdigit():
+                    result.append(p)  # version numbers: 5.4, 3.5, 4.6 — unchanged
+                else:
+                    result.append(p.capitalize())
+            label = " ".join(result)
+            # Restore well-known uppercase tokens that title-casing breaks
+            for orig in ("GPT", "GLM", "API", "AI", "XL", "MoE"):
+                label = label.replace(orig.title(), orig)
+            return label
 
-        models_out = [{"id": mid, "label": _make_label(mid)} for mid in ids if mid]
+        annotate_fast_tier = _is_fast_tier_provider(provider)
+        models_out = []
+        for mid in ids:
+            if not mid:
+                continue
+            entry = {"id": mid, "label": _make_label(mid)}
+            if annotate_fast_tier:
+                entry["supports_fast_tier"] = _model_supports_fast_tier_for_provider(mid, provider)
+            models_out.append(entry)
         return _finish({"provider": provider, "models": models_out,
                         "count": len(models_out)})
 
@@ -19224,7 +19305,7 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
 
             with _INDEX_WRITE_LOCK:
                 index_file_data = json.loads(
-                    SESSION_INDEX_FILE.read_text(encoding="utf-8")
+                    SESSION_INDEX_FILE.read_bytes()
                 )
                 if isinstance(index_file_data, list):
                     live_ids = {
@@ -19512,11 +19593,11 @@ def _prepare_chat_start_session_for_stream(
     s.pending_started_at = started_at if started_at is not None else time.time()
     s.pending_user_source = source
     current_title = getattr(s, "title", None)
-    if source != "process_wakeup" and _is_default_or_empty_session_title(current_title):
+    if _is_default_or_empty_session_title(current_title):
         provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
         if provisional_title and not _is_default_or_empty_session_title(provisional_title):
             s.title = provisional_title
-    if get_webui_session_save_mode() == "eager" and source != "process_wakeup":
+    if get_webui_session_save_mode() == "eager":
         _checkpoint_user_message_for_eager_session_save(
             s,
             msg,
@@ -20359,159 +20440,6 @@ def _handle_goal_command(handler, body):
     return j(handler, payload)
 
 
-def _webui_moa_command_prompt(message: str) -> tuple[bool, str]:
-    """Return (is_moa_command, prompt) for WebUI-typed /moa turns."""
-    text = str(message or "").strip()
-    if text == "/moa":
-        return True, ""
-    if text.startswith("/moa ") or text.startswith("/moa\n"):
-        return True, text[4:].strip()
-    return False, text
-
-
-_WEBUI_RESTART_COMMANDS = {
-    "/restart-hermes": "hermes",
-    "/restart_hermes": "hermes",
-    "/restart-gateways": "gateways",
-    "/restart_gateways": "gateways",
-}
-
-
-def _webui_restart_command_scope(message: str) -> str | None:
-    """Return restart scope for exact WebUI restart slash commands."""
-    parts = str(message or "").strip().split()
-    if len(parts) != 1:
-        return None
-    return _WEBUI_RESTART_COMMANDS.get(parts[0].lower())
-
-
-def _webui_restart_marker_path(stream_id: str) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(stream_id or ""))[:128]
-    return STATE_DIR / "restart_completions" / f"{safe}.json"
-
-
-def _read_webui_restart_completion(stream_id: str) -> dict | None:
-    path = _webui_restart_marker_path(stream_id)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return payload
-
-
-def _start_webui_detached_restart_stream(s, *, msg: str, scope: str) -> dict:
-    """Start a durable restart-helper stream for WebUI-origin slash commands.
-
-    The WebUI process is one of the restart targets for /restart-hermes, so the
-    in-memory stream may die before completion. The detached helper writes a
-    completion marker keyed by stream_id; the new WebUI process exposes it via
-    /api/chat/stream/status so the browser can render the final assistant row
-    after reconnect.
-    """
-    stream_id = f"restart_{uuid.uuid4().hex}"
-    stream = create_stream_channel()
-    started_at = time.time()
-    marker_path = _webui_restart_marker_path(stream_id)
-    marker_path.parent.mkdir(parents=True, exist_ok=True)
-    marker_path.unlink(missing_ok=True)
-
-    with _get_session_agent_lock(s.session_id):
-        s.active_stream_id = stream_id
-        s.pending_user_message = msg
-        s.pending_attachments = []
-        s.pending_started_at = started_at
-        s.pending_user_source = "webui"
-        if _is_default_or_empty_session_title(getattr(s, "title", None)):
-            s.title = "/restart-hermes" if scope == "hermes" else "/restart-gateways"
-        if get_webui_session_save_mode() == "eager":
-            _checkpoint_user_message_for_eager_session_save(
-                s,
-                msg,
-                [],
-                started_at,
-                source="webui",
-            )
-        s.save()
-    register_stream_owner(stream_id, s.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
-
-    def _run_restart() -> None:
-        queued = ""
-        try:
-            from hermes_cli.restart_surfaces import enqueue_detached_restart
-            queued = enqueue_detached_restart(
-                scope,
-                delay=1.0,
-                completion_marker=str(marker_path),
-            )
-            stream.put_nowait(("token", {"text": queued + "\n\n"}))
-            stream.put_nowait(("token", {"text": "Waiting for the detached helper to finish…"}))
-            deadline = time.monotonic() + 10 * 60
-            payload = None
-            while time.monotonic() < deadline:
-                payload = _read_webui_restart_completion(stream_id)
-                if payload and payload.get("status") == "complete":
-                    break
-                time.sleep(1.0)
-            if not payload:
-                payload = {
-                    "status": "complete",
-                    "scope": scope,
-                    "exit_code": 1,
-                    "message": f"Hermes {scope} restart did not report completion before the WebUI watcher timed out.",
-                }
-            message = str(payload.get("message") or queued or "Hermes restart finished.")
-            stream.put_nowait(("token", {"text": "\n\n" + message}))
-            stream.put_nowait(("done", {"session_id": s.session_id, "restart_completion": payload}))
-        except BaseException as exc:
-            message = f"Hermes {scope} restart failed before it could be queued: {exc}"
-            try:
-                marker_path.write_text(
-                    json.dumps(
-                        {
-                            "status": "complete",
-                            "scope": scope,
-                            "exit_code": 1,
-                            "message": message,
-                        },
-                        separators=(",", ":"),
-                    ),
-                    encoding="utf-8",
-                )
-            except Exception:
-                pass
-            stream.put_nowait(("apperror", {"message": message}))
-        finally:
-            try:
-                current = Session.load(s.session_id) or s
-                current.active_stream_id = None
-                current.pending_user_message = None
-                current.pending_attachments = []
-                current.pending_started_at = None
-                current.save()
-            except Exception:
-                logger.debug("failed to clear WebUI restart stream state", exc_info=True)
-            with STREAMS_LOCK:
-                STREAMS.pop(stream_id, None)
-            unregister_stream_owner(stream_id)
-
-    threading.Thread(
-        target=_run_restart,
-        daemon=True,
-        name=f"webui-restart-{stream_id[:12]}",
-    ).start()
-    return {
-        "stream_id": stream_id,
-        "session_id": s.session_id,
-        "pending_started_at": started_at,
-        "title": s.title,
-        "restart_scope": scope,
-    }
-
-
 def _handle_chat_start(handler, body, diag=None):
     try:
         diag.stage("validate_session_id") if diag else None
@@ -20615,21 +20543,8 @@ def _handle_chat_start(handler, body, diag=None):
                 return bad(handler, "Session not found", 404)
         diag.stage("normalize_message") if diag else None
         msg = str(body.get("message", "")).strip()
-        force_moa_turn, msg = _webui_moa_command_prompt(msg)
         if not msg:
-            if force_moa_turn:
-                return bad(handler, "message is required after /moa")
             return bad(handler, "message is required")
-        restart_scope = None if force_moa_turn else _webui_restart_command_scope(msg)
-        if restart_scope:
-            diag.stage("start_webui_restart") if diag else None
-            response = _start_webui_detached_restart_stream(
-                s,
-                msg=msg,
-                scope=restart_scope,
-            )
-            diag.stage("response_write") if diag else None
-            return j(handler, response)
         diag.stage("normalize_attachments") if diag else None
         attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
         recovery = compression_recovery_payload_for_session(s)
@@ -20650,22 +20565,19 @@ def _handle_chat_start(handler, body, diag=None):
             workspace = _resolve_chat_workspace_with_recovery(s, body.get("workspace"))
         except ValueError as e:
             return bad(handler, str(e))
-        requested_model = "default" if force_moa_turn else (body.get("model") or s.model)
+        requested_model = body.get("model") or s.model
         requested_provider = (
-            "moa"
-            if force_moa_turn
-            else (
-                body.get("model_provider")
-                if "model_provider" in body
-                else getattr(s, "model_provider", None)
-            )
+            body.get("model_provider")
+            if "model_provider" in body
+            else getattr(s, "model_provider", None)
         )
         _pp_provider, _pp_default, _pp_cfg = _read_profile_model_config(s, requested_provider)
-        explicit_model_pick = True if force_moa_turn else bool(body.get("explicit_model_pick"))
+        explicit_model_pick = bool(body.get("explicit_model_pick"))
         moa_config = None
         gateway_chat_enabled = webui_gateway_chat_enabled(get_config())
-        if force_moa_turn or body.get("moa_config"):
-            return bad(handler, "MoA override is unavailable on gateway-backed sessions", 409)
+        if body.get("moa_config"):
+            if gateway_chat_enabled:
+                return bad(handler, "MoA override is unavailable on gateway-backed sessions", 409)
             from api.commands import resolve_moa_config
 
             try:
@@ -20806,9 +20718,8 @@ def _handle_chat_sync(handler, body):
         return bad(handler, "Subagent sessions are view-only and cannot be written from WebUI", 400)
     s = get_session(body["session_id"])
     msg = str(body.get("message", "")).strip()
-    force_moa_turn, msg = _webui_moa_command_prompt(msg)
     if not msg:
-        return j(handler, {"error": "message is required after /moa" if force_moa_turn else "empty message"}, status=400)
+        return j(handler, {"error": "empty message"}, status=400)
     try:
         workspace = str(resolve_trusted_workspace(body.get("workspace") or s.workspace))
     except ValueError as e:
@@ -20816,18 +20727,11 @@ def _handle_chat_sync(handler, body):
     with _get_session_agent_lock(s.session_id):
         s.workspace = workspace
         _sync_requested_provider = (
-            "moa"
-            if force_moa_turn
-            else (
-                body.get("model_provider")
-                if "model_provider" in body
-                else getattr(s, "model_provider", None)
-            )
+            body.get("model_provider") if "model_provider" in body else getattr(s, "model_provider", None)
         )
-        _sync_requested_model = "default" if force_moa_turn else (body.get("model") or s.model)
         _pp_provider, _pp_default, _pp_cfg = _read_profile_model_config(s, _sync_requested_provider)
         model, model_provider = _resolve_compatible_session_model_state(
-            _sync_requested_model,
+            body.get("model") or s.model,
             _sync_requested_provider,
             profile_provider=_pp_provider,
             profile_default_model=_pp_default,
@@ -21013,7 +20917,7 @@ def _handle_chat_sync(handler, body):
         {
             "answer": result.get("final_response") or "",
             "status": "done" if result.get("completed", True) else "partial",
-            "session": s.compact() | {"messages": _visible_messages_for_client(s.messages)},
+            "session": s.compact() | {"messages": s.messages},
             "result": {k: v for k, v in result.items() if k != "messages"},
         },
     )
@@ -23006,7 +22910,7 @@ def _handle_session_compress(handler, body):
 
         session_payload = redact_session_data(
             s.compact() | {
-                "messages": _visible_messages_for_client(s.messages),
+                "messages": s.messages,
                 "tool_calls": s.tool_calls,
                 "active_stream_id": s.active_stream_id,
                 "pending_user_message": s.pending_user_message,
@@ -24046,7 +23950,7 @@ def _handle_session_import_cli(handler, body):
             {
                 "session": existing.compact()
                 | {
-                    "messages": _visible_messages_for_client(existing.messages),
+                    "messages": existing.messages,
                     "is_cli_session": (False if _existing_is_sa else True),
                     # Greptile #4911 follow-up: read read_only from
                     # the persisted Session, NOT from cli_meta.  This
@@ -24223,7 +24127,7 @@ def _handle_session_import(handler, body):
         _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
     s.save()
     publish_session_list_changed("session_import")
-    return j(handler, {"ok": True, "session": s.compact() | {"messages": _visible_messages_for_client(s.messages)}})
+    return j(handler, {"ok": True, "session": s.compact() | {"messages": s.messages}})
 
 
 # ── MCP Server helpers ──
@@ -24486,7 +24390,7 @@ def _mcp_tools_from_registry(server_summaries):
 
 def _handle_mcp_tools_list(handler):
     """List known MCP tools from already-available runtime inventory only."""
-    cfg = get_config()
+    cfg = get_config_for_profile_home(get_active_hermes_home())
     servers = cfg.get("mcp_servers", {})
     if not isinstance(servers, dict):
         servers = {}
@@ -25000,7 +24904,7 @@ def _handle_notes_item(handler, parsed):
 
 def _handle_mcp_servers_list(handler):
     """List configured MCP servers with safe, read-only runtime visibility."""
-    cfg = get_config()
+    cfg = get_config_for_profile_home(get_active_hermes_home())
     servers = cfg.get("mcp_servers", {})
     if not isinstance(servers, dict):
         servers = {}

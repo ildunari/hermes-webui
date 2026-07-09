@@ -703,6 +703,13 @@ def get_config_for_profile_home(profile_home: "Path | str | None") -> dict:
         target = Path(profile_home).expanduser()
     except Exception:
         return get_config()
+    try:
+        from api.profiles import get_active_hermes_home
+
+        if Path(get_active_hermes_home()).expanduser() == target:
+            return get_config()
+    except Exception:
+        pass
     # If the ambient resolver already points at this profile home, defer to
     # get_config() so in-memory overrides (monkeypatched cfg) are honored. This
     # MUST run before the nonexistent-home guard below: a matching ambient home
@@ -1141,13 +1148,12 @@ _PROVIDER_DISPLAY = {
     "anthropic": "Anthropic",
     "openai": "OpenAI",
     "openai-api": "OpenAI API",
-    "openai-codex": "Codex",
-    "xai-oauth": "xAI",
+    "openai-codex": "OpenAI Codex",
+    "xai-oauth": "xAI Grok OAuth",
     "copilot": "GitHub Copilot",
-    "moa": "MoA",
+    "moa": "Mixture of Agents",
     "cursor-acp": "Cursor ACP",
-    "atomic": "Atomic",
-    "zai": "zAI",
+    "zai": "Z.AI / GLM",
     "kimi-coding": "Kimi / Moonshot",
     "deepseek": "DeepSeek",
     "minimax": "MiniMax",
@@ -1760,22 +1766,29 @@ _PROVIDER_MODELS = {
         {"id": "nemotron-3-super-free", "label": "Nemotron 3 Super Free"},
         {"id": "big-pickle", "label": "Big Pickle"},
     ],
-    # OpenCode Go — flat-rate models via opencode.ai/go ($10/month)
+    # OpenCode Go — flat-rate models via opencode.ai/go ($10/month).
+    # Synced 2026-07-08 from the public Go docs and documented models endpoint.
+    # Keep preview/free-only Zen models out of this Go picker snapshot.
     "opencode-go": [
+        {"id": "minimax-m3",       "label": "MiniMax M3"},
+        {"id": "minimax-m2.7",     "label": "MiniMax M2.7"},
+        {"id": "minimax-m2.5",     "label": "MiniMax M2.5"},
+        {"id": "kimi-k2.7-code",   "label": "Kimi K2.7 Code"},
+        {"id": "kimi-k2.6",        "label": "Kimi K2.6"},
+        {"id": "kimi-k2.5",        "label": "Kimi K2.5"},
+        {"id": "glm-5.2",          "label": "GLM-5.2"},
         {"id": "glm-5.1",          "label": "GLM-5.1"},
         {"id": "glm-5",            "label": "GLM-5"},
-        {"id": "kimi-k2.5",        "label": "Kimi K2.5"},
-        {"id": "kimi-k2.6",        "label": "Kimi K2.6"},
         {"id": "deepseek-v4-pro",  "label": "DeepSeek V4 Pro"},
         {"id": "deepseek-v4-flash","label": "DeepSeek V4 Flash"},
+        {"id": "qwen3.7-max",      "label": "Qwen3.7 Max"},
+        {"id": "qwen3.7-plus",     "label": "Qwen3.7 Plus"},
+        {"id": "qwen3.6-plus",     "label": "Qwen3.6 Plus"},
+        {"id": "qwen3.5-plus",     "label": "Qwen3.5 Plus"},
         {"id": "mimo-v2-pro",      "label": "MiMo V2 Pro"},
         {"id": "mimo-v2-omni",     "label": "MiMo V2 Omni"},
         {"id": "mimo-v2.5-pro",    "label": "MiMo V2.5 Pro"},
         {"id": "mimo-v2.5",        "label": "MiMo V2.5"},
-        {"id": "minimax-m2.7",     "label": "MiniMax M2.7"},
-        {"id": "minimax-m2.5",     "label": "MiniMax M2.5"},
-        {"id": "qwen3.6-plus",     "label": "Qwen3.6 Plus"},
-        {"id": "qwen3.5-plus",     "label": "Qwen3.5 Plus"},
     ],
     # 'gemini' is the hermes_cli provider ID for Google AI Studio
     # Model IDs are bare — sent directly to:
@@ -2213,10 +2226,12 @@ def _apply_provider_prefix(
     result = []
     for m in raw_models:
         mid = m["id"]
+        entry = dict(m)
         if mid.startswith("@") or "/" in mid:
-            result.append({"id": mid, "label": m["label"]})
+            result.append(entry)
         else:
-            result.append({"id": f"@{provider_id}:{mid}", "label": m["label"]})
+            entry["id"] = f"@{provider_id}:{mid}"
+            result.append(entry)
     return result
 
 
@@ -3840,6 +3855,74 @@ def _is_openai_family_provider(provider: str | None) -> bool:
     return resolved in ("openai", "openai-api", "openai-codex")
 
 
+def _normalize_openai_family_model_id(model_id: str | None) -> str:
+    """Return a model id in the form expected by hermes_cli fast-mode resolution."""
+    model = str(model_id or "").strip()
+    if not model:
+        return ""
+
+    if model.startswith("@") and ":" in model:
+        model = model.split(":", 1)[1].strip()
+
+    if "://" in model:
+        return model
+
+    if "/" in model:
+        provider_hint, candidate = model.split("/", 1)
+        if provider_hint.strip().lower() in {"openai", "openai-api", "openai-codex"}:
+            model = candidate.strip()
+        else:
+            return ""
+
+    return model
+
+
+def _legacy_openai_service_tier_overrides(model_id: str | None, provider: str | None) -> dict:
+    """Compatibility fallback for standalone WebUI installs without hermes_cli.
+
+    Normal operation delegates to Hermes Agent model metadata.  This fallback
+    preserves the old WebUI behavior when the agent package is unavailable,
+    while still failing closed for codex model slugs and foreign provider IDs.
+    """
+    if not _is_openai_family_provider(provider):
+        return {}
+    resolved_provider = str(_resolve_provider_alias(str(provider or "").strip().lower()))
+    raw_model = str(model_id or "").strip()
+    if "://" not in raw_model and "/" in raw_model:
+        provider_hint = raw_model.split("/", 1)[0].strip().lower()
+        if provider_hint not in {"openai", "openai-api", "openai-codex"}:
+            return {}
+    normalized_model = _normalize_openai_family_model_id(model_id)
+    if not normalized_model:
+        if resolved_provider == "openai-codex":
+            return {}
+        return {"service_tier": "priority"}
+    lowered = normalized_model.lower()
+    if "codex" in lowered:
+        return {}
+    if lowered.startswith(("gpt-", "o1", "o3", "o4")):
+        return {"service_tier": "priority"}
+    return {}
+
+
+def _resolve_main_model_fast_mode_overrides(model_id: str | None, provider: str | None = None) -> dict:
+    """Return provider request overrides for the main model fast-mode setting."""
+    normalized_model = _normalize_openai_family_model_id(model_id)
+    if not normalized_model:
+        return _legacy_openai_service_tier_overrides(model_id, provider)
+    try:
+        from hermes_cli.models import resolve_fast_mode_overrides
+    except Exception:
+        logger.debug("Failed to import hermes_cli.models.resolve_fast_mode_overrides; using WebUI compatibility fallback.")
+        return _legacy_openai_service_tier_overrides(model_id, provider)
+    try:
+        resolved = resolve_fast_mode_overrides(normalized_model)
+    except Exception:
+        logger.debug("Failed to resolve fast-mode overrides for %r; using WebUI compatibility fallback.", normalized_model)
+        return _legacy_openai_service_tier_overrides(model_id, provider)
+    return resolved if isinstance(resolved, dict) else {}
+
+
 def _main_model_supports_service_tier(
     model_id: str | None,
     provider: str | None,
@@ -3847,24 +3930,41 @@ def _main_model_supports_service_tier(
     """Return True when the current main-model selection can use OpenAI service tier."""
     if not _is_openai_family_provider(provider):
         return False
-    resolved = str(provider or "").strip().lower()
-    if resolved == "openai-codex":
-        return False
-    raw_model = str(model_id or "").strip().lower()
-    if not raw_model:
-        return True
-    if "/" in raw_model:
-        prefix, bare_model = raw_model.split("/", 1)
-        if prefix != "openai":
-            return False
-    else:
-        bare_model = raw_model
-    if "codex" in bare_model:
-        return False
     return (
-        _is_first_party_model("openai", bare_model)
-        or bare_model.startswith(("gpt-", "o1", "o3", "o4"))
+        str(_resolve_main_model_fast_mode_overrides(model_id, provider).get("service_tier", "")).strip().lower()
+        == "priority"
     )
+
+
+def _model_supports_fast_tier_for_provider(model_id: str | None, provider: str | None) -> bool:
+    """Return whether a provider/model entry supports WebUI's service-tier toggle."""
+    return _main_model_supports_service_tier(model_id, provider)
+
+
+def _annotate_fast_tier_model_groups(payload: dict | None) -> dict | None:
+    """Add service-tier capability metadata to OpenAI-family model groups."""
+    if not isinstance(payload, dict):
+        return payload
+    groups = payload.get("groups")
+    if not isinstance(groups, list):
+        return payload
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        provider_id = str(group.get("provider_id") or "").strip()
+        if not _is_openai_family_provider(provider_id):
+            continue
+        for bucket in ("models", "extra_models"):
+            models = group.get(bucket)
+            if not isinstance(models, list):
+                continue
+            for model in models:
+                if not isinstance(model, dict):
+                    continue
+                model_id = str(model.get("id") or "").strip()
+                if model_id:
+                    model["supports_fast_tier"] = _model_supports_fast_tier_for_provider(model_id, provider_id)
+    return payload
 
 
 def _public_main_service_tier(model_cfg: dict) -> str:
@@ -4107,6 +4207,7 @@ def get_auxiliary_models() -> dict:
         "main": {
             "provider": main_provider,
             "model": main_model,
+            "supports_fast_tier": _main_model_supports_service_tier(main_model, main_provider),
             "service_tier": _public_main_service_tier(model_cfg),
             **_public_advanced_model_options(model_cfg),
         },
@@ -4268,214 +4369,6 @@ def _invoke_models_rebuild(builder):
     actually does the per-provider network calls.
     """
     return builder()
-
-
-def _model_picker_hidden_provider_slugs(config: dict | None) -> set[str]:
-    """Return provider slugs hidden from the WebUI model picker.
-
-    Mirrors Hermes Agent's display-only model_picker/model_catalog policy so
-    WebUI's /api/models payload does not drift from the CLI/Desktop picker.
-    """
-    hidden: list[str] = []
-    source = config if isinstance(config, dict) else {}
-    for section_name in ("model_picker", "model_catalog"):
-        section = source.get(section_name)
-        if not isinstance(section, dict):
-            continue
-        values = section.get("hidden_providers") or section.get("hide_providers") or []
-        if isinstance(values, str):
-            hidden.extend(part.strip() for part in values.split(","))
-        elif isinstance(values, (list, tuple, set)):
-            hidden.extend(str(part).strip() for part in values)
-
-    try:
-        from hermes_cli.model_switch import expand_hidden_provider_slugs
-
-        return expand_hidden_provider_slugs(tuple(part for part in hidden if part))
-    except Exception:
-        pass
-
-    out: set[str] = set()
-    for raw in hidden:
-        value = str(raw or "").strip().lower()
-        if not value:
-            continue
-        if value == "google":
-            out.add("gemini")
-            continue
-        if value == "x-ai":
-            out.add("xai")
-            continue
-        if value == "xai":
-            out.update({"xai", "xai-oauth"})
-            continue
-        out.add(_resolve_provider_alias(value))
-    return out
-
-
-def _model_picker_visible_model_policy(config: dict | None) -> dict[str, tuple[str, ...]]:
-    """Return per-provider model allowlists for the WebUI picker."""
-    source = config if isinstance(config, dict) else {}
-    try:
-        from hermes_cli.model_switch import load_visible_model_policy
-
-        return load_visible_model_policy(source)
-    except Exception:
-        pass
-
-    visible: dict[str, tuple[str, ...]] = {}
-    for section_name in ("model_picker", "model_catalog"):
-        section = source.get(section_name)
-        if not isinstance(section, dict):
-            continue
-        raw = section.get("visible_models") or section.get("show_models") or {}
-        if not isinstance(raw, dict):
-            continue
-        for provider, values in raw.items():
-            key = str(provider or "").strip()
-            if not key:
-                continue
-            if isinstance(values, str):
-                models = [part.strip() for part in values.split(",")]
-            elif isinstance(values, (list, tuple, set)):
-                models = [str(part).strip() for part in values]
-            else:
-                continue
-            canonical = _canonicalise_provider_id(_resolve_provider_alias(key)) or key.lower()
-            visible[canonical] = tuple(model for model in models if model)
-    return visible
-
-
-def _model_picker_policy_provider_id(provider_id: object, config: dict | None) -> str:
-    """Canonical provider id for display-policy and dedup purposes."""
-    pid = str(provider_id or "").strip().lower()
-    if not pid:
-        return ""
-    if pid.startswith("custom:"):
-        suffix = pid.removeprefix("custom:")
-        providers_cfg = config.get("providers", {}) if isinstance(config, dict) else {}
-        if isinstance(providers_cfg, dict) and suffix in providers_cfg:
-            return suffix
-    return _canonicalise_provider_id(_resolve_provider_alias(pid)) or pid
-
-
-def _rewrite_model_option_provider_prefix(model_id: object, old_provider: str, new_provider: str) -> str:
-    raw = str(model_id or "")
-    old = str(old_provider or "").strip()
-    new = str(new_provider or "").strip()
-    if not raw or not old or not new or old == new:
-        return raw
-    prefix = f"@{old}:"
-    if raw.startswith(prefix):
-        return f"@{new}:{raw[len(prefix):]}"
-    return raw
-
-
-def _filter_model_picker_groups_by_policy(groups: list[dict], config: dict | None) -> list[dict]:
-    """Apply model_picker hidden/visible policy and provider dedup to groups."""
-    hidden = _model_picker_hidden_provider_slugs(config)
-    visible = _model_picker_visible_model_policy(config)
-    merged: dict[str, dict] = {}
-    order: list[str] = []
-
-    for group in groups:
-        raw_pid = str(group.get("provider_id") or "").strip().lower()
-        policy_pid = _model_picker_policy_provider_id(raw_pid, config)
-        if not policy_pid or policy_pid in hidden:
-            continue
-
-        next_group = copy.deepcopy(group)
-        next_group["provider_id"] = policy_pid
-        display_name = _PROVIDER_DISPLAY.get(policy_pid)
-        if not display_name and isinstance(config, dict):
-            providers_cfg = config.get("providers", {})
-            if isinstance(providers_cfg, dict):
-                provider_cfg = providers_cfg.get(policy_pid)
-                if isinstance(provider_cfg, dict):
-                    display_name = str(provider_cfg.get("name") or "").strip() or policy_pid
-        if display_name:
-            next_group["provider"] = display_name
-        if raw_pid != policy_pid:
-            next_group["provider"] = display_name or policy_pid
-            for bucket_name in ("models", "extra_models"):
-                bucket = next_group.get(bucket_name)
-                if isinstance(bucket, list):
-                    for model in bucket:
-                        if isinstance(model, dict):
-                            model["id"] = _rewrite_model_option_provider_prefix(
-                                model.get("id"), raw_pid, policy_pid
-                            )
-
-        allowed = visible.get(policy_pid)
-        if allowed:
-            allowed_lower = {model.lower() for model in allowed}
-            for bucket_name in ("models", "extra_models"):
-                bucket = next_group.get(bucket_name)
-                if isinstance(bucket, list):
-                    filtered = [
-                        model for model in bucket
-                        if str(model.get("id") or "").split(":", 1)[-1].lower() in allowed_lower
-                        or str(model.get("id") or "").split(":")[-1].lower() in allowed_lower
-                    ]
-                    next_group[bucket_name] = filtered
-
-        if not next_group.get("models") and not next_group.get("extra_models"):
-            continue
-
-        existing = merged.get(policy_pid)
-        if existing is None:
-            merged[policy_pid] = next_group
-            order.append(policy_pid)
-            continue
-
-        seen_ids = {
-            str(model.get("id") or "")
-            for bucket_name in ("models", "extra_models")
-            for model in existing.get(bucket_name, []) or []
-            if isinstance(model, dict)
-        }
-        for bucket_name in ("models", "extra_models"):
-            for model in next_group.get(bucket_name, []) or []:
-                if not isinstance(model, dict):
-                    continue
-                model_id = str(model.get("id") or "")
-                if not model_id or model_id in seen_ids:
-                    continue
-                existing.setdefault(bucket_name, []).append(model)
-                seen_ids.add(model_id)
-
-    return [merged[pid] for pid in order]
-
-
-def _append_moa_virtual_group(groups: list[dict], config: dict | None) -> None:
-    """Expose configured MoA presets as a virtual model-picker provider."""
-    if any(str(group.get("provider_id") or "").lower() == "moa" for group in groups):
-        return
-    if not isinstance(config, dict):
-        return
-    moa_cfg = config.get("moa")
-    if not isinstance(moa_cfg, dict):
-        return
-    presets = moa_cfg.get("presets")
-    if not isinstance(presets, dict) or not presets:
-        return
-
-    default_preset = str(moa_cfg.get("default_preset") or "").strip()
-    names = [str(name).strip() for name in presets if str(name).strip()]
-    if default_preset in names:
-        names = [default_preset] + [name for name in names if name != default_preset]
-    if not names:
-        return
-
-    groups.append(
-        {
-            "provider": "Mixture of Agents",
-            "provider_id": "moa",
-            "models": [{"id": name, "label": name} for name in names],
-            "source": "virtual",
-            "authenticated": True,
-        }
-    )
 
 
 def _configured_model_badges_from_static_catalog(
@@ -4642,13 +4535,13 @@ def _minimal_static_models_catalog() -> dict:
                     "models": [{"id": default_model, "label": label}],
                 }
             )
-        return {
+        return _annotate_fast_tier_model_groups({
             "active_provider": active_provider,
             "default_model": default_model,
             "configured_model_badges": {},
             "groups": groups,
             "aliases": {},
-        }
+        })
     except Exception:
         logger.debug("minimal static models catalog build failed", exc_info=True)
         return {
@@ -4891,7 +4784,7 @@ def _static_models_catalog_without_live_probes() -> dict:
             if isinstance(provider_cfg, dict) and "models" in provider_cfg:
                 cfg_models = provider_cfg["models"]
                 if isinstance(cfg_models, dict):
-                    raw_models = [{"id": key, "label": _get_label_for_model(key, [])} for key in cfg_models.keys()]
+                    raw_models = [{"id": key, "label": key} for key in cfg_models.keys()]
                 elif isinstance(cfg_models, list):
                     raw_models = []
                     for item in cfg_models:
@@ -4910,7 +4803,7 @@ def _static_models_catalog_without_live_probes() -> dict:
                                 }
                             )
                         elif item:
-                            raw_models.append({"id": item, "label": _get_label_for_model(item, [])})
+                            raw_models.append({"id": item, "label": item})
             if not raw_models:
                 raw_models = copy.deepcopy(_PROVIDER_MODELS.get(pid, []))
             for model_id in configured_model_ids.get(pid, []):
@@ -4950,8 +4843,6 @@ def _static_models_catalog_without_live_probes() -> dict:
                         }
                     )
 
-        _append_moa_virtual_group(groups, cfg)
-        groups = _filter_model_picker_groups_by_policy(groups, cfg)
         _deduplicate_model_ids(groups)
         groups = [
             group
@@ -5009,7 +4900,7 @@ def _static_models_catalog_without_live_probes() -> dict:
         if not groups and default_model:
             return copy.deepcopy(_minimal_static_models_catalog())
 
-        return {
+        return _annotate_fast_tier_model_groups({
             "active_provider": active_provider,
             "default_model": default_model,
             "configured_model_badges": _configured_model_badges_from_static_catalog(
@@ -5019,7 +4910,7 @@ def _static_models_catalog_without_live_probes() -> dict:
             ),
             "groups": groups,
             "aliases": model_aliases,
-        }
+        })
     except Exception:
         logger.debug("static models catalog build failed", exc_info=True)
         return copy.deepcopy(_minimal_static_models_catalog())
@@ -5187,7 +5078,7 @@ def _current_webui_version() -> str | None:
 # guarantees that even if a future release accidentally reuses the same
 # WebUI version string (or a debug build doesn't have a version), a structural
 # change still invalidates the cache.
-_MODELS_CACHE_SCHEMA_VERSION = 4
+_MODELS_CACHE_SCHEMA_VERSION = 3
 
 
 _models_cache_path = STATE_DIR / "models_cache.json"
@@ -5536,22 +5427,17 @@ def _load_models_cache_from_disk() -> dict | None:
         # disk save path does not persist `aliases`, so reconstruct them from
         # current config to keep the /api/models.aliases contract intact (a
         # disk-cache hit must not silently drop `/model <alias>` resolution).
-        groups = _filter_model_picker_groups_by_policy(cache["groups"], cfg)
-        return {
+        return _annotate_fast_tier_model_groups({
             "active_provider": cache["active_provider"],
             "default_model": cache["default_model"],
-            "configured_model_badges": _configured_model_badges_from_static_catalog(
-                groups,
-                active_provider=cache["active_provider"],
-                default_model=cache["default_model"],
-            ),
-            "groups": groups,
+            "configured_model_badges": cache["configured_model_badges"],
+            "groups": cache["groups"],
             "aliases": (
                 cache["aliases"]
                 if isinstance(cache.get("aliases"), dict)
                 else _model_aliases_from_config()
             ),
-        }
+        })
     except Exception:
         return None
 
@@ -5609,18 +5495,13 @@ def _load_stale_models_cache_from_disk() -> dict | None:
             # duration of the over-budget stale fallback. Reconstruct from
             # current config, mirroring the live/static catalog alias build.
             aliases = _model_aliases_from_config()
-        groups = _filter_model_picker_groups_by_policy(cache["groups"], cfg)
-        return {
+        return _annotate_fast_tier_model_groups({
             "active_provider": cache["active_provider"],
             "default_model": cache["default_model"],
-            "configured_model_badges": _configured_model_badges_from_static_catalog(
-                groups,
-                active_provider=cache["active_provider"],
-                default_model=cache["default_model"],
-            ),
-            "groups": groups,
+            "configured_model_badges": cache["configured_model_badges"],
+            "groups": cache["groups"],
             "aliases": aliases,
-        }
+        })
     except Exception:
         return None
 
@@ -5685,7 +5566,7 @@ def _get_fresh_memory_models_cache(now: float) -> dict | None:
         _available_models_cache_source_fingerprint = None
         return None
     if _is_valid_models_cache(_available_models_cache):
-        return copy.deepcopy(_available_models_cache)
+        return _annotate_fast_tier_model_groups(copy.deepcopy(_available_models_cache))
     _available_models_cache = None
     _available_models_cache_ts = 0.0
     _available_models_live_rebuild_ts = 0.0
@@ -5784,71 +5665,12 @@ def invalidate_provider_models_cache(provider_id: str):
     _delete_models_cache_on_disk()
 
 
-def _prettify_model_label_fallback(model_id: str) -> str:
-    """Standalone fallback for Hermes-style model labels."""
-    raw = str(model_id or "").strip()
-    if not raw:
-        return ""
-    if raw.startswith("@") and ":" in raw:
-        raw = raw.split(":", 1)[1]
-    if "://" not in raw and "/" in raw:
-        raw = raw.split("/", 1)[1]
-    tokens = [token for token in raw.replace("_", "-").replace(":", "-").split("-") if token]
-    out: list[str] = []
-    i = 0
-    token_cases = {
-        "ai": "AI",
-        "api": "API",
-        "chatgpt": "ChatGPT",
-        "claude": "Claude",
-        "codex": "Codex",
-        "deepseek": "DeepSeek",
-        "flash": "Flash",
-        "fable": "Fable",
-        "gemini": "Gemini",
-        "glm": "GLM",
-        "gpt": "GPT",
-        "haiku": "Haiku",
-        "mini": "Mini",
-        "opus": "Opus",
-        "pro": "Pro",
-        "qwopus": "Qwopus",
-        "sonnet": "Sonnet",
-        "spark": "Spark",
-    }
-    while i < len(tokens):
-        token = tokens[i]
-        lower = token.lower()
-        if token.isdigit() and i + 1 < len(tokens) and tokens[i + 1].isdigit():
-            out.append(f"{token}.{tokens[i + 1]}")
-            i += 2
-            continue
-        out.append(token_cases.get(lower) or (token[:1].upper() + token[1:]))
-        i += 1
-    return " ".join(out)
-
-
-def _prettify_model_label(model_id: str) -> str:
-    """Use Hermes Agent's model label formatter when available."""
-    if "://" in str(model_id or ""):
-        return _prettify_model_label_fallback(model_id)
-    try:
-        module = __import__("hermes_cli.model_display", fromlist=["prettify_model_label"])
-        label = module.prettify_model_label(model_id)
-        if label:
-            return label
-    except Exception:
-        pass
-    return _prettify_model_label_fallback(model_id)
-
-
 def _get_label_for_model(model_id: str, existing_groups: list) -> str:
     """Return a human-friendly label for *model_id*.
 
     Resolution order:
     1. If the model already appears in *existing_groups* with a label, use it.
-    2. Strip @provider: prefix and namespace prefix, then use the Hermes Agent
-       model-display formatter.
+    2. Strip @provider: prefix and namespace prefix, then title-case.
 
     This ensures the injected default model entry in the dropdown always shows
     the same label as the live-fetched or static-catalog version, rather than
@@ -5869,28 +5691,14 @@ def _get_label_for_model(model_id: str, existing_groups: list) -> str:
             if m.get("label") and _norm(str(m.get("id", ""))) == norm_lookup:
                 return m["label"]
 
-    formatter = globals().get("_prettify_model_label")
-    if callable(formatter):
-        return str(formatter(lookup_id))
-
-    # Compatibility for tests/tools that exec only this function body.
-    bare = lookup_id if _has_scheme(lookup_id) else lookup_id.split("/", 1)[1] if "/" in lookup_id else lookup_id
-    words = [w for w in bare.replace("_", "-").split("-") if w]
-    result = []
-    i = 0
-    while i < len(words):
-        word = words[i]
-        if word.isdigit() and i + 1 < len(words) and words[i + 1].isdigit():
-            result.append(f"{word}.{words[i + 1]}")
-            i += 2
-            continue
-        result.append(
-            word.upper()
-            if (len(word) <= 3 and word.replace(".", "").isalnum() and not word.isdigit())
-            else word.capitalize()
-        )
-        i += 1
-    return " ".join(result)
+    # Fall back: strip only the first slash-segment (provider prefix),
+    # preserving vendor hierarchy for multi-slash IDs (#3360).
+    # Skip for URI-scheme IDs whose slashes are path separators (#3429).
+    bare = lookup_id.split("/", 1)[1] if ("/" in lookup_id and not _has_scheme(lookup_id)) else lookup_id
+    return " ".join(
+        w.upper() if (len(w) <= 3 and w.replace(".", "").isalnum() and not w.isdigit()) else w.capitalize()
+        for w in bare.replace("_", "-").split("-")
+    )
 
 
 def _read_live_provider_model_ids(provider_id: str) -> list[str]:
@@ -6300,13 +6108,8 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 if not _p.get("authenticated"):
                     continue
                 try:
-                    _status = _gas(_p["id"])
-                    _src = _status.get("key_source", "")
-                    _label = _status.get("label", "")
-                    _source = _status.get("source", _src)
-                    if _p.get("id") in {"copilot", "github-copilot"} and _is_ambient_gh_cli_entry(
-                        str(_source), str(_label), str(_src)
-                    ):
+                    _src = _gas(_p["id"]).get("key_source", "")
+                    if _src == "gh auth token":
                         continue
                 except Exception:
                     logger.debug("Failed to get key source for provider %s", _p.get("id", "unknown"))
@@ -6946,6 +6749,19 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 allow_empty: bool = False,
             ) -> None:
                 picker_models = copy.deepcopy(raw_models or [])
+                if _is_openai_family_provider(provider_id):
+                    for _model in picker_models:
+                        if not isinstance(_model, dict):
+                            continue
+                        _model_id = str(_model.get("id") or "").strip()
+                        if not _model_id:
+                            continue
+                        _model["supports_fast_tier"] = (
+                            str(
+                                _resolve_main_model_fast_mode_overrides(_model_id, provider_id).get("service_tier", "")
+                            ).strip().lower()
+                            == "priority"
+                        )
                 if apply_prefix:
                     picker_models = _apply_provider_prefix(picker_models, provider_id, active_provider)
                 visible_models, extra_models = _split_picker_overflow_models(
@@ -7443,8 +7259,6 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # Post-process: ensure model IDs are globally unique across groups.
         # When multiple providers expose the same bare model ID, prefix
         # collisions with @provider_id: so the frontend can distinguish them.
-        _append_moa_virtual_group(groups, cfg)
-        groups = _filter_model_picker_groups_by_policy(groups, cfg)
         _deduplicate_model_ids(groups)
 
         # Defense-in-depth: drop any optgroup that ended up with zero models
@@ -7982,7 +7796,17 @@ def _maybe_log_slow_stages(
 
 
 # ── Static file path ─────────────────────────────────────────────────────────
-_INDEX_HTML_PATH = REPO_ROOT / "static" / "index.html"
+
+
+def get_static_root() -> Path:
+    return REPO_ROOT / "static"
+
+
+def get_index_html_path() -> Path:
+    return get_static_root() / "index.html"
+
+
+_INDEX_HTML_PATH = get_index_html_path()
 
 # ── Thread synchronisation ───────────────────────────────────────────────────
 LOCK = threading.Lock()
@@ -8477,6 +8301,7 @@ _SETTINGS_DEFAULTS = {
     "show_previous_messaging_sessions": False,  # show older Telegram/Discord/etc. reset segments
     "sync_to_insights": False,  # mirror WebUI token usage to state.db for /insights
     "check_for_updates": True,  # check if webui/agent repos are behind upstream
+    "update_channel": "stable",  # stable | experimental — which release stream to track (stable = soaked/promoted; experimental = every batch)
     "ignore_agent_updates": False,  # keep WebUI update notices but suppress Agent update checks
     "whats_new_summary_enabled": False,  # show an LLM-written What's New summary before diff links
     "tts_enabled": False,
@@ -8541,7 +8366,7 @@ _SETTINGS_DEFAULTS = {
     "api_redact_enabled": True,  # redact sensitive data (API keys, secrets) from API responses
     "dashboard_plugins": {},  # plugin_name -> bool, opt-in per plugin (default off per PF-10b)
     "sidebar_density": "compact",  # compact | detailed
-    "auto_title_refresh_every": "5",  # adaptive title refresh: 0=off, 5/10/20=every N exchanges
+    "auto_title_refresh_every": "0",  # adaptive title refresh: 0=off, 5/10/20=every N exchanges
     "default_message_mode": "steer",  # behavior when sending while agent is running: queue | interrupt | steer
     "password_hash": None,  # PBKDF2-HMAC-SHA256 hash; None = auth disabled
     "auth_disabled_acknowledged": False,  # user acknowledged unauthenticated risk
@@ -8757,6 +8582,7 @@ _SETTINGS_ALLOWED_KEYS = set(_SETTINGS_DEFAULTS.keys()) - {
 _SETTINGS_ENUM_VALUES = {
     "send_key": {"enter", "ctrl+enter", "shift+enter"},
     "sidebar_density": {"compact", "detailed"},
+    "update_channel": {"stable", "experimental"},
     "font_size": {"small", "default", "large", "xlarge"},
     "auto_title_refresh_every": {"0", "5", "10", "20"},
     "default_message_mode": {"queue", "interrupt", "steer"},
@@ -8840,6 +8666,64 @@ _SETTINGS_TTS_ENGINE_RE = __import__("re").compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0
 
 _SETTINGS_WRITE_VERSION = 0
 _SETTINGS_WRITE_LOCK = __import__("threading").Lock()
+
+
+def _atomic_write_settings_text(path: Path, text: str) -> None:
+    """Write *text* to *path* atomically (temp file + fsync + os.replace).
+
+    ``settings.json`` was rewritten with a plain ``Path.write_text``, which
+    truncates the file in place: a crash or full disk mid-write leaves it
+    truncated/empty, so the next start loses every persisted setting (theme,
+    workspace, tab order, and the login ``password_hash``). Writing to a
+    sibling temp file, fsyncing, then ``os.replace`` keeps the old contents
+    intact until the rename commits the new ones in one step.  Mirrors the
+    tempfile+fsync+os.replace pattern already used by
+    ``webui_session_db.WebUIJsonSessionDB._atomic_write``.
+
+    The existing file's mode is carried onto the replacement: ``os.replace``
+    swaps in the temp file's inode, and a plain ``open`` respects the umask
+    (typically 0644), so without this an operator-hardened ``settings.json``
+    (chmod 0600 because it holds the password hash) would be silently loosened
+    on the next save.  New files fall back to the umask-adjusted default.
+
+    A symlinked target is written through to its referent (same follow-through
+    as the ``Path.write_text`` this replaces), rather than replacing the link
+    itself with a regular file.
+    """
+    path = Path(path)
+    write_path = path.resolve(strict=False) if path.is_symlink() else path
+    tmp = write_path.with_name(
+        f".{write_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        mode = os.stat(write_path).st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o666 & ~_current_umask()
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, write_path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _current_umask() -> int:
+    """Read the process umask without leaving it changed.
+
+    ``os.umask`` has no read-only form (it sets and returns the prior value),
+    so we set-then-restore. Called only on the new-``settings.json`` path, which
+    is rare; the tiny set-to-0 window is acceptable here (unlike a per-write
+    hot path).
+    """
+    umask = os.umask(0)
+    os.umask(umask)
+    return umask
 
 
 def _coerce_provider_cost_budget(value: Any) -> float | None:
@@ -9001,9 +8885,9 @@ def save_settings(settings: dict) -> dict:
     effective_persisted_speech_keys.update(applied_speech_keys)
     persisted = _settings_payload_for_write(current, effective_persisted_speech_keys)
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(
+    _atomic_write_settings_text(
+        SETTINGS_FILE,
         json.dumps(persisted, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
     global _SETTINGS_WRITE_VERSION
     with _SETTINGS_WRITE_LOCK:
@@ -9044,7 +8928,8 @@ if _settings_file_exists:
             startup_persisted_speech_keys = _extract_persisted_speech_keys(
                 _read_raw_settings_file()
             )
-            SETTINGS_FILE.write_text(
+            _atomic_write_settings_text(
+                SETTINGS_FILE,
                 json.dumps(
                     _settings_payload_for_write(
                         _startup_settings, startup_persisted_speech_keys
@@ -9052,7 +8937,6 @@ if _settings_file_exists:
                     ensure_ascii=False,
                     indent=2,
                 ),
-                encoding="utf-8",
             )
         except Exception:
             pass

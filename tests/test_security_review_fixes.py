@@ -118,7 +118,7 @@ def test_post_update_check_performs_forced_fetch(monkeypatch):
     monkeypatch.setattr(routes, "load_settings", lambda: {"check_for_updates": True})
     monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
 
-    def fake_check(*, force=False, include_agent=True):
+    def fake_check(*, force=False, include_agent=True, channel="stable"):
         calls.append((force, include_agent))
         return {"checked_at": 456, "webui": None, "agent": None}
 
