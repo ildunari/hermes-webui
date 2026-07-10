@@ -2356,6 +2356,7 @@ def _build_session_list_cache_payload(
             represented_webui_ids,
             show_cron_sessions=show_cron_sessions,
             show_webhook_sessions=show_webhook_sessions,
+            diagnostic_source_filter=source_filter,
         )
     else:
         diag_stage("filter_webui_sessions")
@@ -2375,6 +2376,19 @@ def _build_session_list_cache_payload(
         deduped_cli = []
     diag_stage("sort_sessions")
     merged = webui_sessions + deduped_cli
+    diagnostic_source = str(source_filter or "").strip().lower()
+    internal_sources = {"subagent", "tool", "smoke-test"}
+    if diagnostic_source in internal_sources:
+        merged = [
+            session
+            for session in merged
+            if diagnostic_source in {
+                str(session.get(key) or "").strip().lower()
+                for key in ("source_tag", "source", "raw_source", "session_source")
+            }
+        ]
+    else:
+        merged = [s for s in merged if not _is_internal_agent_execution_row(s)]
     merged.sort(
         key=lambda s: s.get("last_message_at") or s.get("updated_at", 0) or 0,
         reverse=True,
@@ -8547,12 +8561,25 @@ def _is_duplicate_webui_state_projection(session: dict, represented_webui_ids: s
     return bool(_session_lineage_ids(session) & represented_webui_ids)
 
 
+def _is_internal_agent_execution_row(session: dict) -> bool:
+    """Classify non-conversation Agent execution rows by any source marker."""
+    if not isinstance(session, dict):
+        return False
+    markers = {
+        value
+        for key in ("source_tag", "source", "raw_source", "session_source")
+        if (value := str(session.get(key) or "").strip().lower())
+    }
+    return bool(markers & {"subagent", "tool", "smoke-test"})
+
+
 def _dedupe_cli_sidebar_sessions_for_api(
     cli: list[dict],
     represented_webui_ids: set[str],
     *,
     show_cron_sessions: bool = False,
     show_webhook_sessions: bool = False,
+    diagnostic_source_filter: str | None = None,
 ) -> list[dict]:
     """Return state sidebar rows while preserving project-hidden background rows.
 
@@ -8572,14 +8599,23 @@ def _dedupe_cli_sidebar_sessions_for_api(
         and not _is_duplicate_webui_state_projection(s, represented_webui_ids)
         and is_cli_session_row_visible(s)
     ]
-    visible = [
-        s for s in candidates
-        if not _hide_background(
-            s,
+    diagnostic_source = str(diagnostic_source_filter or "").strip().lower()
+    internal_sources = {"subagent", "tool", "smoke-test"}
+
+    def _visible_for_requested_scope(session: dict) -> bool:
+        markers = {
+            str(session.get(key) or "").strip().lower()
+            for key in ("source_tag", "source", "raw_source", "session_source")
+        }
+        if diagnostic_source in internal_sources:
+            return diagnostic_source in markers
+        return not _hide_background(
+            session,
             show_cron=show_cron_sessions,
             show_webhook=show_webhook_sessions,
         )
-    ]
+
+    visible = [s for s in candidates if _visible_for_requested_scope(s)]
     return _include_project_hidden_background_sidebar_sessions(candidates, visible)
 
 

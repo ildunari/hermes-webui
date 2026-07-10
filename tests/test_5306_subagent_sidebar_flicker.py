@@ -1,15 +1,10 @@
 """Regression tests for delegated-subagent sidebar bugs #5306 and #5305.
 
-These lock two invariants for delegate/subagent child rows in the sidebar:
+These lock the current ordinary-sidebar policy for delegate/subagent child rows:
 
-#5306 (flicker): while a parent WebUI session is the active/streaming session,
-a linked delegate child that transiently reports ``message_count === 0`` between
-``/api/sessions`` polls must NOT be dropped by the visibility predicate
-(``_sidebarRowHasVisibleMessages``). Before the fix it was filtered out *before*
-``_attachChildSessionsToSidebarRows`` ever saw it, so it never entered
-``sessionsRaw`` — the row vanished, then reappeared on the next refresh once its
-list metadata caught up (the flicker). The child must stay stacked under its
-parent across re-renders even at message_count 0.
+#5306 is deliberately superseded for internal sources: delegated subagent rows
+are diagnostic execution records, not ordinary conversations. They are now
+filtered consistently on every poll instead of stacking beneath the parent.
 
 #5305 (orphan): a delegated subagent child whose WebUI parent is filtered out of
 the current render (project/profile/source scope) must NOT be promoted to a
@@ -92,6 +87,7 @@ eval(extractFunc('_sidebarLineageKeyForRow'));
 eval(extractFunc('_collapseSessionLineageForSidebar'));
 eval(extractFunc('_attachChildSessionsToSidebarRows'));
 eval(extractFunc('_sessionAttentionState'));
+eval(extractFunc('_isOrdinarySidebarInternalSession'));
 eval(extractFunc('_sidebarRowHasVisibleMessages'));
 eval(extractFunc('_partitionSidebarSessionRows'));
 eval(extractFunc('_scopedSidebarReferenceRows'));
@@ -133,15 +129,12 @@ console.log(JSON.stringify({
 }));
 """
     out = json.loads(_run_node(source))
-    # The zero-message delegate child of the active parent survives partitioning.
-    assert "subagent_child" in out["sessionsRaw"]
-    # It is stacked UNDER the parent, not rendered as a top-level row.
+    # Internal execution rows never enter the ordinary sidebar partition.
+    assert "subagent_child" not in out["sessionsRaw"]
     assert out["topLevel"] == ["active_parent"]
-    assert out["childCount"] == 1
-    assert out["childSids"] == ["subagent_child"]
-    # The predicate keeps the active parent's child...
-    assert out["childPredicate"] is True
-    # ...but still hides a truly-empty UNRELATED session (no regression).
+    assert out["childCount"] == 0
+    assert out["childSids"] == []
+    assert out["childPredicate"] is False
     assert out["unrelatedEmptyPredicate"] is False
 
 
@@ -170,8 +163,8 @@ function renderOnce(childMsgCount){
 console.log(JSON.stringify({ pollA: renderOnce(0), pollB: renderOnce(2) }));
 """
     out = json.loads(_run_node(source))
-    assert out["pollA"] == ["subagent_child"], "child dropped on the zero-message poll (flicker)"
-    assert out["pollB"] == ["subagent_child"], "child dropped on the caught-up poll"
+    assert out["pollA"] == []
+    assert out["pollB"] == []
 
 
 def test_5306_zero_message_child_of_inactive_parent_is_still_hidden():
@@ -216,9 +209,8 @@ console.log(JSON.stringify({
 }));
 """
     out = json.loads(_run_node(source))
-    # Child survives the visibility/project scope into sessionsRaw (parent does not)...
-    assert out["sessionsRaw"] == ["subagent_child"]
-    # ...but is NOT rendered as a top-level orphan.
+    # The ordinary partition drops the internal child before orphan handling.
+    assert out["sessionsRaw"] == []
     assert out["topLevel"] == []
     assert out["orphans"] == []
 
@@ -240,10 +232,8 @@ console.log(JSON.stringify(rows.map(r=>({sid:r.session_id, orphan:!!r._orphan_ch
     assert out == []
 
 
-def test_5305_visible_parent_still_stacks_subagent_child():
-    """Guard the common #5244 case still holds after the #5305 change: when the
-    WebUI parent IS visible in the same render, the delegate child stacks under
-    it (not suppressed, not orphaned)."""
+def test_5305_direct_attach_preserves_diagnostic_subagent_lineage():
+    """Direct diagnostic lineage helpers still preserve parent/child links."""
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
     source = _preamble(js) + """
 global._showArchived = false;

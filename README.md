@@ -223,6 +223,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Session projects -- named groups with colors for organizing sessions
 - Session tags -- add #tag to titles for colored chips and click-to-filter
 - Grouped by Today / Yesterday / Earlier in the sidebar (collapsible date groups)
+- Internal Agent execution sessions (`subagent`, `tool`, and `smoke-test`) stay out of the ordinary sidebar; direct session URLs and explicit source-filtered diagnostics remain available
 - Download as Markdown transcript, full JSON export, or import from JSON
 - Sessions persist across page reloads and SSH tunnel reconnects
 - Browser tab title reflects the active session name

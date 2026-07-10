@@ -6725,7 +6725,17 @@ function _sessionAttentionState(s){
   return {kind,count,severity:String(attention.severity||''),label,title};
 }
 
+function _isOrdinarySidebarInternalSession(s){
+  if(!s||typeof s!=='object') return false;
+  const sources=[s.source_tag,s.source,s.raw_source,s.session_source]
+    .map(v=>String(v||'').trim().toLowerCase()).filter(Boolean);
+  return sources.some(source=>source==='subagent'||source==='tool'||source==='smoke-test');
+}
+
 function _sidebarRowHasVisibleMessages(s, activeSidForSidebar){
+  // Internal execution rows stay directly addressable for diagnostics, but are
+  // not ordinary conversations and must never enter the sidebar partition.
+  if(_isOrdinarySidebarInternalSession(s)) return false;
   return (s.message_count||0)>0 ||
     _sessionAttentionState(s) ||
     _isSessionEffectivelyStreaming(s) ||

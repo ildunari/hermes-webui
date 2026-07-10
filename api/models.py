@@ -3669,15 +3669,33 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         s.save()
     return s
 
+_INTERNAL_AGENT_SESSION_SOURCES = frozenset({'subagent', 'tool', 'smoke-test'})
+
+
+def _session_raw_source(session: dict) -> str:
+    """Return the first concrete, normalized Agent source marker on a row."""
+    for key in ('source_tag', 'source', 'raw_source'):
+        value = str(session.get(key) or '').strip().lower()
+        if value:
+            return value
+    return str(session.get('session_source') or '').strip().lower()
+
+
+def _session_source_markers(session: dict) -> set[str]:
+    """Return every normalized source marker, including stale raw provenance."""
+    return {
+        value
+        for key in ('source_tag', 'source', 'raw_source', 'session_source')
+        if (value := str(session.get(key) or '').strip().lower())
+    }
+
+
 def _hide_from_default_sidebar(session: dict, *, show_cron: bool = False, show_webhook: bool = False) -> bool:
     """Return True for internal/background sessions hidden from the default list."""
     sid = str(session.get('session_id') or '')
-    source = (
-        session.get('source_tag')
-        or session.get('source')
-        or session.get('raw_source')
-        or session.get('session_source')
-    )
+    source = _session_raw_source(session)
+    if _session_source_markers(session) & _INTERNAL_AGENT_SESSION_SOURCES:
+        return True
     if not show_cron and (source == 'cron' or sid.startswith('cron_')):
         return True
     if not show_webhook and source == 'webhook':
