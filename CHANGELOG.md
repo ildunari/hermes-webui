@@ -9,6 +9,8 @@
 
 ### Added
 
+- **New "Final answer only" chat activity display mode.** Settings → Appearance → Activity display now offers a third option beside Compact Worklog and Transparent Stream: "Final answer only" hides all activity rows (thinking, tool calls, worklog) and shows just the assistant's final answer — the clean, minimal output style of ChatGPT/Claude. It's a pure display lens (opt-in; the default stays Compact Worklog), so no activity data is lost — switching modes re-renders the same conversation with more or less detail. Thanks @rodboev. (#5746, #5706)
+
 - **Resumable session event streams (server contract).** A new per-session SSE endpoint (`GET /api/sessions/{id}/events`) lets a client reconnect and resume from where its stream dropped — replaying journalled events after a cursor (standard EventSource `Last-Event-ID`, with an `after_event_id` query fallback for clients that can't set the header), deduped against live events at an atomic subscribe/snapshot boundary. Replay is bounded (per-line byte cap enforced pre-decode + an event-count limit) and *honest*: any limit, gap, or non-contiguous cursor returns a fresh `session_snapshot` recovery boundary so the client re-syncs rather than silently losing events. An idle no-cursor subscriber also re-syncs if a run starts and finishes entirely within one keepalive tick. Cross-profile access is refused (404) before any replay. This is the Phase-1 server contract; no client consumes it yet. Thanks @rodboev. (#5677, #4812)
 
 ### Fixed
