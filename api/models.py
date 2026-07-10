@@ -13,6 +13,7 @@ import time
 import uuid
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 
 import api.config as _cfg
 from api.compression_anchor import is_context_compression_marker
@@ -54,6 +55,123 @@ _CLI_SESSIONS_CACHE = {}
 _CLI_SESSIONS_CACHE_WAIT_SECONDS = 1.0
 # Event waits that keep stale rows visible while a rebuild is in flight.
 _CLI_SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
+
+# Hermex is backed by this WebUI sidebar. Some desktop/ACP-style clients create
+# complete Hermes sessions with a framework title (or no title at all) but never
+# call Hermes' normal first-turn title hook. Repair only those explicitly-known
+# producer defaults; a user-authored "Session" on another surface stays intact.
+_AGENT_TITLE_BACKFILL_SOURCES = frozenset({
+    "desktop", "craft-agent", "craft-agents-oss",
+})
+_AGENT_TITLE_PLACEHOLDERS = frozenset({
+    "", "untitled", "session", "desktop session", "agent session", "tui session",
+})
+_AGENT_TITLE_BACKFILL_LOCK = threading.Lock()
+_AGENT_TITLE_BACKFILL_INFLIGHT: set[tuple[str, str]] = set()
+_AGENT_TITLE_BACKFILL_RETRY_AFTER: dict[tuple[str, str], float] = {}
+_AGENT_TITLE_BACKFILL_RETRY_SECONDS = 300.0
+_AGENT_TITLE_BACKFILL_MAX_CONCURRENT = 2
+
+
+def _is_repairable_agent_session_title(source, title) -> bool:
+    """Return whether an agent-produced title can safely be auto-repaired."""
+    source = str(source or "").strip().lower()
+    normalized_title = " ".join(str(title or "").split()).casefold()
+    return source in _AGENT_TITLE_BACKFILL_SOURCES and normalized_title in _AGENT_TITLE_PLACEHOLDERS
+
+
+def _backfill_agent_session_title(*, session_id: str, profile: str, source: str, known_title) -> None:
+    """Generate and persist one missing desktop/Craft session title.
+
+    The worker writes only the authoritative Hermes ``state.db`` title field;
+    it never synthesizes a WebUI transcript. Before persisting it re-reads the
+    title so a concurrent producer or manual rename always wins.
+    """
+    key = (str(profile or ""), str(session_id or ""))
+    wrote_title = False
+    db = None
+    try:
+        if (
+            not key[0]
+            or not key[1]
+            or not _is_repairable_agent_session_title(source, known_title)
+        ):
+            return
+        messages = get_state_db_session_messages(key[1], profile=key[0])
+        if not messages:
+            return
+        from api.streaming import generate_session_title_for_session
+
+        candidate_session = SimpleNamespace(
+            session_id=key[1],
+            profile=key[0],
+            title=known_title,
+            messages=messages,
+        )
+        next_title, _reason, _raw_preview = generate_session_title_for_session(candidate_session)
+        if not next_title:
+            return
+
+        from api.state_sync import _get_state_db
+
+        db = _get_state_db(profile=key[0])
+        if not db or not _is_repairable_agent_session_title(
+            source,
+            db.get_session_title(key[1]),
+        ):
+            return
+        try:
+            wrote_title = bool(db.set_session_title(key[1], next_title))
+        except ValueError:
+            # Hermes titles are unique. Preserve the model label but make a rare
+            # collision deterministic rather than leaving this session unnamed.
+            wrote_title = bool(db.set_session_title(key[1], f"{next_title[:72]} {key[1][-6:]}"))
+    except Exception:
+        logger.debug("Agent session title backfill failed for %s", key[1], exc_info=True)
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                logger.debug("Failed to close title-backfill state.db", exc_info=True)
+        with _AGENT_TITLE_BACKFILL_LOCK:
+            _AGENT_TITLE_BACKFILL_INFLIGHT.discard(key)
+            if wrote_title:
+                _AGENT_TITLE_BACKFILL_RETRY_AFTER.pop(key, None)
+            elif key[0] and key[1]:
+                _AGENT_TITLE_BACKFILL_RETRY_AFTER[key] = time.monotonic() + _AGENT_TITLE_BACKFILL_RETRY_SECONDS
+    if wrote_title:
+        # Do not serve an old placeholder from the short-lived CLI cache.
+        clear_cli_sessions_cache()
+
+
+def _queue_agent_session_title_backfill(*, session_id: str, profile: str, source: str, title) -> None:
+    """Schedule at most one bounded repair attempt for a placeholder title."""
+    if not _is_repairable_agent_session_title(source, title):
+        return
+    key = (str(profile or ""), str(session_id or ""))
+    if not key[0] or not key[1]:
+        return
+    now = time.monotonic()
+    with _AGENT_TITLE_BACKFILL_LOCK:
+        if key in _AGENT_TITLE_BACKFILL_INFLIGHT:
+            return
+        if len(_AGENT_TITLE_BACKFILL_INFLIGHT) >= _AGENT_TITLE_BACKFILL_MAX_CONCURRENT:
+            return
+        if _AGENT_TITLE_BACKFILL_RETRY_AFTER.get(key, 0.0) > now:
+            return
+        _AGENT_TITLE_BACKFILL_INFLIGHT.add(key)
+    threading.Thread(
+        target=_backfill_agent_session_title,
+        kwargs={
+            "session_id": key[1],
+            "profile": key[0],
+            "source": source,
+            "known_title": title,
+        },
+        daemon=True,
+        name=f"agent-title-backfill-{key[1][-8:]}",
+    ).start()
 
 # Per-file parse cache for Claude Code JSONL transcripts (#4718/#4662 phase 4).
 # ``~/.claude/projects`` is a GLOBAL, profile-independent directory, but the
@@ -6762,7 +6880,12 @@ def _load_cli_sessions_uncached(
             else CLI_VISIBLE_SESSION_LIMIT
         ),
         log=logger,
-        exclude_sources=("cron", "webhook") if source_filter is None else None,
+        # Delegated subagents belong in their parent conversation's activity,
+        # not as top-level Hermex history rows. An explicit source query remains
+        # available to diagnostics and recovery paths.
+        exclude_sources=("cron", "subagent", "webhook")
+        if source_filter is None
+        else None,
         include_sources=None if source_filter is None else (source_filter,),
     ):
         sid = row['id']
@@ -6831,6 +6954,12 @@ def _load_cli_sessions_uncached(
             '_compression_segment_count': row.get('_compression_segment_count'),
             'is_cli_session': is_cli_session_row({**row, **_source_meta}),
         })
+        _queue_agent_session_title_backfill(
+            session_id=sid,
+            profile=profile,
+            source=_source,
+            title=_title,
+        )
 
     if source_filter is not None:
         return cli_sessions
