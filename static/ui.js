@@ -1795,6 +1795,14 @@ function _applyDashboardStatus(status){
 }
 async function refreshDashboardStatus(force=false){
   const now=Date.now();
+  // Skip the interval-driven poll while the tab is hidden: the 60s interval
+  // equals the cache TTL, so every background tick was a real /api/dashboard/status
+  // fetch that never hit the cache — a needless wakeup on a tab nobody is
+  // looking at (battery/CPU, #2476). Forced calls (settings save, init, the
+  // visibilitychange catch-up) still run. A visible tab keeps its live status.
+  if(!force&&typeof document!=='undefined'&&document.hidden){
+    return _dashboardStatusCache;
+  }
   if(!force&&_dashboardStatusCache&&(now-_dashboardStatusFetchedAt)<DASHBOARD_STATUS_TTL_MS){
     _applyDashboardStatus(_dashboardStatusCache);
     return _dashboardStatusCache;
@@ -1860,6 +1868,13 @@ function _initDashboardLinkProbe(){
   loadDashboardSettings();
   refreshDashboardStatus(true);
   setInterval(refreshDashboardStatus,DASHBOARD_STATUS_TTL_MS);
+  // Catch up once when the tab becomes visible again, since the interval poll
+  // was skipped while hidden and its cache is now stale.
+  if(typeof document!=='undefined'&&typeof document.addEventListener==='function'){
+    document.addEventListener('visibilitychange',()=>{
+      if(!document.hidden) refreshDashboardStatus(true);
+    });
+  }
 }
 if(document.readyState==='complete'){
   _initDashboardLinkProbe();
@@ -3756,6 +3771,15 @@ function renderModelDropdown(){
     }
     return 500;
   };
+  const _selectedModelState=(typeof _modelStateForSelect==='function')?_modelStateForSelect(sel,sel.value):{model:sel&&sel.value||'',model_provider:null};
+  const _modelProviderForSelectedBadge=(m)=>{
+    const _provider=String((m&&m.providerId)||(m&&m.badge&&m.badge.provider)||((typeof _providerFromModelValue==='function')?_providerFromModelValue(m&&m.value):'')||'').trim();
+    return (_provider&&_provider!=='default')?_provider:null;
+  };
+  const _isSelectedModelRow=(m)=>String((m&&m.value)||'')===String((_selectedModelState&&_selectedModelState.model)||(sel&&sel.value)||'')&&String(_modelProviderForSelectedBadge(m)||'')===String((_selectedModelState&&_selectedModelState.model_provider)||'');
+  const _selectedModelBadge=(m)=>_isSelectedModelRow(m)
+    ?`<span class="model-opt-badge model-opt-badge--selected">${esc(t('model_badge_selected')||'Selected')}</span>`
+    :'';
   const _renderProviderEndpointHint=(entry,parent)=>{
     if(!entry||!entry.label||!entry.modelsEndpointError) return;
     const hint=document.createElement('div');
@@ -3765,13 +3789,13 @@ function renderModelDropdown(){
   };
   // Build a single model-option row (mirrors the main render loop's row markup),
   // used both by the main render and by the in-place overflow reveal below.
-  const _buildModelRow=(m,sel,withProviderChip)=>{
+  const _buildModelRow=(m,withProviderChip)=>{
     const row=document.createElement('div');
-    row.className='model-opt'+(m.value===sel.value?' active':'');
+    row.className='model-opt'+(_isSelectedModelRow(m)?' active':'');
     const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(m.badge.label||'Configured')}</span>`:'';
     const _plainGroup=m.group?String(m.group).replace(/\s*\(\d+\s+of\s+\d+\)\s*$/,''):'';
     const providerChip=(_plainGroup&&withProviderChip)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
-    row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
+    row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${_selectedModelBadge(m)}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
     row.onclick=()=>selectFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
     return row;
   };
@@ -3825,7 +3849,7 @@ function renderModelDropdown(){
       for(const m of extraModels){
         if(!m||!m.id) continue;
         if(_alreadyShown.has(esc(m.id))) continue;
-        const row=_buildModelRow({value:m.id,name:m.label||m.id,id:m.id,group:_plainLabel,groupKey,providerId:(og.dataset&&og.dataset.provider)||''},sel,false);
+        const row=_buildModelRow({value:m.id,name:m.label||m.id,id:m.id,group:_plainLabel,groupKey,providerId:(og.dataset&&og.dataset.provider)||''},false);
         wrap.insertBefore(row,moreEl);
         if(!firstNewRow) firstNewRow=row;
       }
@@ -3880,17 +3904,17 @@ function renderModelDropdown(){
   const _selectedGroupKey=(()=>{
     const _selVal=String((sel&&sel.value)||'');
     if(!_selVal) return null;
-    const _hit=_modelData.find(m=>m&&!m.endpointErrorOnly&&String(m.value||'')===_selVal);
+    const _hit=_modelData.find(m=>m&&!m.endpointErrorOnly&&_isSelectedModelRow(m)) || _modelData.find(m=>m&&!m.endpointErrorOnly&&String(m.value||'')===_selVal);
     return _hit?_hit.groupKey:null;
   })();
-  const _makeModelRow=(m,sel,shouldRenderHeading)=>{
+  const _makeModelRow=(m,shouldRenderHeading)=>{
     const row=document.createElement('div');
-    row.className='model-opt'+(m.value===sel.value?' active':'');
+    row.className='model-opt'+(_isSelectedModelRow(m)?' active':'');
     const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(m.badge.label||'Configured')}</span>`:'';
     const _plainGroup=m.group?String(m.group).replace(/\s*\(\d+\s+of\s+\d+\)\s*$/,''):'';
     const _underOwnHeading=shouldRenderHeading&&!!(m.groupKey&&_groupWrappers[m.groupKey]);
     const providerChip=(_plainGroup&&!_underOwnHeading)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
-    row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
+    row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${_selectedModelBadge(m)}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
     row.onclick=()=>selectFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
     return row;
   };
@@ -3975,7 +3999,7 @@ function renderModelDropdown(){
       }
       for(const m of configuredModels){
         const row=document.createElement('div');
-        row.className='model-opt'+(m.value===sel.value?' active':'');
+        row.className='model-opt'+(_isSelectedModelRow(m)?' active':'');
         let badgeLabel = '';
         let modelName = m.name;
         if (m.badge) {
@@ -3989,7 +4013,7 @@ function renderModelDropdown(){
           }
         }
         const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(badgeLabel)}</span>`:'';
-        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(modelName)}</span>${badgeHtml}</div><span class="model-opt-id">${esc(m.id)}</span>`;
+        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(modelName)}</span>${badgeHtml}${_selectedModelBadge(m)}</div><span class="model-opt-id">${esc(m.id)}</span>`;
         row.onclick=()=>selectFromDropdown(m.value,(m.badge&&m.badge.provider)||m.providerId||null);
         dd.appendChild(row);
       }
@@ -4090,16 +4114,16 @@ function renderModelDropdown(){
               });
               wrapper.appendChild(subHeading);
               wrapper.appendChild(subWrapper);
-              for(const m of pfxRows) subWrapper.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
+              for(const m of pfxRows) subWrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
             } else {
-              for(const m of pfxRows) wrapper.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
+              for(const m of pfxRows) wrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
             }
           }
         } else {
-          for(const m of groupRows) wrapper.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
+          for(const m of groupRows) wrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
         }
       } else {
-        for(const m of groupRows) dd.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
+        for(const m of groupRows) dd.appendChild(_makeModelRow(m,shouldRenderHeading));
       }
       if(!term&&hiddenCount){
         const showAll=document.createElement('div');
@@ -4228,6 +4252,8 @@ async function toggleModelDropdown(){
   renderModelDropdown();
   dd.classList.add('open');
   _positionModelDropdown();
+  const activeRow=dd.querySelector('.model-opt.active');
+  if(activeRow&&typeof activeRow.scrollIntoView==='function') activeRow.scrollIntoView({block:'nearest'});
   chip.classList.add('active');
   const mobileAction=$('composerMobileModelAction');
   if(mobileAction) mobileAction.classList.add('active');
@@ -11029,12 +11055,77 @@ function _onLiveActivityToggle(group){
   if(group.getAttribute('data-live-tool-call-group')!=='1') return;
   _liveActivityUserExpanded = !group.classList.contains('tool-call-group-collapsed');
 }
+function _materializeDeferredWorklogRows(group){
+  // #5839: build the row DOM for a settled worklog whose rows were deferred at
+  // render time (collapsed). Idempotent — clears the marker so it runs once.
+  if(!group||group.getAttribute('data-worklog-rows-deferred')!=='1') return false;
+  let rows=group._deferredWorklogRows;
+  // The JS-property stash is dropped when the transcript is restored from the
+  // HTML cache (innerHTML round-trip). Recover the rows from the owning message
+  // via the disclosure key (anchor-scene:<rawIdx>) so a post-restore expand
+  // still fills the worklog. (#5839)
+  if((!rows||!rows.length)&&typeof _deferredWorklogRowsFromGroup==='function'){
+    rows=_deferredWorklogRowsFromGroup(group);
+  }
+  group.removeAttribute('data-worklog-rows-deferred');
+  group._deferredWorklogRows=null;
+  if(!rows||!rows.length) return false;
+  const ok=_renderAnchorSceneRowsIntoWorklog(group,rows,{settled:true});
+  if(!ok) return false;
+  // #5839 fix: the eager render path post-processes its rows (syntax highlight,
+  // copy buttons, mermaid, katex, structured trees) and restores detail-disclosure
+  // state; a lazily-materialized group must do the same or expanded rows render
+  // un-enhanced and any captured open/scroll state is lost. Post-process on the
+  // next frame (matching the eager rebuild paths), then re-apply the disclosure
+  // state stashed with the group at defer time.
+  const disclosure=group._deferredWorklogDisclosure;
+  group._deferredWorklogDisclosure=null;
+  if(typeof _postProcessWithAnchorSuppression==='function'
+     && typeof requestAnimationFrame==='function'){
+    requestAnimationFrame(()=>{
+      _postProcessWithAnchorSuppression(group);
+      if(disclosure&&disclosure.size&&typeof _restoreWorklogDetailDisclosureState==='function'){
+        _restoreWorklogDetailDisclosureState(group, disclosure);
+      }
+    });
+  }else if(disclosure&&disclosure.size&&typeof _restoreWorklogDetailDisclosureState==='function'){
+    _restoreWorklogDetailDisclosureState(group, disclosure);
+  }
+  return true;
+}
+function _deferredWorklogRowsFromGroup(group){
+  // Recover a settled worklog's rows from S.messages using the group's
+  // disclosure key `anchor-scene:<rawIdx>`. Used after an HTML-cache restore
+  // where the _deferredWorklogRows JS property was dropped. (#5839)
+  const key=group&&group.getAttribute&&group.getAttribute('data-activity-disclosure-key');
+  const m=key&&/^anchor-scene:(\d+)$/.exec(key);
+  if(!m) return null;
+  const msg=S.messages&&S.messages[Number(m[1])];
+  const scene=msg&&msg._anchor_activity_scene;
+  if(!scene) return null;
+  return _anchorSceneRowsForRendering(scene,{settled:true});
+}
+function _rehydrateDeferredWorklogsFromCache(root){
+  // After restoring a transcript from _sessionHtmlCache, deferred settled
+  // worklogs carry data-worklog-rows-deferred="1" but lost their stashed rows
+  // (JS properties don't survive innerHTML). Re-stash from the owning message so
+  // the first expand materializes correctly. (#5839)
+  if(!root||!root.querySelectorAll) return;
+  root.querySelectorAll('[data-worklog-rows-deferred="1"]').forEach(group=>{
+    if(group._deferredWorklogRows&&group._deferredWorklogRows.length) return;
+    const rows=_deferredWorklogRowsFromGroup(group);
+    if(rows&&rows.length) group._deferredWorklogRows=rows;
+    else group.removeAttribute('data-worklog-rows-deferred'); // nothing to defer
+  });
+}
 function _toggleActivityGroup(summary){
   const group=summary&&summary.closest?summary.closest('.agent-activity-group,.tool-call-group'):null;
   if(!group) return;
   const collapsed=group.classList.toggle('tool-call-group-collapsed');
   group.classList.toggle('open',!collapsed);
   summary.setAttribute('aria-expanded',String(!collapsed));
+  // #5839: materialize deferred settled rows on first expand (lazy render).
+  if(!collapsed) _materializeDeferredWorklogRows(group);
   _writeActivityDisclosureState(group.getAttribute('data-activity-disclosure-key'), !collapsed);
   if(typeof _onLiveActivityToggle==='function') _onLiveActivityToggle(group);
 }
@@ -11514,6 +11605,7 @@ function _anchorSceneTransparentNodeForRow(row, opts){
     const text=String(row.text||'').trim();
     if(!text) return null;
     const finalAnswer=String((opts&&opts.finalAnswer)||'').trim();
+    if(opts&&opts.liveTokenFinalPrefixEligible&&_anchorSceneLiveTokenFinalPrefix(row,text,finalAnswer)) return null;
     if(finalAnswer&&_anchorSceneProseMatchesFinalAnswer(text,finalAnswer)) return null;
     node=_anchorSceneNodeForRow(row,{settled});
     if(!node) return null;
@@ -11555,6 +11647,18 @@ function _anchorSceneTransparentNodeForRow(row, opts){
   if(opts&&opts.sessionId) node.setAttribute('data-session-id',String(opts.sessionId));
   if(live) node.setAttribute('data-live-stream-owned','1');
   return node;
+}
+function _anchorSceneLiveTokenFinalPrefix(row, proseText, finalAnswer){
+  if(!row||row.role!=='prose'||row.kind!=='process_prose') return false;
+  if(String(row.source_event_type||'')!=='token') return false;
+  if(!String(row.local_id||'').startsWith('live-prose:')) return false;
+  const norm=(s)=>String(s||'').replace(/\s+/g,' ').trim().toLowerCase();
+  const rowKey=norm(proseText), finalKey=norm(finalAnswer);
+  return !!(rowKey&&finalKey&&rowKey.length<finalKey.length&&finalKey.startsWith(rowKey));
+}
+function _anchorSceneLastNonTerminalWorkRowIndex(rows){
+  if(!Array.isArray(rows)) return -1;
+  return rows.reduce((last,row,idx)=>(row&&row.role==='tool')?idx:last,-1);
 }
 // Whitespace-insensitive compare so a scene prose row that IS the final answer
 // (possibly re-wrapped) is recognized and not duplicated against the segment.
@@ -12153,6 +12257,7 @@ function _renderSettledAnchorSceneTransparentForMessage(message, segment, rawIdx
   const scene=message._anchor_activity_scene;
   const rows=_anchorSceneRowsForRendering(scene,{settled:true});
   if(!rows.length) return false;
+  const lastNonTerminalWorkRowIndex=_anchorSceneLastNonTerminalWorkRowIndex(rows);
   // The assistant segment owns the final answer; pass it so intermediate prose
   // rows render but the final-answer-duplicate prose row is suppressed.
   const finalAnswer=String(
@@ -12171,8 +12276,9 @@ function _renderSettledAnchorSceneTransparentForMessage(message, segment, rawIdx
     }
   });
   let wrote=false;
-  for(const row of rows){
-    const node=_anchorSceneTransparentNodeForRow(row,{settled:true,finalAnswer});
+  for(let idx=0;idx<rows.length;idx+=1){
+    const row=rows[idx];
+    const node=_anchorSceneTransparentNodeForRow(row,{settled:true,finalAnswer,liveTokenFinalPrefixEligible:idx>lastNonTerminalWorkRowIndex});
     if(!node) continue;
     if(segment.parentElement===blocks) blocks.insertBefore(node,segment);
     else blocks.appendChild(node);
@@ -12288,6 +12394,24 @@ function _renderSettledAnchorSceneForMessage(message, segment, rawIdx){
   });
   if(!group) return false;
   group.setAttribute('data-anchor-settled-scene-owner','1');
+  // #5839: for a COLLAPSED settled worklog, defer building the row DOM until the
+  // user first expands it. A reasoning-heavy turn can carry 80+ activity rows;
+  // eagerly materializing them for every historical turn balloons the DOM and a
+  // later synchronous layout (e.g. opening a dropdown) tips the tab into a
+  // multi-GB freeze. The summary chip renders from data-turn-duration, not the
+  // rows, so a deferred worklog still shows its "Processed in Xs" label. On
+  // expand, _toggleActivityGroup materializes the stashed rows exactly once.
+  const collapsed=group.classList.contains('tool-call-group-collapsed');
+  if(collapsed){
+    group._deferredWorklogRows=rows;
+    group.setAttribute('data-worklog-rows-deferred','1');
+    const list=_toolWorklogListEl(group);
+    if(list) list.innerHTML='';
+    _syncToolCallGroupSummary(group);
+    return true;
+  }
+  group._deferredWorklogRows=null;
+  group.removeAttribute('data-worklog-rows-deferred');
   return _renderAnchorSceneRowsIntoWorklog(group,rows,{settled:true});
 }
 function _syncLiveWorklogReasonsForAnchor(anchor, displayTextOverride){
@@ -14078,6 +14202,7 @@ function renderMessages(options){
       _messageVirtualWindowKey=renderWindowKey;
       _sessionHtmlCacheSid=sid;
       _rehydrateTransparentStreamDom(inner);
+      _rehydrateDeferredWorklogsFromCache(inner);
       _wireMessageWindowLoadEarlierButton();
       if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
       _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
@@ -15254,7 +15379,15 @@ function renderMessages(options){
     }
   }
   _restoreWorklogDetailDisclosureState(inner, worklogDetailDisclosureState);
-  _messageVirtualWindowKey=renderWindowKey;
+  // #5839 fix: deferred settled worklogs have no rows yet at restore time, so
+  // the disclosure restore above can't reach their detail elements. Stash the
+  // captured state on each still-deferred group; _materializeDeferredWorklogRows
+  // re-applies it (key-scoped + idempotent) once the rows exist on expand.
+  if(worklogDetailDisclosureState&&worklogDetailDisclosureState.size){
+    inner.querySelectorAll('[data-worklog-rows-deferred="1"]').forEach(group=>{
+      group._deferredWorklogDisclosure=worklogDetailDisclosureState;
+    });
+  }
   // Render per-turn duration and optional token usage on assistant messages.
   // Duration stays visible even when token usage is disabled, because it answers
   // the basic "how long did that turn take?" UX question. Only walk rendered
@@ -15426,6 +15559,9 @@ function renderMessages(options){
           group.classList.add('open');
           const summary=group.querySelector('.tool-call-group-summary,.activity-summary');
           if(summary) summary.setAttribute('aria-expanded','true');
+          // #5839: this turn is otherwise blank, so materialize any deferred
+          // settled rows now that we're force-expanding the worklog to fill it.
+          if(typeof _materializeDeferredWorklogRows==='function') _materializeDeferredWorklogRows(group);
         }
         // `revealed` means "this turn has a non-empty Worklog group that the user
         // can see" — NOT "we just expanded something". An already-open non-empty

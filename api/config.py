@@ -2446,6 +2446,31 @@ def _custom_slug_rest_looks_like_host_port(rest: str) -> bool:
     return False
 
 
+def _parse_provider_qualified_model_id(model_id: str) -> tuple[str, str] | None:
+    """Parse WebUI's ``@provider:model`` route hint into ``(model, provider)``.
+
+    The provider segment can contain colons for named custom providers, while
+    the model segment can also contain colons for tags such as ``:free``.
+    Keep this parser shared with ``resolve_model_provider`` so any caller that
+    compares route-hinted model lanes uses the same grammar.
+    """
+    candidate = str(model_id or "").strip()
+    if not candidate.startswith("@") or ":" not in candidate:
+        return None
+    inner = candidate[1:]
+    provider_hint, bare_model = inner.rsplit(":", 1)
+    if provider_hint.startswith("custom:") and provider_hint.count(":") >= 2:
+        _slug_rest = provider_hint[len("custom:"):]
+        if not _custom_slug_rest_looks_like_host_port(_slug_rest):
+            provider_hint, extra = provider_hint.rsplit(":", 1)
+            bare_model = f"{extra}:{bare_model}"
+    elif (provider_hint not in _PROVIDER_MODELS
+            and provider_hint not in _PROVIDER_DISPLAY
+            and not provider_hint.startswith("custom:")):
+        provider_hint, bare_model = inner.split(":", 1)
+    return bare_model, provider_hint
+
+
 def _get_provider_base_url(provider_id):
     """Look up the configured base_url for a provider (e.g. lmstudio).
 
@@ -2683,18 +2708,9 @@ def resolve_model_provider(model_id: str) -> tuple:
     #
     # Exception: ``custom:<ip-or-host>:<port>`` is a single logical slug derived
     # from OpenAI ``base_url`` authority and contains no eaten model segments.
-    if model_id.startswith("@") and ":" in model_id:
-        inner = model_id[1:]
-        provider_hint, bare_model = inner.rsplit(":", 1)
-        if provider_hint.startswith("custom:") and provider_hint.count(":") >= 2:
-            _slug_rest = provider_hint[len("custom:"):]
-            if not _custom_slug_rest_looks_like_host_port(_slug_rest):
-                provider_hint, extra = provider_hint.rsplit(":", 1)
-                bare_model = f"{extra}:{bare_model}"
-        elif (provider_hint not in _PROVIDER_MODELS
-                and provider_hint not in _PROVIDER_DISPLAY
-                and not provider_hint.startswith("custom:")):
-            provider_hint, bare_model = inner.split(":", 1)
+    parsed_provider_hint = _parse_provider_qualified_model_id(model_id)
+    if parsed_provider_hint is not None:
+        bare_model, provider_hint = parsed_provider_hint
         if (
             provider_hint.startswith("custom:")
             and config_base_url
@@ -2969,6 +2985,19 @@ def model_with_provider_context(model_id: str, model_provider: str | None = None
         return model
 
     return f"@{provider}:{model}"
+
+
+def canonical_model_provider_lane(model_id: str, model_provider: str | None = None) -> tuple[str, str | None]:
+    """Return the runtime-resolved model/provider pair used for lane comparisons."""
+    model = str(model_id or "").strip()
+    provider = str(model_provider or "").strip() or None
+    if not model:
+        return "", provider
+    resolved_model, resolved_provider, _ = resolve_model_provider(
+        model_with_provider_context(model, provider)
+    )
+    resolved_provider = str(resolved_provider or "").strip() or None
+    return str(resolved_model or "").strip(), resolved_provider
 
 
 def get_effective_default_model(config_data: dict | None = None) -> str:
@@ -4144,22 +4173,65 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
 
 # ── Auxiliary model configuration ──────────────────────────────────────────
 
-# Canonical auxiliary task slots. Keep in sync with hermes_cli/config.py
-# DEFAULT_CONFIG["auxiliary"] and hermes_cli/web_server.py _AUX_TASK_SLOTS.
-AUX_TASK_SLOTS: tuple[str, ...] = (
- "vision",
- "web_extract",
- "compression",
- "session_search",
- "skills_hub",
- "approval",
- "mcp",
- "title_generation",
- "curator",
- "kanban_decomposer",
- "profile_describer",
- "triage_specifier",
+# Canonical auxiliary task catalog.
+# Keep in sync with hermes_cli/config.py DEFAULT_CONFIG["auxiliary"] and
+# hermes_cli/web_server.py _AUX_TASK_SLOTS.
+AUXILIARY_TASK_CATALOG: tuple[dict[str, str], ...] = (
+    {"key": "vision", "label": "Vision", "description": "image/screenshot analysis"},
+    {"key": "web_extract", "label": "Web extract", "description": "web page summarization"},
+    {"key": "compression", "label": "Compression", "description": "context summarization"},
+    {"key": "approval", "label": "Approval", "description": "smart command approval"},
+    {"key": "mcp", "label": "MCP", "description": "MCP tool reasoning"},
+    {"key": "title_generation", "label": "Title generation", "description": "session titles"},
+    {"key": "skills_hub", "label": "Skills hub", "description": "skills search/install"},
+    {"key": "curator", "label": "Curator", "description": "skill-usage review pass"},
+    {"key": "kanban_decomposer", "label": "Kanban decomposer", "description": "task decomposition"},
+    {"key": "profile_describer", "label": "Profile describer", "description": "profile summaries"},
+    {"key": "triage_specifier", "label": "Triage specifier", "description": "issue/task triage specs"},
 )
+
+AUX_TASK_SLOTS: tuple[str, ...] = tuple(item["key"] for item in AUXILIARY_TASK_CATALOG)
+
+# Slots removed from the WebUI catalog whose persisted assignments should be
+# discarded when the user explicitly resets all auxiliary-model routing.
+RETIRED_AUX_TASK_SLOTS: tuple[str, ...] = ("session_search",)
+
+
+def _aux_task_payload(task_key: str, entry: dict, fallback_label: str = "", fallback_description: str = "") -> dict:
+    """Build the API payload row for a single auxiliary task."""
+    if not isinstance(entry, dict):
+        entry = {}
+    return {
+        "task": task_key,
+        "provider": str(entry.get("provider") or "auto").strip() or "auto",
+        "model": str(entry.get("model") or "").strip(),
+        "base_url": str(entry.get("base_url") or "").strip(),
+        "timeout": entry.get("timeout", ""),
+        "download_timeout": entry.get("download_timeout", ""),
+        "max_concurrency": entry.get("max_concurrency", ""),
+        "extra_body": entry.get("extra_body") if isinstance(entry.get("extra_body"), dict) else {},
+        "api_key_set": bool(str(entry.get("api_key") or "").strip()),
+        "label": fallback_label,
+        "description": fallback_description,
+    }
+
+
+def _iter_auxiliary_task_rows() -> list[dict]:
+    """Return canonical auxiliary task payload rows."""
+    aux_cfg = cfg.get("auxiliary", {})
+    if not isinstance(aux_cfg, dict):
+        aux_cfg = {}
+
+    rows: list[dict] = []
+
+    # Canonical, first-class tasks from WebUI's catalog.
+    for slot in AUXILIARY_TASK_CATALOG:
+        key = str(slot["key"]).strip()
+        if not key:
+            continue
+        rows.append(_aux_task_payload(key, aux_cfg.get(key, {}), slot["label"], slot["description"]))
+
+    return rows
 
 
 def get_auxiliary_models() -> dict:
@@ -4181,26 +4253,7 @@ def get_auxiliary_models() -> dict:
     main_provider = str(model_cfg.get("provider") or "").strip()
     main_model = str(model_cfg.get("default") or model_cfg.get("name") or "").strip()
 
-    aux_cfg = cfg.get("auxiliary", {})
-    if not isinstance(aux_cfg, dict):
-        aux_cfg = {}
-
-    tasks = []
-    for slot in AUX_TASK_SLOTS:
-        entry = aux_cfg.get(slot, {})
-        if not isinstance(entry, dict):
-            entry = {}
-        tasks.append({
-            "task": slot,
-            "provider": str(entry.get("provider") or "auto").strip(),
-            "model": str(entry.get("model") or "").strip(),
-            "base_url": str(entry.get("base_url") or "").strip(),
-            "timeout": entry.get("timeout", ""),
-            "download_timeout": entry.get("download_timeout", ""),
-            "max_concurrency": entry.get("max_concurrency", ""),
-            "extra_body": entry.get("extra_body") if isinstance(entry.get("extra_body"), dict) else {},
-            "api_key_set": bool(str(entry.get("api_key") or "").strip()),
-        })
+    tasks = _iter_auxiliary_task_rows()
 
     return {
         "tasks": tasks,
@@ -4238,20 +4291,19 @@ def set_auxiliary_model(task: str, provider: str, model: str, advanced: dict | N
     Sensitive api_key values are write-only: get_auxiliary_models() only reports
     whether one is set.
     """
-    if task != "__reset__" and task not in AUX_TASK_SLOTS:
-        raise ValueError(
-            f"Unknown auxiliary task slot: {task!r}. Valid: {list(AUX_TASK_SLOTS)}"
-        )
     config_path = _get_config_path()
     with _cfg_lock:
         config_data = _load_yaml_config_file(config_path)
-
+        if task != "__reset__" and task not in AUX_TASK_SLOTS:
+            raise ValueError(f"Unknown auxiliary task slot: {task!r}. Valid: {list(AUX_TASK_SLOTS)}")
         if task == "__reset__":
             # Per-slot reset: set each slot to auto, preserving extra fields
             # (timeout, extra_body, api_key, base_url, download_timeout, etc.)
             aux_cfg = config_data.get("auxiliary", {})
             if not isinstance(aux_cfg, dict):
                 aux_cfg = {}
+            for retired_slot in RETIRED_AUX_TASK_SLOTS:
+                aux_cfg.pop(retired_slot, None)
             for slot in AUX_TASK_SLOTS:
                 slot_cfg = aux_cfg.get(slot, {})
                 if not isinstance(slot_cfg, dict):
@@ -6867,14 +6919,20 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                             _mid = str(_item.get("id") or "").strip()
                             if not _mid or _mid in seen_ids:
                                 continue
-                            _pricing = _item.get("pricing") or {}
-                            try:
-                                _is_free = (
-                                    float(_pricing.get("prompt", "0") or "0") == 0
-                                    and float(_pricing.get("completion", "0") or "0") == 0
-                                )
-                            except (TypeError, ValueError):
-                                _is_free = False
+                            _pricing = _item.get("pricing")
+                            _is_free = False
+                            if (
+                                isinstance(_pricing, dict)
+                                and "prompt" in _pricing
+                                and "completion" in _pricing
+                            ):
+                                try:
+                                    _is_free = (
+                                        float(_pricing["prompt"]) == 0
+                                        and float(_pricing["completion"]) == 0
+                                    )
+                                except (TypeError, ValueError):
+                                    _is_free = False
                             # Also include explicit `:free` suffix variants
                             _is_free = _is_free or _mid.endswith(":free")
                             if not _is_free:
@@ -7863,10 +7921,39 @@ class StreamChannel:
     of them instead of being consumed destructively by a single queue reader.
     """
 
+    # Cap on the offline replay buffer (drop-oldest). While no tab is subscribed,
+    # put_nowait() buffers the stream tail so a first/reconnecting subscriber can
+    # catch up. But a client that disconnects without cancelling leaves the turn
+    # running with zero subscribers, so an unbounded buffer here grows for the
+    # WHOLE turn (a busy turn emits thousands of coalesced token frames) — an OOM
+    # risk per abandoned turn (#4633). Bounding to the most recent N frames keeps
+    # a reconnecting tab's needed *tail* intact; older dropped frames stay
+    # recoverable via the run journal by last_event_id. 8192 is generous enough
+    # to hold a long multi-tool turn's backlog while capping worst-case memory to
+    # a fixed number of small (event, data, id) tuples — deliberately far above
+    # SessionChannel's per-subscriber maxsize of 16 (that queue drops on a *slow*
+    # reader; this buffer must survive a legitimate reconnect gap).
+    _OFFLINE_BUFFER_MAXLEN = 8192
+
     def __init__(self):
         self._lock = threading.Lock()
         self._subscribers: list[queue.Queue] = []
-        self._offline_buffer: list[tuple[str, object]] = []
+        self._offline_buffer: collections.deque = collections.deque(
+            maxlen=self._OFFLINE_BUFFER_MAXLEN
+        )
+        # Frames evicted at the cap from the CURRENT buffer content. Scoped to
+        # the buffer, NOT to an attach cycle: it resets exactly when the buffer
+        # itself is cleared (first live broadcast), never on subscribe/
+        # unsubscribe alone — a drain is a non-destructive copy, so after a
+        # transient attach the buffer is STILL truncated and reporting 0 would
+        # hand the next subscriber a silently-holed tail. Whether a given
+        # reconnect actually NEEDS the evicted frames is decided server-side
+        # against offline_first_event_id (its cursor may sit inside the
+        # retained tail). Also gates the one-shot eviction log.
+        self._offline_dropped = 0
+        # Cumulative evictions over the channel's lifetime, never reset — for ops
+        # visibility via diagnostic_snapshot().
+        self._offline_dropped_total = 0
         self._last_event_id: str | None = None
 
     def subscribe(self) -> queue.Queue:
@@ -7883,8 +7970,19 @@ class StreamChannel:
             # is safe. Per Opus advisor on stage-292.
             for item in self._offline_buffer:
                 q.put_nowait(item)
+            first = self._offline_buffer[0] if self._offline_buffer else None
             snapshot = {
                 "offline_buffered_events": len(self._offline_buffer),
+                # Surface eviction so the SSE handler can tell the tail it is
+                # about to drain may be truncated (older frames were dropped at
+                # the cap) and must be proven contiguous before streaming.
+                "offline_dropped_events": self._offline_dropped,
+                # Event id of the oldest retained frame: the handler needs run-
+                # journal coverage only for (client cursor → this frame); a
+                # cursor already inside the retained tail needs no journal.
+                "offline_first_event_id": (
+                    first[2] if first is not None and len(first) >= 3 else None
+                ),
                 "last_event_id": self._last_event_id,
             }
             self._subscribers.append(q)
@@ -7911,9 +8009,27 @@ class StreamChannel:
                 self._last_event_id = event_id
             subscribers = list(self._subscribers)
             if not subscribers:
+                # deque(maxlen) evicts the oldest frame automatically when full.
+                # Log once on the first eviction (debug: an abandoned/disconnected
+                # turn is expected to hit this) and keep a running dropped count
+                # for diagnostics.
+                if len(self._offline_buffer) >= self._OFFLINE_BUFFER_MAXLEN:
+                    if self._offline_dropped == 0:  # first eviction this cycle
+                        logger.debug(
+                            "StreamChannel offline buffer full (cap=%d); dropping "
+                            "oldest frames while no subscriber is connected",
+                            self._OFFLINE_BUFFER_MAXLEN,
+                        )
+                    self._offline_dropped += 1
+                    self._offline_dropped_total += 1
                 self._offline_buffer.append(item)
                 return
+            # A subscriber is live: events now broadcast directly, so the offline
+            # tail is drained. Reset the per-cycle eviction count (which also
+            # re-arms the one-shot log) so the NEXT disconnect/overflow cycle
+            # reports and logs its own truncation, not a stale carry-over.
             self._offline_buffer.clear()
+            self._offline_dropped = 0
         for q in subscribers:
             q.put_nowait(item)
 
@@ -7923,6 +8039,9 @@ class StreamChannel:
             return {
                 "subscriber_count": len(self._subscribers),
                 "offline_buffered_events": len(self._offline_buffer),
+                # Cumulative over the channel lifetime (ops visibility), vs. the
+                # per-cycle count subscribe_with_snapshot() reports for truncation.
+                "offline_dropped_events": self._offline_dropped_total,
             }
 
 

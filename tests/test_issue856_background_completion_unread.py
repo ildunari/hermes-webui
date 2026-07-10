@@ -519,7 +519,7 @@ def test_completion_unread_clears_only_when_session_is_opened():
     assert load_idx != -1, "loadSession not found"
     load_block = SESSIONS_JS[load_idx:SESSIONS_JS.find("function _resolveSessionModelForDisplaySoon", load_idx)]
 
-    stale_guard_idx = load_block.find("if (_loadingSessionId !== sid) return;")
+    stale_guard_idx = load_block.find("if (!_isCurrentLoad()) return;")
     clear_idx = load_block.find("_clearSessionCompletionUnread(S.session.session_id);")
     set_viewed_idx = load_block.find("_setSessionViewedCount(S.session.session_id")
 

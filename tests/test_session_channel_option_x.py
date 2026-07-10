@@ -1039,10 +1039,11 @@ def test_load_session_rearms_stream_on_every_early_return():
 
     # Specifically: the same-session no-op guard must be PRECEDED by a re-arm
     # so re-selecting a session whose stream a prior failed load killed revives
-    # it. The re-arm sits before the guard (not inside a wrapping block) so the
-    # guard stays the exact one-liner other tests assert; it's idempotent so
+    # it. The re-arm sits before the guard (not inside a wrapping block), with
+    # the updated authoritative-load check that still permits the same-session
+    # guard when no different in-flight load is running; it's idempotent so
     # the real-switch path is unaffected.
-    guard_ix = body.index("currentSid===sid && !forceReload && !_loadingSessionId")
+    guard_ix = body.index("currentSid===sid && !forceReload && (!_loadingSessionId || _loadingSessionId===sid)")
     pre_guard = body[max(0, guard_ix - 600):guard_ix]
     assert "_rearmActiveSessionStream()" in pre_guard, (
         "a re-arm must run before the same-session no-op guard so a "
