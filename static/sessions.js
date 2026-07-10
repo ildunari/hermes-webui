@@ -3584,11 +3584,12 @@ function _pinnedSessionCount(){
   return (_allSessions||[]).filter(s=>s&&s.pinned&&!s.archived).length;
 }
 function _getPinnedSessionsLimit(){
-  const limit=parseInt(window._pinnedSessionsLimit||3,10);
-  return (Number.isFinite(limit)&&limit>0)?limit:3;
+  const limit=parseInt(window._pinnedSessionsLimit,10);
+  return (Number.isFinite(limit)&&limit>=0)?limit:3;
 }
 function _pinnedSessionsLimitMessage(){
   const limit=_getPinnedSessionsLimit();
+  if(limit===0) return 'Pinned conversations are unlimited.';
   return `Only ${limit} conversations can be pinned. Unpin one before pinning another.`;
 }
 function _worktreeSessionCount(ids){

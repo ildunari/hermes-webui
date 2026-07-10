@@ -8710,7 +8710,10 @@ async function _autosavePreferencesSettings(payload){
       if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
     }
     if(payload&&Object.prototype.hasOwnProperty.call(payload,'fade_text_effect')) window._fadeTextEffect=!!payload.fade_text_effect;
-    if(saved&&Object.prototype.hasOwnProperty.call(saved,'pinned_sessions_limit')) window._pinnedSessionsLimit=parseInt(saved.pinned_sessions_limit,10)||3;
+    if(saved&&Object.prototype.hasOwnProperty.call(saved,'pinned_sessions_limit')){
+      const pinnedSessionsLimit=parseInt(saved.pinned_sessions_limit,10);
+      window._pinnedSessionsLimit=(Number.isFinite(pinnedSessionsLimit)&&pinnedSessionsLimit>=0)?pinnedSessionsLimit:3;
+    }
     if(payload&&payload.show_tps!==undefined){
       window._showTps=!!(saved&&saved.show_tps);
       if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
@@ -9147,10 +9150,15 @@ async function loadSettingsPanel(){
     if(showTpsCb){showTpsCb.checked=!!settings.show_tps;showTpsCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const pinnedLimitField=$('settingsPinnedSessionsLimit');
     if(pinnedLimitField){
-      pinnedLimitField.value=parseInt(settings.pinned_sessions_limit||3,10)||3;
-      window._pinnedSessionsLimit=parseInt(pinnedLimitField.value,10)||3;
+      const pinnedSessionsLimit=parseInt(settings.pinned_sessions_limit,10);
+      pinnedLimitField.value=(Number.isFinite(pinnedSessionsLimit)&&pinnedSessionsLimit>=0)?pinnedSessionsLimit:3;
+      window._pinnedSessionsLimit=parseInt(pinnedLimitField.value,10);
       pinnedLimitField.addEventListener('change',_schedulePreferencesAutosave,{once:false});
-      pinnedLimitField.addEventListener('input',()=>{window._pinnedSessionsLimit=parseInt(pinnedLimitField.value,10)||3;_schedulePreferencesAutosave();},{once:false});
+      pinnedLimitField.addEventListener('input',()=>{
+        const nextPinnedSessionsLimit=parseInt(pinnedLimitField.value,10);
+        window._pinnedSessionsLimit=(Number.isFinite(nextPinnedSessionsLimit)&&nextPinnedSessionsLimit>=0)?nextPinnedSessionsLimit:3;
+        _schedulePreferencesAutosave();
+      },{once:false});
     }
     const fadeTextCb=$('settingsFadeTextEffect');
     if(fadeTextCb){

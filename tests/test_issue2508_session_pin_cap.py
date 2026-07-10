@@ -171,7 +171,8 @@ def test_session_pin_cap_has_backend_and_frontend_guards():
     assert 'persisted_rows = [' in ROUTES_PY
     assert 'candidate_rows.extend(' in ROUTES_PY
     assert 'pinned_lineage_ids = _visible_pinned_lineage_ids(candidate_rows)' in ROUTES_PY
-    assert 'pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)' in ROUTES_PY
+    assert 'pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3))' in ROUTES_PY
+    assert 'pinned_sessions_limit > 0' in ROUTES_PY
     assert 'if len(pinned_lineage_ids) >= pinned_sessions_limit:' in ROUTES_PY
     assert 'Up to {pinned_sessions_limit} sessions can be pinned' in ROUTES_PY
 

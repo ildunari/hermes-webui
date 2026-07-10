@@ -8343,7 +8343,7 @@ _SETTINGS_DEFAULTS = {
     "hide_composer_status": False,  # hide status text in composer footer
     "hide_composer_context": False,  # hide context indicator in composer footer/mobile config panel
     "hide_composer_bg_badge": False,  # hide background-jobs badge in composer footer
-    "pinned_sessions_limit": 3,  # maximum active pinned sessions shown in the sidebar
+    "pinned_sessions_limit": 3,  # maximum active pinned sessions; 0 disables the limit
     "inflight_state_max_sessions": 8,  # max active-stream recovery snapshots kept in browser localStorage
     "inflight_state_max_messages": 24,  # max recent messages kept per recovery snapshot
     "inflight_state_max_tool_calls": 48,  # max recent tool-call records kept per recovery snapshot
@@ -8590,7 +8590,7 @@ _SETTINGS_ENUM_VALUES = {
     "structured_code_default_view": {"auto", "on", "off"},
 }
 _SETTINGS_INT_RANGES = {
-    "pinned_sessions_limit": (1, 99),
+    "pinned_sessions_limit": (0, 99),
     "inflight_state_max_sessions": (1, 25),
     "inflight_state_max_messages": (1, 100),
     "inflight_state_max_tool_calls": (1, 200),

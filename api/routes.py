@@ -14977,14 +14977,15 @@ def handle_post(handler, parsed) -> bool:
         pin_requested = bool(body.get("pinned", True))
         # TOCTOU guard (Opus stage-389): the count check and the pin write
         # must happen under the same lock, otherwise two parallel pin
-        # requests can both pass `len(pinned_ids) >= 3` against the same
-        # snapshot and both succeed, leaving the user with 4 pins. The check
+        # requests can both pass the configured finite limit against the same
+        # snapshot and both succeed, leaving the user over quota. The check
         # must be careful not to nest `all_sessions()` (which acquires LOCK
         # internally) inside a `with LOCK:` block — that's a deadlock since
         # LOCK is a non-reentrant `threading.Lock`. We snapshot the
         # persisted index outside the lock, then re-check the in-memory
         # mutation set inside the lock and commit the pin atomically.
-        if pin_requested and not getattr(s, "pinned", False):
+        pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3))
+        if pin_requested and not getattr(s, "pinned", False) and pinned_sessions_limit > 0:
             # Pre-snapshot from persisted index (acquires LOCK internally,
             # so must run outside our own LOCK acquire below).
             persisted_rows = [
@@ -15013,7 +15014,6 @@ def handle_post(handler, parsed) -> bool:
                     },
                 )
                 pinned_lineage_ids.discard(target_lineage)
-                pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
                 if len(pinned_lineage_ids) >= pinned_sessions_limit:
                     return bad(handler, f"Up to {pinned_sessions_limit} sessions can be pinned. Unpin one before pinning another.", 400)
                 # Mark in-memory pin state under LOCK so concurrent pin

@@ -2912,7 +2912,8 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     window._workspaceTodosTab=!!s.workspace_todos_tab;
     if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
     window._sidebarDensity=(s.sidebar_density==='detailed'?'detailed':'compact');
-    window._pinnedSessionsLimit=parseInt(s.pinned_sessions_limit||3,10)||3;
+    const pinnedSessionsLimit=parseInt(s.pinned_sessions_limit,10);
+    window._pinnedSessionsLimit=(Number.isFinite(pinnedSessionsLimit)&&pinnedSessionsLimit>=0)?pinnedSessionsLimit:3;
     window._inflightStateLimits={
       maxSessions:parseInt(s.inflight_state_max_sessions||8,10)||8,
       messages:parseInt(s.inflight_state_max_messages||24,10)||24,

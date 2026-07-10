@@ -854,7 +854,7 @@ const LOCALES = {
     settings_label_bot_name: 'Default assistant name',
     settings_label_password: 'Access Password',
     settings_label_pinned_limit: 'Pinned conversations limit',
-    settings_desc_pinned_limit: 'Maximum number of active conversations that can be pinned in the sidebar. Default is 3.',
+    settings_desc_pinned_limit: 'Maximum number of active conversations that can be pinned in the sidebar. Use 0 for unlimited; default is 3.',
     settings_label_dashboard_mode: 'Official Hermes Dashboard',
     settings_desc_dashboard_mode: 'Show a nav-rail link when the official hermes dashboard is reachable. Public reverse-proxy URLs are stored as browser-only links and are never server-probed.',
     settings_dashboard_mode_auto: 'Auto-detect',
