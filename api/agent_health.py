@@ -23,6 +23,7 @@ confirmed outage.
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import os
 import threading
@@ -251,6 +252,46 @@ def _gateway_running_pid(gateway_status: Any, pid_path: Path | None) -> int | No
         return get_running_pid()
 
 
+def _accepts_positional_pid_path(get_running_pid: Any) -> bool:
+    try:
+        signature = inspect.signature(get_running_pid)
+    except (TypeError, ValueError):
+        return False
+    for param in signature.parameters.values():
+        if param.kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            continue
+        name = str(param.name or "").lower()
+        return "path" in name and "pid" in name
+    return False
+
+
+def _gateway_running_pid_strict_path(gateway_status: Any, pid_path: Path) -> int | None:
+    """Read a PID from an explicit path only; never fall back to ambient state."""
+    get_running_pid = gateway_status.get_running_pid
+    for kwargs in (
+        {"pid_path": pid_path, "cleanup_stale": False},
+        {"pid_path": pid_path},
+    ):
+        try:
+            return get_running_pid(**kwargs)
+        except TypeError:
+            pass
+
+    if not _accepts_positional_pid_path(get_running_pid):
+        return None
+
+    try:
+        return get_running_pid(pid_path, cleanup_stale=False)
+    except TypeError:
+        try:
+            return get_running_pid(pid_path)
+        except TypeError:
+            return None
+
+
 def get_active_profile_gateway_running_pid(profile: str | None = None) -> int | None:
     """Return the confirmed active-profile PID without state fallbacks.
 
@@ -268,7 +309,7 @@ def get_active_profile_gateway_running_pid(profile: str | None = None) -> int | 
         else:
             gateway_home = get_hermes_home_for_profile(profile)
         gateway_pid_path = Path(gateway_home) / _GATEWAY_PID_FILE
-        return _gateway_running_pid(gateway_status, gateway_pid_path)
+        return _gateway_running_pid_strict_path(gateway_status, gateway_pid_path)
     except Exception:
         return None
 

@@ -125,6 +125,22 @@ def test_restart_active_profile_gateway_pins_explicit_default_profile(monkeypatc
     assert called["env"]["HERMES_HOME"] == "/mock/hermes/default"
 
 
+def test_restart_active_profile_gateway_rejects_malformed_explicit_profile(monkeypatch):
+    gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
+
+    def fail_popen(*args, **kwargs):
+        raise AssertionError("malformed explicit profile must not launch subprocess")
+
+    monkeypatch.setattr(gateway_restart.subprocess, "Popen", fail_popen)
+
+    for profile in ("", "../bad"):
+        result = gateway_restart.restart_active_profile_gateway(profile=profile)
+
+        assert result["status"] == "failed"
+        assert "Invalid profile for gateway restart" in result["message"]
+    assert gateway_restart._GATEWAY_RESTART_LOCK.locked() is False
+
+
 def test_restart_active_profile_gateway_failure_preserves_empty_output_contract(monkeypatch):
     gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
 

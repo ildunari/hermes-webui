@@ -58,7 +58,9 @@ def _gateway_restart_profile_context(profile: str | None = None) -> tuple[Path, 
         raw_profile = str(get_active_profile_name() or "default").strip()
         active_home = Path(get_active_hermes_home())
     else:
-        raw_profile = str(profile or "default").strip()
+        raw_profile = str(profile or "").strip()
+        if not raw_profile or not _PROFILE_ID_RE.fullmatch(raw_profile):
+            raise ValueError(f"Invalid profile for gateway restart: {profile!r}")
         active_home = Path(get_hermes_home_for_profile(raw_profile))
 
     if not raw_profile or not _PROFILE_ID_RE.fullmatch(raw_profile) or _is_root_profile(raw_profile):
