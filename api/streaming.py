@@ -1460,21 +1460,6 @@ def _mark_latest_assistant_tool_limit_status(messages) -> bool:
     return False
 
 
-def _is_internal_wakeup_source(source) -> bool:
-    """Return True for server-internal wakeup prompts that should not render as user chat."""
-    return str(source or '').strip() == 'process_wakeup'
-
-
-def _is_internal_wakeup_user_message(msg) -> bool:
-    """Return True for model-facing wakeup user rows that belong only in context."""
-    if not isinstance(msg, dict) or msg.get('role') != 'user':
-        return False
-    if _is_internal_wakeup_source(msg.get('_source')):
-        return True
-    text = _message_text(msg.get('content', '')).lstrip()
-    return text.startswith('[IMPORTANT: Background process') or text.startswith('[ASYNC DELEGATION')
-
-
 def _session_has_cancel_marker(session) -> bool:
     """Return True if a visible cancel/interrupted marker is already persisted."""
     for msg in reversed(getattr(session, 'messages', None) or []):
@@ -5441,7 +5426,6 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
     if not result_messages:
         return previous_display
     previous_user_tail = _stale_user_tail_candidate(_last_user_row(previous_context))
-    hide_current_user_turn = _is_internal_wakeup_source(source)
 
     # ── Backfill normal turns from previous_context that are missing from
     # previous_display.  After context compression recovery, previous_context
@@ -5503,7 +5487,6 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
                                 and _ckey not in _context_inserted
                                 and _ckey not in _display_id_set
                                 and not _is_context_compression_marker(_cmsg)
-                                and not _is_internal_wakeup_user_message(_cmsg)
                                 and not _is_compressed_context_tool_result_summary_message(_cmsg)
                             ):
                                 _backfilled.append(copy.deepcopy(_cmsg))
@@ -5531,7 +5514,6 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
                                 and _ckey not in _context_inserted
                                 and _ckey not in _display_id_set
                                 and not _is_context_compression_marker(_cmsg)
-                                and not _is_internal_wakeup_user_message(_cmsg)
                                 and not _is_compressed_context_tool_result_summary_message(_cmsg)
                             ):
                                 _backfilled.append(copy.deepcopy(_cmsg))
@@ -5551,7 +5533,6 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
                     and _ckey not in _context_inserted
                     and _ckey not in _display_id_set
                     and not _is_context_compression_marker(_cmsg)
-                    and not _is_internal_wakeup_user_message(_cmsg)
                     and not _is_compressed_context_tool_result_summary_message(_cmsg)
                 ):
                     _backfilled.append(copy.deepcopy(_cmsg))
@@ -5620,8 +5601,7 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
         )
     )
     if (
-        not hide_current_user_turn
-        and current_user_key is not None
+        current_user_key is not None
         and not current_user_in_candidates
         and not current_user_already_checkpointed
         and any(
@@ -5651,10 +5631,6 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
             continue
         key = _message_identity(msg)
         is_current_user_turn = _looks_like_current_user_turn(msg, msg_text)
-        if hide_current_user_turn and isinstance(msg, dict) and msg.get('role') == 'user' and (
-            is_current_user_turn or _is_internal_wakeup_user_message(msg)
-        ):
-            continue
         if (
             ((key is not None and key == current_user_key) or is_current_user_turn)
             and merged
@@ -6256,8 +6232,6 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
     """
     pending_text = str(getattr(session, 'pending_user_message', None) or '')
     if not pending_text:
-        return False
-    if _is_internal_wakeup_source(getattr(session, 'pending_user_source', None)):
         return False
     normalized_pending = " ".join(pending_text.split())
     if normalized_pending:
