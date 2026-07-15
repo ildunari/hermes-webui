@@ -1,7 +1,21 @@
+"""Regression coverage for the durable process-wakeup transcript contract.
+
+Process wakeups are synthetic user turns, not hidden model-only scaffolding.  The
+backend must persist and return them with ``_source: process_wakeup`` so they
+remain a chronological turn boundary.  The frontend renders persisted wakeups
+as compact status rows rather than human-authored bubbles, while still hiding a
+pending wakeup placeholder to avoid showing the same in-flight turn twice.
+"""
+
+from pathlib import Path
 from types import SimpleNamespace
 
 
-def test_process_wakeup_user_prompt_hidden_from_display_merge():
+ROOT = Path(__file__).resolve().parents[1]
+UI_JS = ROOT / "static" / "ui.js"
+
+
+def test_process_wakeup_user_prompt_persists_as_synthetic_display_boundary():
     from api.streaming import _merge_display_messages_after_agent_result
 
     previous = [
@@ -22,24 +36,25 @@ def test_process_wakeup_user_prompt_hidden_from_display_merge():
         source="process_wakeup",
     )
 
-    assert [m["role"] for m in merged] == ["user", "assistant", "assistant"]
-    assert all("ASYNC DELEGATION" not in str(m.get("content", "")) for m in merged)
+    assert [m["role"] for m in merged] == ["user", "assistant", "user", "assistant"]
+    assert merged[-2]["content"] == wakeup
+    assert merged[-2]["_source"] == "process_wakeup"
     assert merged[-1]["content"] == "I saw the subagent result and handled it."
 
 
-def test_process_wakeup_context_backfill_does_not_surface_internal_user_row():
+def test_process_wakeup_context_backfill_restores_synthetic_turn_in_order():
     from api.streaming import _merge_display_messages_after_agent_result
 
     visible = [
         {"role": "user", "content": "start"},
         {"role": "assistant", "content": "ok"},
     ]
-    hidden_wakeup = {
+    wakeup = {
         "role": "user",
         "content": "[IMPORTANT: Background process proc_1 completed (exit_code=0).",
         "_source": "process_wakeup",
     }
-    previous_context = visible + [hidden_wakeup]
+    previous_context = visible + [wakeup]
     result_messages = previous_context + [
         {"role": "user", "content": "next normal turn"},
         {"role": "assistant", "content": "normal answer"},
@@ -53,35 +68,32 @@ def test_process_wakeup_context_backfill_does_not_surface_internal_user_row():
         source="webui",
     )
 
-    assert all("Background process" not in str(m.get("content", "")) for m in merged)
+    assert merged[2] == wakeup
     assert [m["content"] for m in merged[-2:]] == ["next normal turn", "normal answer"]
 
 
+def test_api_message_window_keeps_existing_process_wakeup_rows_visible():
+    from api.routes import _message_window_for_display
 
-def test_api_visible_messages_filter_existing_process_wakeup_rows():
-    from api.routes import _visible_messages_for_client
-
-    leaked = {
+    wakeup = {
         "role": "user",
         "_source": "process_wakeup",
-        "content": "[IMPORTANT: Background process proc_3e2cfd521406 completed (exit_code=1).\nCommand: ssh ...",
+        "content": "[IMPORTANT: Background process proc_3 completed (exit_code=1).",
     }
-    visible = [
-        {"role": "assistant", "content": "Same stale Cairo failure, already bypassed."},
-        leaked,
-        {"role": "assistant", "content": "I handled the background result."},
+    messages = [
+        {"role": "assistant", "content": "before"},
+        wakeup,
+        {"role": "assistant", "content": "after"},
     ]
 
-    filtered = _visible_messages_for_client(visible)
+    window, offset = _message_window_for_display(messages)
 
-    assert leaked not in filtered
-    assert [m["content"] for m in filtered] == [
-        "Same stale Cairo failure, already bypassed.",
-        "I handled the background result.",
-    ]
+    assert window == messages
+    assert window[1] is wakeup
+    assert offset == 0
 
 
-def test_process_wakeup_pending_prompt_not_materialized_on_error():
+def test_process_wakeup_pending_prompt_materializes_on_error_with_source():
     from api.streaming import _materialize_pending_user_turn_before_error
 
     session = SimpleNamespace(
@@ -93,40 +105,70 @@ def test_process_wakeup_pending_prompt_not_materialized_on_error():
         context_messages=[],
     )
 
-    assert _materialize_pending_user_turn_before_error(session) is False
-    assert session.messages == []
-
-
-def test_api_visible_messages_filter_legacy_watch_overflow_rows():
-    from api.routes import _visible_messages_for_client
-
-    rows = [
-        {"role": "assistant", "content": "before"},
-        {"role": "user", "content": "[IMPORTANT: Watch-pattern overflow: >3 notifications in 15s]"},
-        {"role": "user", "content": "[IMPORTANT: Watch patterns disabled for process proc_x]"},
-        {"role": "assistant", "content": "after"},
+    assert _materialize_pending_user_turn_before_error(session) is True
+    assert session.messages == [
+        {
+            "role": "user",
+            "content": "[ASYNC DELEGATION COMPLETE — deleg_test]\nresult",
+            "timestamp": 123,
+            "_recovered": True,
+            "_source": "process_wakeup",
+        }
     ]
 
-    filtered = _visible_messages_for_client(rows)
 
-    assert [m["content"] for m in filtered] == ["before", "after"]
+def test_frontend_pending_guard_recognizes_legacy_watch_overflow_prompts():
+    source = UI_JS.read_text(encoding="utf-8")
+    helper_idx = source.find("function _isInternalWakeupPendingSession")
+    pending_idx = source.find("function getPendingSessionMessage")
+
+    assert helper_idx != -1
+    assert pending_idx != -1
+    assert helper_idx < pending_idx
+    helper = source[helper_idx:pending_idx]
+    assert "[IMPORTANT: Watch-pattern" in helper
+    assert "[IMPORTANT: Watch patterns" in helper
 
 
-def test_api_pending_process_wakeup_hidden_but_active_stream_preserved():
-    from api.routes import _pending_user_message_for_client, _pending_user_source_for_client
+def test_api_pending_process_wakeup_metadata_and_active_stream_are_preserved(monkeypatch):
+    import api.routes as routes
 
+    saved = []
     session = SimpleNamespace(
-        active_stream_id="stream_1",
-        pending_user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg_x]\nresult",
-        pending_user_source="process_wakeup",
+        workspace=None,
+        model=None,
+        model_provider=None,
+        active_stream_id=None,
+        pending_user_message=None,
+        pending_attachments=None,
+        pending_started_at=None,
+        pending_user_source=None,
+        title="Existing title",
+        messages=[],
+        save=lambda: saved.append(True),
+    )
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: "deferred")
+    wakeup = "[ASYNC DELEGATION BATCH COMPLETE — deleg_x]\nresult"
+
+    routes._prepare_chat_start_session_for_stream(
+        session,
+        msg=wakeup,
+        attachments=[],
+        workspace="/tmp",
+        model="gpt-test",
+        model_provider="test",
+        stream_id="stream_1",
+        started_at=123.0,
+        source="process_wakeup",
     )
 
     assert session.active_stream_id == "stream_1"
-    assert _pending_user_message_for_client(session) is None
-    assert _pending_user_source_for_client(session) is None
+    assert session.pending_user_message == wakeup
+    assert session.pending_user_source == "process_wakeup"
+    assert saved == [True]
 
 
-def test_process_wakeup_does_not_set_provisional_title_for_untitled_session(monkeypatch):
+def test_process_wakeup_uses_normal_provisional_title_path_and_eager_checkpoint(monkeypatch):
     import api.routes as routes
 
     saved = []
@@ -141,13 +183,15 @@ def test_process_wakeup_does_not_set_provisional_title_for_untitled_session(monk
         pending_user_source=None,
         title="Untitled",
         messages=[],
+        truncation_watermark=None,
         save=lambda: saved.append(True),
     )
     monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: "eager")
+    wakeup = "[IMPORTANT: Background process proc_x completed (exit_code=0).\nOutput:\nOK]"
 
     routes._prepare_chat_start_session_for_stream(
         session,
-        msg="[IMPORTANT: Background process proc_x completed (exit_code=0).\nOutput:\nOK]",
+        msg=wakeup,
         attachments=[],
         workspace="/tmp",
         model="gpt-test",
@@ -157,15 +201,16 @@ def test_process_wakeup_does_not_set_provisional_title_for_untitled_session(monk
         source="process_wakeup",
     )
 
-    assert session.title == "Untitled"
-    assert session.messages == []
+    assert session.title != "Untitled"
+    assert session.messages[0]["content"] == wakeup
+    assert session.messages[0]["_source"] == "process_wakeup"
     assert saved == [True]
 
 
-def test_visible_filter_before_window_does_not_underfill_limited_tail():
-    from api.routes import _message_window_for_display, _visible_messages_for_client
+def test_process_wakeup_counts_as_renderable_in_limited_api_tail():
+    from api.routes import _message_window_for_display
 
-    raw = [
+    messages = [
         {"role": "user", "content": "u1"},
         {"role": "assistant", "content": "a1"},
         {"role": "user", "_source": "process_wakeup", "content": "[ASYNC DELEGATION COMPLETE — deleg_x]"},
@@ -173,38 +218,51 @@ def test_visible_filter_before_window_does_not_underfill_limited_tail():
         {"role": "user", "content": "u3"},
     ]
 
-    display = _visible_messages_for_client(raw)
-    window, offset = _message_window_for_display(display, msg_limit=4)
+    window, offset = _message_window_for_display(messages, msg_limit=4)
 
-    assert [m["content"] for m in window] == ["u1", "a1", "a2", "u3"]
-    assert offset == 0
-
-
+    assert [m["content"] for m in window] == ["a1", "[ASYNC DELEGATION COMPLETE — deleg_x]", "a2", "u3"]
+    assert window[1]["_source"] == "process_wakeup"
+    assert offset == 1
 
 
-def test_cli_import_existing_session_echo_filters_internal_wakeup_rows():
-    from api.routes import _visible_messages_for_client
+def test_imported_existing_session_echo_keeps_synthetic_wakeup_boundary():
+    from api.routes import _message_window_for_display
 
     existing_messages = [
         {"role": "user", "content": "real"},
-        {"role": "user", "_source": "process_wakeup", "content": "[IMPORTANT: Background process proc_x completed]"},
+        {
+            "role": "user",
+            "_source": "process_wakeup",
+            "content": "[IMPORTANT: Background process proc_x completed]",
+        },
     ]
 
-    assert _visible_messages_for_client(existing_messages) == [{"role": "user", "content": "real"}]
+    window, offset = _message_window_for_display(existing_messages)
+
+    assert window == existing_messages
+    assert window[-1]["_source"] == "process_wakeup"
+    assert offset == 0
 
 
-def test_frontend_pending_session_message_hides_internal_wakeup_prompt():
-    from pathlib import Path
-
-    source = Path("static/ui.js").read_text()
+def test_frontend_pending_safeguard_hides_duplicate_but_persisted_row_is_compact():
+    source = UI_JS.read_text(encoding="utf-8")
     helper_idx = source.find("function _isInternalWakeupPendingSession")
     pending_idx = source.find("function getPendingSessionMessage")
 
     assert helper_idx != -1
     assert pending_idx != -1
     assert helper_idx < pending_idx
-    snippet = source[pending_idx:pending_idx + 500]
-    assert "_isInternalWakeupPendingSession(session,text)" in snippet
-    assert "return null" in snippet
-    assert "process_wakeup" in source[helper_idx:helper_idx + 500]
-    assert "[ASYNC DELEGATION" in source[helper_idx:helper_idx + 500]
+    pending_snippet = source[pending_idx:pending_idx + 500]
+    assert "_isInternalWakeupPendingSession(session,text)" in pending_snippet
+    assert "return null" in pending_snippet
+    assert "process_wakeup" in source[helper_idx:pending_idx]
+    assert "[ASYNC DELEGATION" in source[helper_idx:pending_idx]
+
+    render_marker = source.find("const isProcessWakeup=")
+    process_branch = source.find("if(isProcessWakeup)", render_marker)
+    human_branch = source.find("if(isUser)", render_marker)
+    assert render_marker != -1
+    assert process_branch != -1
+    assert human_branch != -1
+    assert process_branch < human_branch
+    assert "process-wakeup-row" in source[process_branch:human_branch]
