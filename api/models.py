@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover
 
 import api.config as _cfg
 from api.compression_anchor import is_context_compression_marker
+from api.process_wakeup import is_process_wakeup_control_text
 from api.config import (
     SESSION_DIR, SESSION_INDEX_FILE, SESSIONS, SESSIONS_MAX,
     LOCK, STREAMS, STREAMS_LOCK, DEFAULT_WORKSPACE, DEFAULT_MODEL, PROJECTS_FILE, HOME,
@@ -7721,6 +7722,11 @@ def get_state_db_session_messages(
                     msg[col] = value
                 if msg.get('role') == 'tool' and msg.get('tool_name') and not msg.get('name'):
                     msg['name'] = msg['tool_name']
+                # state.db has no source column. Recover provenance only for
+                # synthetic user rows carrying an anchored Hermes control
+                # prefix so ordinary human text remains a normal user turn.
+                if msg.get('role') == 'user' and is_process_wakeup_control_text(msg.get('content')):
+                    msg['_source'] = 'process_wakeup'
                 msgs.append(msg)
     except Exception:
         return []

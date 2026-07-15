@@ -466,6 +466,76 @@ def test_state_db_reader_since_timestamp_keeps_null_timestamp_rows(monkeypatch, 
     assert [m["content"] for m in messages] == ["null timestamp kept", "kept"]
 
 
+def test_state_db_reader_recovers_process_wakeup_source_from_control_prefixes(monkeypatch, tmp_path):
+    import api.models as models
+
+    sid = "webui_state_only_process_wakeup"
+    _install_test_session(monkeypatch, tmp_path, sid, [])
+    wakeups = [
+        "[IMPORTANT: Background process proc_1 completed (exit_code=0).\nOutput:\ndone]",
+        "[ASYNC DELEGATION COMPLETE — deleg_1]\nresult",
+        "[IMPORTANT: Watch-pattern overflow: suppressing further watch_match events.]",
+        "[IMPORTANT: Watch patterns disabled for process proc_1.]",
+    ]
+    _make_state_db(
+        tmp_path / "state.db",
+        sid,
+        [{"role": "user", "content": text, "timestamp": 20.0 + idx} for idx, text in enumerate(wakeups)],
+    )
+
+    messages = models.get_state_db_session_messages(sid)
+
+    assert [message["content"] for message in messages] == wakeups
+    assert [message.get("_source") for message in messages] == ["process_wakeup"] * 4
+
+
+def test_state_db_reader_does_not_infer_wakeup_source_from_ordinary_text(monkeypatch, tmp_path):
+    import api.models as models
+
+    sid = "webui_state_only_human_wakeup_words"
+    _install_test_session(monkeypatch, tmp_path, sid, [])
+    rows = [
+        {"role": "user", "content": "Please explain [IMPORTANT: Background process markers", "timestamp": 20.0},
+        {"role": "user", "content": "An ASYNC DELEGATION can be useful", "timestamp": 21.0},
+        {"role": "assistant", "content": "[IMPORTANT: Background process proc_1 completed", "timestamp": 22.0},
+        {"role": "user", "content": "[IMPORTANT: Background processes are useful", "timestamp": 23.0},
+        {"role": "user", "content": "[ASYNC DELEGATIONS are useful", "timestamp": 24.0},
+    ]
+    _make_state_db(tmp_path / "state.db", sid, rows)
+
+    messages = models.get_state_db_session_messages(sid)
+
+    assert all("_source" not in message for message in messages)
+
+
+def test_api_state_db_only_wakeup_keeps_compact_rendering_provenance(monkeypatch, tmp_path):
+    import api.routes as routes
+
+    sid = "webui_state_only_wakeup_api"
+    sidecar_messages = [
+        {"role": "assistant", "content": "before wakeup", "timestamp": 1000.0},
+    ]
+    wakeup = "[IMPORTANT: Background process proc_api completed (exit_code=0).\nOutput:\ndone]"
+    _install_test_session(monkeypatch, tmp_path, sid, sidecar_messages)
+    _make_state_db(
+        tmp_path / "state.db",
+        sid,
+        sidecar_messages
+        + [
+            {"role": "user", "content": wakeup, "timestamp": 1001.0},
+            {"role": "assistant", "content": "after wakeup", "timestamp": 1002.0},
+        ],
+    )
+
+    handler = _GetHandler(f"/api/session?session_id={sid}&messages=1&resolve_model=0")
+    routes.handle_get(handler, urlparse(handler.path))
+
+    assert handler.status == 200
+    messages = handler.response_json["session"]["messages"]
+    assert [message["content"] for message in messages] == ["before wakeup", wakeup, "after wakeup"]
+    assert messages[1]["_source"] == "process_wakeup"
+
+
 def test_limited_display_with_precomputed_sidecar_keeps_empty_state_db_guard(monkeypatch, tmp_path):
     import api.routes as routes
 
