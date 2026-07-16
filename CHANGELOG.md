@@ -71,6 +71,8 @@
 
 ### Fixed
 
+- **The mobile composer model picker no longer opens off-screen.** On phones the model dropdown could open below the fold (looking like it "won't open", issue #6080) because it lived inside `.composer-footer`, whose `container-type` (and, under the Geist Contrast skin, `backdrop-filter`) made the footer the containing block for the dropdown's fixed positioning — so it anchored to the bottom-of-screen footer instead of the viewport. The picker now reparents to `<body>` while open (the same idiom the profile dropdown already uses), so its fixed positioning resolves against the visual viewport on every skin; it flips above/below the anchor by available space, clamps below the titlebar, and re-positions as the on-screen keyboard / URL bar move the visual viewport. Desktop behavior is unchanged. Thanks @webtecnica. (#6105, #6080)
+
 - **Approval and clarify popups no longer collapse to tiny blank windows on very narrow screens.** On very narrow viewports the clarify card could shrink to an unreadable sliver; it now gets a `min-width` and `overflow:visible` matching the approval card. Thanks @webtecnica. (#6104, #6094)
 
 - **Stream event timestamps no longer break the row layout on narrow foldable screens.** On screens under 360px the per-event timestamps could spill out of tool/thinking card headers; the headers now clip overflow so the timestamp layout holds. (Tool names stay visible — an earlier draft hid them at ≤360px, which lost tool identity; the header clip alone prevents the spill.) Thanks @webtecnica. (#6106, #6099)
