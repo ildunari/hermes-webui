@@ -8052,7 +8052,8 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             # (#3957): the daemon inherits neither the request-profile TLS nor
             # os.environ, so without this it would probe the default profile's
             # credentials and, over budget, publish the rebuilt catalog to the
-            # DEFAULT profile's disk cache. No-op for the default profile.
+            # DEFAULT profile's disk cache. Root/default is explicitly bound too,
+            # so it cannot fall through to a later process-active named profile.
             _worker_scope = (
                 _prof_scope_worker(_active_profile_name, "models rebuild (worker)")
                 if _prof_scope_worker is not None

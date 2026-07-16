@@ -284,6 +284,54 @@ def test_session_visit_cross_profile_requests_share_one_draining_worker(monkeypa
     assert calls == [{"force_refresh": True}, {"force_refresh": True}]
 
 
+def test_session_visit_default_refresh_stays_root_after_active_profile_changes(
+    monkeypatch, tmp_path
+):
+    """A queued root refresh must not inherit a named profile before it runs."""
+    import api.config as cfg
+    import api.profiles as profiles
+    import threading
+
+    real_thread = threading.Thread
+    queued_targets = []
+    observed_bindings = []
+
+    class _DeferredThread:
+        def __init__(self, *, target, **_kwargs):
+            queued_targets.append(target)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(cfg, "_session_visit_refresh_profiles", set(), raising=False)
+    monkeypatch.setattr(cfg, "_session_visit_refresh_worker_running", False, raising=False)
+    monkeypatch.setattr(profiles, "_active_profile", "default")
+    monkeypatch.setattr(cfg, "_models_cache_path", tmp_path / "models_cache.json")
+    monkeypatch.setattr(cfg.threading, "Thread", _DeferredThread)
+
+    def _observe_refresh(**_kwargs):
+        observed_bindings.append(
+            (profiles.get_active_profile_name(), cfg._get_models_cache_path().name)
+        )
+        return _catalog("rebuilt")
+
+    monkeypatch.setattr(cfg, "get_available_models", _observe_refresh)
+
+    # Capture root while it is active, but defer the detached worker until after
+    # another request/process action changes the global fallback profile.
+    assert cfg._start_session_visit_models_refresh() is True
+    assert len(queued_targets) == 1
+    profiles._active_profile = "work"
+
+    worker = real_thread(target=queued_targets[0])
+    worker.start()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert observed_bindings == [("default", "models_cache.json")]
+    assert profiles.get_active_profile_name() == "work"
+
+
 def test_force_refresh_sync_followers_wait_past_legacy_timeout(tmp_path, monkeypatch):
     import api.config as cfg
     import threading

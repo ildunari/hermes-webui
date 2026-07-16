@@ -436,16 +436,19 @@ def test_thread_local_env_value_none_default_returns_empty_string(monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_detached_worker_scope_noop_for_default_profile(monkeypatch):
-    """profile_scope_for_detached_worker is a no-op for the default profile."""
+def test_detached_worker_scope_pins_default_profile_without_applying_env(monkeypatch):
+    """Default is TLS-bound even though it needs no named-profile env mirror."""
     monkeypatch.setattr(profiles, "_is_root_profile", lambda n: n in ("", "default"))
     monkeypatch.delenv("ISSUE_3957_WPROBE", raising=False)
-    # Default/empty name → no TLS set, no env applied.
+    monkeypatch.setattr(profiles, "_active_profile", "work")
+
     with profiles.profile_scope_for_detached_worker("default", "test"):
-        assert profiles.get_active_profile_name() in ("", "default")
+        assert profiles.get_active_profile_name() == "default"
         assert os.environ.get("ISSUE_3957_WPROBE") is None
     with profiles.profile_scope_for_detached_worker("", "test"):
+        assert profiles.get_active_profile_name() == "default"
         assert os.environ.get("ISSUE_3957_WPROBE") is None
+    assert profiles.get_active_profile_name() == "work"
 
 
 def test_detached_worker_scope_binds_profile_on_new_thread(monkeypatch, tmp_path):
