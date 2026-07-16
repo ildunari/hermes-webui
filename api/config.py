@@ -4638,6 +4638,8 @@ _available_models_live_rebuild_ts: float = 0.0
 _available_models_cache_source_fingerprint: dict | None = None
 _AVAILABLE_MODELS_CACHE_TTL: float = 86400.0  # 24 hours
 _SESSION_VISIT_MODELS_FRESHNESS_SECONDS: float = 300.0
+_session_visit_refresh_lock = threading.Lock()
+_session_visit_refresh_profiles: set[str] = set()
 _available_models_cache_lock = threading.RLock()  # must be RLock: cold path refactoring moved slow work inside this lock, requiring re-entry
 _cache_build_cv = threading.Condition(_available_models_cache_lock)  # shares underlying RLock so notify_all() is safe inside with _available_models_cache_lock
 _cache_build_in_progress = False  # True while a cold path is actively building
@@ -8206,13 +8208,60 @@ def warm_models_catalog_provenance_if_cold() -> None:
         _available_models_cache_lock.release()
 
 
-def get_available_models_for_session_visit() -> dict:
-    """Return /api/models with a short session-visit freshness horizon.
+def _start_session_visit_models_refresh() -> bool:
+    """Start one profile-scoped catalog refresh without blocking the request."""
+    try:
+        from api.profiles import (
+            get_active_profile_name,
+            profile_scope_for_detached_worker,
+        )
 
-    perf(session-load-latency) Phase 0: this function is the source of the
-    multi-second `/api/models?freshness=session_visit` latency. Stage markers
-    feed into RequestDiagnostics when called from /api/models; standalone
-    callers get the same envelope via the local _stagelog dict.
+        profile_name = (get_active_profile_name() or "default").strip() or "default"
+    except Exception:
+        profile_name = "default"
+        profile_scope_for_detached_worker = None
+
+    with _session_visit_refresh_lock:
+        if profile_name in _session_visit_refresh_profiles:
+            return False
+        _session_visit_refresh_profiles.add(profile_name)
+
+    def _refresh() -> None:
+        from contextlib import nullcontext
+
+        scope = (
+            profile_scope_for_detached_worker(
+                profile_name,
+                "session-visit models refresh",
+            )
+            if profile_scope_for_detached_worker is not None
+            else nullcontext()
+        )
+        try:
+            with scope:
+                get_available_models(force_refresh=True)
+        except Exception:
+            logger.debug("background session-visit models refresh failed", exc_info=True)
+        finally:
+            with _session_visit_refresh_lock:
+                _session_visit_refresh_profiles.discard(profile_name)
+
+    threading.Thread(
+        target=_refresh,
+        name=f"models-session-visit-refresh-{profile_name}",
+        daemon=True,
+    ).start()
+    return True
+
+
+def get_available_models_for_session_visit() -> dict:
+    """Return /api/models immediately and refresh stale catalogs in background.
+
+    A fresh cache is returned directly. A stale cache remains a valid
+    last-known catalog, so serve it without waiting for provider probes and
+    launch a coalesced profile-scoped refresh. With no disk cache, return the
+    network-free minimal catalog and warm the real catalog asynchronously.
+    Stage markers feed RequestDiagnostics for regression evidence.
     """
     import time as _time
     import logging as _logging
@@ -8269,22 +8318,17 @@ def get_available_models_for_session_visit() -> dict:
     _mark("cache_age_stale_or_missing")
     stale_cached = disk_cached or _load_stale_models_cache_from_disk()
     _mark(f"stale_cached_loaded:{bool(stale_cached)}")
-    try:
-        _mark("force_refresh_start")
-        result = get_available_models(force_refresh=True)
-        _mark("force_refresh_done")
+    refresh_started = _start_session_visit_models_refresh()
+    _mark(f"background_refresh_started:{refresh_started}")
+    if stale_cached is not None:
+        _mark("stale_cache_returned")
         _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
-        return result
-    except Exception:
-        _mark("force_refresh_failed")
-        logger.debug("session-visit models refresh failed", exc_info=True)
-        if stale_cached is not None:
-            _mark("stale_fallback_return")
-            _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
-            return copy.deepcopy(stale_cached)
-        _mark("prefer_cache_fallback")
-        _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
-        return get_available_models(prefer_cache=True)
+        return copy.deepcopy(stale_cached)
+    _mark("prefer_cache_fallback")
+    result = get_available_models(prefer_cache=True)
+    _mark("prefer_cache_returned")
+    _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
+    return result
 
 
 def _maybe_log_slow_stages(
