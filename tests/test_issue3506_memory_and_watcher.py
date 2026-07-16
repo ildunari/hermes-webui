@@ -218,8 +218,8 @@ def test_cheap_fingerprint_stable_and_sensitive(tmp_path):
     assert fp4 != fp3
 
 
-def test_cheap_fingerprint_excludes_sources_from_session_aggregate(tmp_path):
-    """cron/webui session rows are excluded, while global message appends still count."""
+def test_cheap_fingerprint_excludes_default_sources_and_their_messages(tmp_path):
+    """cron/subagent/webui churn is wholly outside the default projection."""
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
     _add_session(conn, "tg1", "telegram", mc=2)
@@ -236,9 +236,7 @@ def test_cheap_fingerprint_excludes_sources_from_session_aggregate(tmp_path):
     fp2 = gw._cheap_change_fingerprint(db)
     assert fp2 == fp1, "excluded-source session rows must not move the sessions aggregate"
 
-    # MAX(messages.id) is intentionally global and catches appends even if a
-    # visible session row's message_count lags; excluded-source message appends
-    # are accepted false positives.
+    # Message aggregates are joined through included sessions, not global.
     conn.execute(
         "INSERT INTO messages (session_id, role, content, timestamp) "
         "VALUES ('cron1', 'user', 'x', ?)",
@@ -246,7 +244,20 @@ def test_cheap_fingerprint_excludes_sources_from_session_aggregate(tmp_path):
     )
     conn.commit()
     fp3 = gw._cheap_change_fingerprint(db)
-    assert fp3 != fp2
+    assert fp3 == fp2
+
+    for source in ("subagent", "webui"):
+        conn.execute(
+            "INSERT INTO sessions (id, source, model, started_at, message_count, title) "
+            "VALUES (?, ?, 'm', ?, 0, ?)",
+            (source, source, time.time(), source),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'x', ?)",
+            (source, time.time()),
+        )
+    conn.commit()
+    assert gw._cheap_change_fingerprint(db) == fp2
 
 
 def test_cheap_fingerprint_detects_source_change(tmp_path):
@@ -294,8 +305,8 @@ def test_cheap_fingerprint_detects_same_count_message_rewrite(tmp_path):
     )
 
 
-def test_cheap_fingerprint_does_not_detect_same_row_message_update(tmp_path):
-    """A same-count in-place content/timestamp update does not move the cheap signal."""
+def test_cheap_fingerprint_detects_same_row_timestamp_update(tmp_path):
+    """An in-place timestamp update changes projected last_activity."""
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
     _add_session(conn, "s1", "telegram", mc=3)
@@ -307,9 +318,7 @@ def test_cheap_fingerprint_does_not_detect_same_row_message_update(tmp_path):
     )
     conn.commit()
     fp2 = gw._cheap_change_fingerprint(db)
-    assert fp2 == fp1, (
-        "same-count in-place rewrites are outside the O(small) fingerprint"
-    )
+    assert fp2 != fp1
 
 
 def test_cheap_fingerprint_detects_lagging_message_count_append(tmp_path):
@@ -344,8 +353,8 @@ def test_cheap_fingerprint_detects_message_delete_or_prune(tmp_path):
     assert fp2 != fp1
 
 
-def test_cheap_fingerprint_does_not_track_metadata_only_session_updates(tmp_path):
-    """The O(small) signal tracks row existence/source counts, not every metadata column."""
+def test_cheap_fingerprint_tracks_projection_metadata_updates(tmp_path):
+    """Lineage/visibility fields can alter collapse output and must invalidate."""
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
     _add_session(conn, "s1", "telegram", mc=2)
@@ -354,17 +363,17 @@ def test_cheap_fingerprint_does_not_track_metadata_only_session_updates(tmp_path
     conn.execute("UPDATE sessions SET parent_session_id = 'p-root' WHERE id = 's1'")
     conn.commit()
     fp1 = gw._cheap_change_fingerprint(db)
-    assert fp1 == fp0, "metadata-only lineage changes are outside the cheap aggregate"
+    assert fp1 != fp0
 
     conn.execute("UPDATE sessions SET end_reason = 'compressed' WHERE id = 's1'")
     conn.commit()
     fp2 = gw._cheap_change_fingerprint(db)
-    assert fp2 == fp1, "metadata-only end_reason changes are outside the cheap aggregate"
+    assert fp2 != fp1
 
     conn.execute("UPDATE sessions SET ended_at = 1234567890.0 WHERE id = 's1'")
     conn.commit()
     fp3 = gw._cheap_change_fingerprint(db)
-    assert fp3 == fp2, "metadata-only ended_at changes are outside the cheap aggregate"
+    assert fp3 != fp2
 
 
 def test_cheap_fingerprint_handles_missing_db(tmp_path):

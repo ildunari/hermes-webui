@@ -20547,7 +20547,7 @@ def _handle_btw(handler, body):
     ephemeral.active_stream_id = stream_id
     ephemeral.save()
     stream = create_stream_channel()
-    register_stream_owner(stream_id, ephemeral.session_id)
+    register_stream_owner(stream_id, ephemeral.session_id, getattr(ephemeral, "profile", None))
     with STREAMS_LOCK:
         STREAMS[stream_id] = stream
     from api.background import track_btw
@@ -20597,7 +20597,7 @@ def _handle_background(handler, body):
     bg.active_stream_id = stream_id
     bg.save()
     stream = create_stream_channel()
-    register_stream_owner(stream_id, bg.session_id)
+    register_stream_owner(stream_id, bg.session_id, getattr(bg, "profile", None))
     with STREAMS_LOCK:
         STREAMS[stream_id] = stream
     task_id = uuid.uuid4().hex[:8]
@@ -21023,7 +21023,7 @@ def _start_chat_stream_for_session(
     set_last_workspace(workspace)
     diag.stage("stream_registration") if diag else None
     stream = create_stream_channel()
-    register_stream_owner(stream_id, s.session_id)
+    register_stream_owner(stream_id, s.session_id, getattr(s, "profile", None))
     with STREAMS_LOCK:
         STREAMS[stream_id] = stream
     # #1932: mark stream as goal-related so the streaming hook evaluates the goal.

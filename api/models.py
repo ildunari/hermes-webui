@@ -819,6 +819,45 @@ def _active_stream_ids():
     return active_ids
 
 
+def _active_stream_ids_for_profile(
+    profile: str | None,
+    *,
+    all_profiles: bool = False,
+    active_ids=None,
+):
+    """Return active streams relevant to one profile's sidebar cache.
+
+    Unknown ownership is included conservatively so registration races never
+    disable the active-run safety hold-down. Known streams from another profile
+    are excluded, preventing an unrelated profile from freezing this cache TTL.
+    """
+    active_ids = _active_stream_ids() if active_ids is None else set(active_ids)
+    if all_profiles or not active_ids:
+        return active_ids
+    target = str(profile or "default").strip() or "default"
+    try:
+        from api.profiles import _profiles_match
+    except Exception:
+        _profiles_match = lambda left, right: left == right
+    try:
+        with _cfg.STREAM_SESSION_OWNERS_LOCK:
+            owner_profiles = dict(getattr(_cfg, "STREAM_SESSION_OWNER_PROFILES", {}))
+            owners = dict(_cfg.STREAM_SESSION_OWNERS)
+    except Exception:
+        owner_profiles, owners = {}, {}
+
+    relevant = set()
+    for stream_id in active_ids:
+        stream_profile = owner_profiles.get(stream_id)
+        if stream_profile is None:
+            owner_id = owners.get(stream_id)
+            session = SESSIONS.get(owner_id) if owner_id else None
+            stream_profile = getattr(session, "profile", None) if session is not None else None
+        if stream_profile is None or _profiles_match(stream_profile, target):
+            relevant.add(stream_id)
+    return relevant
+
+
 def _append_recovered_turn_to_context(session, recovered: dict) -> None:
     context_messages = getattr(session, 'context_messages', None)
     if not isinstance(context_messages, list) or not context_messages:
@@ -6528,7 +6567,9 @@ def _reload_cli_sessions_after_inflight(
         _cli_sessions_cache_done(cache_key, event)
 
 
-def _cli_sessions_cache_ttl_seconds() -> float:
+def _cli_sessions_cache_ttl_seconds(
+    profile: str | None = None, *, all_profiles: bool = False
+) -> float:
     # #4842: widen the freshness window while a turn is streaming so the fixed
     # streaming poll cadence doesn't force a rebuild on every poll. Paired
     # with the streaming-freeze cache key (so the key is stable across polls
@@ -6536,7 +6577,9 @@ def _cli_sessions_cache_ttl_seconds() -> float:
     # streaming-TTL window instead of one per poll. Mirrors the route-level
     # #4808 TTL widening.
     try:
-        if _cli_sessions_streaming_freeze_marker() is not None:
+        if _cli_sessions_streaming_freeze_marker(
+            profile, all_profiles=all_profiles
+        ) is not None:
             return max(0.0, float(_CLI_SESSIONS_CACHE_STREAMING_TTL_SECONDS))
     except (TypeError, ValueError):
         pass
@@ -6663,8 +6706,10 @@ def _sqlite_file_stat_cache_key(db_path: Path):
     )
 
 
-def _cli_sessions_streaming_freeze_marker():
-    """Return a stable cache-key marker while any turn is actively streaming.
+def _cli_sessions_streaming_freeze_marker(
+    profile: str | None = None, *, all_profiles: bool = False
+):
+    """Return a stable cache-key marker for relevant active streams.
 
     The CLI/cron sidebar projection (``_load_cli_sessions_uncached``) is gated by
     ``_CLI_SESSIONS_CACHE``, whose key folds in ``_sqlite_file_stat_cache_key`` →
@@ -6693,7 +6738,7 @@ def _cli_sessions_streaming_freeze_marker():
     trade-off of the freeze. (#4842)
     """
     try:
-        active = _active_stream_ids()
+        active = _active_stream_ids_for_profile(profile, all_profiles=all_profiles)
     except Exception:
         return None
     if not active:
@@ -6733,7 +6778,7 @@ def _resolve_cli_sessions_context(source_filter=None, include_claude_code: bool 
     # The wider streaming TTL in get_cli_sessions() still permits a periodic
     # rebuild after that window, and structural mutations invalidate via
     # clear_cli_sessions_cache().
-    _streaming_marker = _cli_sessions_streaming_freeze_marker()
+    _streaming_marker = _cli_sessions_streaming_freeze_marker(cli_profile)
     db_state_key = _streaming_marker if _streaming_marker is not None else _sqlite_file_stat_cache_key(db_path)
     cache_key = (
         str(hermes_home),
@@ -7204,13 +7249,14 @@ def get_cli_sessions(
     bridge is purely additive and never crashes the WebUI.
     """
     source_filter = _normalize_cli_session_source_filter(source_filter)
+    cli_profile = None
     if all_profiles:
         contexts, context_cache_key = _all_profiles_cli_contexts()
         db_path = "all profiles"
         # #4842: freeze the volatile per-profile state.db component while
         # streaming so a streamed message row in one profile doesn't bust the
         # all-profiles CLI cache and re-run every profile's heavy projection.
-        _streaming_marker = _cli_sessions_streaming_freeze_marker()
+        _streaming_marker = _cli_sessions_streaming_freeze_marker(all_profiles=True)
         if _streaming_marker is not None:
             context_cache_key = ('streaming-frozen', _streaming_marker)
         cache_key = (
@@ -7235,7 +7281,10 @@ def get_cli_sessions(
         )
         if not resolve_supports_include_claude_code:
             cache_key = cache_key + (bool(include_claude_code),)
-    ttl = _cli_sessions_cache_ttl_seconds()
+    ttl = _cli_sessions_cache_ttl_seconds(
+        None if all_profiles else cli_profile,
+        all_profiles=all_profiles,
+    )
     now = time.monotonic()
 
     def _load_sessions():

@@ -8,7 +8,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from api.config import LOCK, SESSION_DIR, SESSIONS, SETTINGS_FILE
-from api.models import _active_state_db_path, _active_stream_ids
+from api.models import _active_state_db_path, _active_stream_ids, _active_stream_ids_for_profile
 from api.profiles import _profiles_match
 
 
@@ -181,7 +181,7 @@ def _session_list_cache_get(
         # #4808: widen the freshness window while a turn is streaming so the fixed
         # streaming poll cadence doesn't force a full rebuild on every poll.
         ttl = _SESSIONS_CACHE_TTL_SECONDS
-        if _session_list_cache_streaming_freeze_marker() is not None:
+        if _session_list_cache_streaming_freeze_marker(key) is not None:
             ttl = _SESSIONS_CACHE_STREAMING_TTL_SECONDS
         fresh = (now - ts) < ttl
         if fresh:
@@ -206,7 +206,7 @@ def _session_list_cache_stale_reason(key: tuple) -> str | None:
         if stamp != current_stamp:
             return "source"
         ttl = _SESSIONS_CACHE_TTL_SECONDS
-        if _session_list_cache_streaming_freeze_marker() is not None:
+        if _session_list_cache_streaming_freeze_marker(key) is not None:
             ttl = _SESSIONS_CACHE_STREAMING_TTL_SECONDS
         if (now - ts) >= ttl:
             return "age"
@@ -277,8 +277,8 @@ def _session_list_cache_path_stamp(path: Path | None) -> tuple[int, int]:
         return (0, 0)
 
 
-def _session_list_cache_streaming_freeze_marker():
-    """Return a hold-down marker while any session is actively streaming, else None.
+def _session_list_cache_streaming_freeze_marker(key: tuple | None = None):
+    """Return a profile-local hold-down marker while a session is streaming.
 
     During an active chat turn the gateway/CLI writes message rows to state.db
     continuously. Each write advances the WAL stat and the content fingerprint
@@ -306,7 +306,15 @@ def _session_list_cache_streaming_freeze_marker():
     title/message_count, which already tolerates a <=TTL refresh delay.
     """
     try:
-        active = _session_list_cache_active_stream_ids()
+        if key is None:
+            active = _session_list_cache_active_stream_ids()
+        else:
+            cache_profile, cache_all_profiles, *_rest = key
+            active = _active_stream_ids_for_profile(
+                cache_profile,
+                all_profiles=bool(cache_all_profiles),
+                active_ids=_session_list_cache_active_stream_ids(),
+            )
     except Exception:
         return None
     if not active:
@@ -360,7 +368,7 @@ def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple
     # version stay live so user-initiated sidebar/setting toggles invalidate
     # immediately. Skipping the fingerprint's SQLite connect here also makes the
     # streaming-path stamp strictly cheaper than the idle path.
-    streaming_marker = _session_list_cache_streaming_freeze_marker()
+    streaming_marker = _session_list_cache_streaming_freeze_marker(key)
     if streaming_marker is not None:
         return (
             streaming_marker,

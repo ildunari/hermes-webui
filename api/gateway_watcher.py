@@ -12,6 +12,7 @@ import hashlib
 import logging
 import os
 import queue
+import sqlite3
 import threading
 import time
 from contextlib import closing
@@ -37,67 +38,90 @@ def _snapshot_hash(sessions: list) -> str:
 # Sources excluded from the WebUI sidebar projection. Must match the default
 # ``exclude_sources`` used by ``read_importable_agent_session_rows`` so the
 # sessions-table aggregate tracks the same row set as the expensive projection.
-_WATCHER_EXCLUDED_SOURCES = ("cron", "webui")
+_WATCHER_EXCLUDED_SOURCES = ("cron", "subagent", "webui")
+
+
+# Every sessions-table field read by read_importable_agent_session_rows(),
+# including lineage/visibility inputs whose changes can alter which row survives.
+_WATCHER_PROJECTED_SESSION_COLUMNS = (
+    "id", "title", "model", "message_count", "started_at", "source",
+    "session_source", "user_id", "chat_id", "chat_type", "thread_id",
+    "session_key", "origin_chat_id", "origin_user_id", "platform",
+    "parent_session_id", "ended_at", "end_reason",
+)
 
 
 def _cheap_change_fingerprint(db_path: Path) -> str | None:
-    """Compute a small change-detection fingerprint without scanning messages.
+    """Hash the complete sidebar projection input, cheaper than projecting it.
 
-    The watcher only needs to know whether it should pay for the full sidebar
-    projection. Use covering-index aggregates over ``sessions`` and
-    ``messages``: visible session counts/max rowids by source, plus message
-    count and ``MAX(messages.id)``. In current Hermes state DBs, ``messages.id``
-    is an INTEGER PRIMARY KEY/rowid, so SQLite can answer the max from the table
-    btree instead of aggregating every message row.
-
-    Returns the fingerprint string, or ``None`` on any error / a pre-source
-    schema so the caller falls back to running the expensive projection rather
-    than risk skipping a change.
+    This scan intentionally preserves correctness rather than relying on rowid or
+    global aggregates: in-place session updates and rewrites of an older
+    transcript must invalidate too. It reads all projected session fields and
+    one grouped message aggregate (count, user count, max timestamp) per included
+    session, but skips candidate ordering, lineage collapse, Python mapping, and
+    repeated correlated lookups performed by the full projection.
     """
     try:
         with closing(open_state_db_readonly(db_path)) as conn:
-            cur = conn.cursor()
-            cur.execute("PRAGMA table_info(sessions)")
-            session_cols = {row[1] for row in cur.fetchall()}
-            if not session_cols:
+            session_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if "source" not in session_cols:
                 return None
-            if 'source' not in session_cols:
-                return None
-
+            selectable = [
+                column for column in _WATCHER_PROJECTED_SESSION_COLUMNS
+                if column in session_cols
+            ]
             placeholders = ", ".join("?" for _ in _WATCHER_EXCLUDED_SOURCES)
-            cur.execute(
-                "SELECT source, COUNT(*), COALESCE(MAX(rowid), 0) "
-                f"FROM sessions "
-                f"WHERE source IS NOT NULL AND source NOT IN ({placeholders}) "
-                "GROUP BY source ORDER BY source",
-                list(_WATCHER_EXCLUDED_SOURCES),
-            )
+            params = list(_WATCHER_EXCLUDED_SOURCES)
             h = hashlib.md5(usedforsecurity=False)
-            for row in cur.fetchall():
-                h.update(repr(row).encode('utf-8', 'replace'))
-                h.update(b'\x1e')
+            session_rows = conn.execute(
+                f"SELECT {', '.join(selectable)} FROM sessions "
+                f"WHERE source IS NOT NULL AND source NOT IN ({placeholders}) "
+                "ORDER BY id",
+                params,
+            ).fetchall()
+            for row in session_rows:
+                h.update(repr(row).encode("utf-8", "replace"))
+                h.update(b"\x1e")
 
-            table_names = {
-                r[0] for r in conn.execute(
+            tables = {
+                row[0] for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
-            if 'messages' in table_names:
-                cur.execute("PRAGMA table_info(messages)")
-                message_cols = {row[1]: row for row in cur.fetchall()}
-                id_info = message_cols.get('id')
-                if id_info is None:
-                    return None
-                id_type = str(id_info[2] or "").upper()
-                if int(id_info[5] or 0) != 1 or "INT" not in id_type:
-                    return None
-                msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-                msg_max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
-            else:
-                msg_count = 0
-                msg_max_id = 0
-            h.update(repr(("messages", msg_count, msg_max_id)).encode('utf-8', 'replace'))
+            if "messages" not in tables:
+                return h.hexdigest()
+            message_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+            }
+            if "session_id" not in message_cols:
+                return h.hexdigest()
+            count_col = "id" if "id" in message_cols else "session_id"
+            user_count_expr = (
+                "COUNT(CASE WHEN LOWER(m.role) = 'user' THEN 1 END)"
+                if "role" in message_cols
+                else f"COUNT(m.{count_col})"
+            )
+            max_timestamp_expr = (
+                "COALESCE(MAX(m.timestamp), 0)" if "timestamp" in message_cols else "0"
+            )
+            message_rows = conn.execute(
+                f"SELECT s.id, COUNT(m.{count_col}), {user_count_expr}, "
+                f"{max_timestamp_expr} "
+                "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
+                f"WHERE s.source IS NOT NULL AND s.source NOT IN ({placeholders}) "
+                "GROUP BY s.id ORDER BY s.id",
+                params,
+            ).fetchall()
+            for row in message_rows:
+                h.update(repr(row).encode("utf-8", "replace"))
+                h.update(b"\x1e")
             return h.hexdigest()
+    except sqlite3.Error:
+        # Unknown/locked schema: force the caller to run the authoritative full
+        # projection rather than trusting an incomplete fingerprint.
+        return None
     except Exception:
         return None
 

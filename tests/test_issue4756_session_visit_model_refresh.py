@@ -160,6 +160,7 @@ def test_session_visit_background_refresh_coalesces_per_profile(monkeypatch):
     calls = []
 
     monkeypatch.setattr(cfg, "_session_visit_refresh_profiles", set(), raising=False)
+    monkeypatch.setattr(cfg, "_session_visit_refresh_worker_running", False, raising=False)
     monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: "demo")
 
     class _Scope:
@@ -192,6 +193,95 @@ def test_session_visit_background_refresh_coalesces_per_profile(monkeypatch):
                 break
         time.sleep(0.01)
     assert calls == [{"force_refresh": True}]
+
+
+def test_session_visit_cold_fallback_is_built_before_refresh_is_published(tmp_path, monkeypatch):
+    import api.config as cfg
+
+    _reset_models_memory_cache(monkeypatch)
+    expected = _catalog("minimal")
+    fallback_ready = []
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: tmp_path / "missing.json")
+    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: None)
+    monkeypatch.setattr(
+        cfg,
+        "_minimal_static_models_catalog",
+        lambda: fallback_ready.append(True) or expected,
+    )
+
+    def _start_refresh():
+        assert fallback_ready, "refresh was published before cold fallback existed"
+        return True
+
+    monkeypatch.setattr(cfg, "_start_session_visit_models_refresh", _start_refresh)
+    monkeypatch.setattr(
+        cfg,
+        "get_available_models",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("foreground entered build gate")),
+    )
+
+    assert cfg.get_available_models_for_session_visit() == expected
+
+
+def test_session_visit_cross_profile_requests_share_one_draining_worker(monkeypatch):
+    import api.config as cfg
+    import threading
+
+    active_profile = {"name": "alpha"}
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    scopes = []
+    calls = []
+    thread_count = 0
+    real_thread = threading.Thread
+
+    monkeypatch.setattr(cfg, "_session_visit_refresh_profiles", set(), raising=False)
+    monkeypatch.setattr(cfg, "_session_visit_refresh_worker_running", False, raising=False)
+    monkeypatch.setattr("api.profiles.get_active_profile_name", lambda: active_profile["name"])
+
+    class _Scope:
+        def __init__(self, profile):
+            self.profile = profile
+
+        def __enter__(self):
+            scopes.append(self.profile)
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        "api.profiles.profile_scope_for_detached_worker",
+        lambda profile, *_args: _Scope(profile),
+    )
+
+    def _refresh(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+        return _catalog("rebuilt")
+
+    def _thread(*args, **kwargs):
+        nonlocal thread_count
+        thread_count += 1
+        return real_thread(*args, **kwargs)
+
+    monkeypatch.setattr(cfg, "get_available_models", _refresh)
+    monkeypatch.setattr(cfg.threading, "Thread", _thread)
+
+    assert cfg._start_session_visit_models_refresh() is True
+    assert first_entered.wait(timeout=5)
+    active_profile["name"] = "beta"
+    assert cfg._start_session_visit_models_refresh() is True
+    assert thread_count == 1
+    release_first.set()
+    for _ in range(200):
+        with cfg._session_visit_refresh_lock:
+            if not cfg._session_visit_refresh_worker_running:
+                break
+        time.sleep(0.01)
+    assert scopes == ["alpha", "beta"]
+    assert calls == [{"force_refresh": True}, {"force_refresh": True}]
 
 
 def test_force_refresh_sync_followers_wait_past_legacy_timeout(tmp_path, monkeypatch):

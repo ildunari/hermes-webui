@@ -4640,6 +4640,7 @@ _AVAILABLE_MODELS_CACHE_TTL: float = 86400.0  # 24 hours
 _SESSION_VISIT_MODELS_FRESHNESS_SECONDS: float = 300.0
 _session_visit_refresh_lock = threading.Lock()
 _session_visit_refresh_profiles: set[str] = set()
+_session_visit_refresh_worker_running = False
 _available_models_cache_lock = threading.RLock()  # must be RLock: cold path refactoring moved slow work inside this lock, requiring re-entry
 _cache_build_cv = threading.Condition(_available_models_cache_lock)  # shares underlying RLock so notify_all() is safe inside with _available_models_cache_lock
 _cache_build_in_progress = False  # True while a cold path is actively building
@@ -8209,7 +8210,12 @@ def warm_models_catalog_provenance_if_cold() -> None:
 
 
 def _start_session_visit_models_refresh() -> bool:
-    """Start one profile-scoped catalog refresh without blocking the request."""
+    """Queue a profile refresh on one process-wide detached worker.
+
+    Catalog builds are serialized process-wide. Keep pending profile names and
+    drain them with one worker instead of spawning profile threads that merely
+    queue behind the same global build gate.
+    """
     try:
         from api.profiles import (
             get_active_profile_name,
@@ -8221,34 +8227,49 @@ def _start_session_visit_models_refresh() -> bool:
         profile_name = "default"
         profile_scope_for_detached_worker = None
 
+    global _session_visit_refresh_worker_running
     with _session_visit_refresh_lock:
         if profile_name in _session_visit_refresh_profiles:
             return False
         _session_visit_refresh_profiles.add(profile_name)
+        if _session_visit_refresh_worker_running:
+            return True
+        _session_visit_refresh_worker_running = True
 
-    def _refresh() -> None:
+    def _refresh_pending_profiles() -> None:
         from contextlib import nullcontext
+        global _session_visit_refresh_worker_running
 
-        scope = (
-            profile_scope_for_detached_worker(
-                profile_name,
-                "session-visit models refresh",
-            )
-            if profile_scope_for_detached_worker is not None
-            else nullcontext()
-        )
-        try:
-            with scope:
-                get_available_models(force_refresh=True)
-        except Exception:
-            logger.debug("background session-visit models refresh failed", exc_info=True)
-        finally:
+        while True:
             with _session_visit_refresh_lock:
-                _session_visit_refresh_profiles.discard(profile_name)
+                if not _session_visit_refresh_profiles:
+                    _session_visit_refresh_worker_running = False
+                    return
+                pending_profile = next(iter(_session_visit_refresh_profiles))
+            scope = (
+                profile_scope_for_detached_worker(
+                    pending_profile,
+                    "session-visit models refresh",
+                )
+                if profile_scope_for_detached_worker is not None
+                else nullcontext()
+            )
+            try:
+                with scope:
+                    get_available_models(force_refresh=True)
+            except Exception:
+                logger.debug(
+                    "background session-visit models refresh failed for profile %s",
+                    pending_profile,
+                    exc_info=True,
+                )
+            finally:
+                with _session_visit_refresh_lock:
+                    _session_visit_refresh_profiles.discard(pending_profile)
 
     threading.Thread(
-        target=_refresh,
-        name=f"models-session-visit-refresh-{profile_name}",
+        target=_refresh_pending_profiles,
+        name="models-session-visit-refresh",
         daemon=True,
     ).start()
     return True
@@ -8318,17 +8339,24 @@ def get_available_models_for_session_visit() -> dict:
     _mark("cache_age_stale_or_missing")
     stale_cached = disk_cached or _load_stale_models_cache_from_disk()
     _mark(f"stale_cached_loaded:{bool(stale_cached)}")
+    # Build the foreground fallback before publishing detached work. On a cold
+    # cache, starting the refresher first lets it acquire the catalog lock and
+    # makes a subsequent prefer-cache fallback wait behind the live rebuild.
+    fallback = (
+        copy.deepcopy(stale_cached)
+        if stale_cached is not None
+        else copy.deepcopy(_minimal_static_models_catalog())
+    )
+    _mark("foreground_fallback_ready")
     refresh_started = _start_session_visit_models_refresh()
     _mark(f"background_refresh_started:{refresh_started}")
     if stale_cached is not None:
         _mark("stale_cache_returned")
         _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
-        return copy.deepcopy(stale_cached)
-    _mark("prefer_cache_fallback")
-    result = get_available_models(prefer_cache=True)
-    _mark("prefer_cache_returned")
+        return fallback
+    _mark("minimal_fallback_returned")
     _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
-    return result
+    return fallback
 
 
 def _maybe_log_slow_stages(
@@ -8662,6 +8690,7 @@ STREAMS_LOCK = threading.Lock()
 # stream_id -> session_id owner, populated synchronously before worker startup so
 # stream-id authorization does not depend on worker lifecycle registration.
 STREAM_SESSION_OWNERS: dict = {}
+STREAM_SESSION_OWNER_PROFILES: dict = {}
 STREAM_SESSION_OWNERS_LOCK = threading.Lock()
 CANCEL_FLAGS: dict = {}
 AGENT_INSTANCES: dict = {}  # stream_id -> AIAgent instance for interrupt propagation
@@ -8673,7 +8702,7 @@ STREAM_LAST_EVENT_ID: dict = {}  # stream_id -> latest journal event_id for `id:
 PENDING_GOAL_CONTINUATION: set = set()  # session_ids awaiting a goal continuation turn (#1932)
 
 
-def register_stream_owner(stream_id: str, session_id: str) -> None:
+def register_stream_owner(stream_id: str, session_id: str, profile: str | None = None) -> None:
     """Record the session that owns a stream before worker startup."""
     stream_id = str(stream_id or "").strip()
     session_id = str(session_id or "").strip()
@@ -8681,6 +8710,7 @@ def register_stream_owner(stream_id: str, session_id: str) -> None:
         return
     with STREAM_SESSION_OWNERS_LOCK:
         STREAM_SESSION_OWNERS[stream_id] = session_id
+        STREAM_SESSION_OWNER_PROFILES[stream_id] = str(profile or "default")
 
 
 def stream_owner_session_id(stream_id: str) -> str | None:
@@ -8701,6 +8731,7 @@ def unregister_stream_owner(stream_id: str) -> None:
         return
     with STREAM_SESSION_OWNERS_LOCK:
         STREAM_SESSION_OWNERS.pop(stream_id, None)
+        STREAM_SESSION_OWNER_PROFILES.pop(stream_id, None)
 
 
 # ── Gateway capability cache ─────────────────────────────────────────────────

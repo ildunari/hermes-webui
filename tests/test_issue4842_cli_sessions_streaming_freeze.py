@@ -9,11 +9,11 @@ per streamed delta, so that fingerprint advances on essentially every
 candidate-join + projection (and the lineage-metadata pass) on every poll — the
 multi-second ``get_cli_sessions`` in #4842.
 
-Fix: while any stream is active, the cache key folds in a stable streaming-freeze
-marker (keyed only on the set of active stream ids) instead of the volatile
-content fingerprint, and the cache TTL widens — so the projection is reused across
-polls mid-stream and rebuilt at most once per streaming-TTL window. The instant a
-stream starts/stops the marker changes, so freshly-finished rows surface promptly.
+Fix: while a stream in the cache's profile is active, the cache key folds in a
+stable streaming-freeze marker (keyed only on that profile's active stream ids)
+instead of the volatile content fingerprint, and the cache TTL widens. Other
+profiles remain independently fresh; unknown ownership freezes conservatively
+for active-run safety.
 """
 import sys
 from pathlib import Path
@@ -97,6 +97,53 @@ def test_streaming_ttl_wider_than_idle(monkeypatch):
         "streaming TTL must exceed idle TTL so the fixed poll cadence does not "
         "force a rebuild on every poll (#4842)"
     )
+
+
+def test_streaming_freeze_and_ttl_are_profile_local(monkeypatch):
+    from api import config as cfg
+
+    _set_active_streams(monkeypatch, ["alpha-stream"])
+    monkeypatch.setattr(
+        cfg,
+        "STREAM_SESSION_OWNER_PROFILES",
+        {"alpha-stream": "alpha"},
+        raising=False,
+    )
+    monkeypatch.setattr(cfg, "STREAM_SESSION_OWNERS", {}, raising=False)
+
+    assert M._cli_sessions_streaming_freeze_marker("alpha") is not None
+    assert M._cli_sessions_streaming_freeze_marker("beta") is None
+    assert M._cli_sessions_cache_ttl_seconds("alpha") == M._CLI_SESSIONS_CACHE_STREAMING_TTL_SECONDS
+    assert M._cli_sessions_cache_ttl_seconds("beta") == M._CLI_SESSIONS_CACHE_TTL_SECONDS
+    assert M._cli_sessions_streaming_freeze_marker(all_profiles=True) is not None
+
+
+def test_route_cache_freeze_is_profile_local(monkeypatch):
+    from api import config as cfg
+    from api import route_session_list_cache as route_cache
+
+    monkeypatch.setattr(route_cache, "_session_list_cache_active_stream_ids", lambda: {"alpha-stream"})
+    monkeypatch.setattr(
+        cfg,
+        "STREAM_SESSION_OWNER_PROFILES",
+        {"alpha-stream": "alpha"},
+        raising=False,
+    )
+    monkeypatch.setattr(cfg, "STREAM_SESSION_OWNERS", {}, raising=False)
+    alpha_key = route_cache._session_list_cache_key("alpha", False, True, False, False)
+    beta_key = route_cache._session_list_cache_key("beta", False, True, False, False)
+
+    assert route_cache._session_list_cache_streaming_freeze_marker(alpha_key) is not None
+    assert route_cache._session_list_cache_streaming_freeze_marker(beta_key) is None
+
+
+def test_unknown_stream_owner_freezes_conservatively(monkeypatch):
+    from api import config as cfg
+
+    _set_active_streams(monkeypatch, ["registration-window"])
+    monkeypatch.setattr(cfg, "STREAM_SESSION_OWNER_PROFILES", {}, raising=False)
+    monkeypatch.setattr(cfg, "STREAM_SESSION_OWNERS", {}, raising=False)
+    assert M._cli_sessions_streaming_freeze_marker("beta") is not None
 
 
 def test_structural_change_listener_clears_cli_cache(monkeypatch):
