@@ -68,6 +68,35 @@ def test_post_compression_estimate_uses_pruned_request_and_preserves_last_prompt
     assert calls == [(pruned, "workspace", agent.tools)]
 
 
+def test_post_compression_estimate_includes_prefill_and_ephemeral_system_context(monkeypatch):
+    from api.streaming import _estimate_post_compression_context_tokens
+
+    calls = []
+
+    def estimate(messages, *, system_prompt, tools):
+        calls.append((messages, system_prompt, tools))
+        return 5_120
+
+    monkeypatch.setattr("agent.model_metadata.estimate_request_tokens_rough", estimate, raising=False)
+    prefill = [{"role": "user", "content": "prefill"}]
+    pruned = [{"role": "assistant", "content": "summary"}]
+    agent = type(
+        "Agent",
+        (),
+        {
+            "tools": [{"name": "read_file"}],
+            "prefill_messages": prefill,
+            "_cached_system_prompt": "base system",
+            "ephemeral_system_prompt": "webui guidance",
+        },
+    )()
+
+    assert _estimate_post_compression_context_tokens(agent, pruned, "workspace") == 5_120
+    assert calls == [
+        (prefill + pruned, "base system\n\nwebui guidance", agent.tools)
+    ]
+
+
 def test_post_compression_estimate_falls_back_when_request_estimator_is_unavailable(monkeypatch):
     from api.streaming import _estimate_post_compression_context_tokens
 

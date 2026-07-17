@@ -24491,11 +24491,14 @@ def _handle_session_compress(handler, body):
             headline = f"Compressed: {len(original_messages)} \u2192 {len(compressed_messages)} messages"
             summary = {
                 "headline": headline,
-                "token_line": f"Rough transcript estimate: ~{before_tokens} \u2192 ~{after_tokens} tokens",
+                "token_line": (
+                    f"Conversation transcript estimate: ~{before_tokens:,} → "
+                    f"~{after_tokens:,} tokens"
+                ),
                 "note": f"Focus: {focus_topic}" if focus_topic else None,
             }
             summary["reference_message"] = (
-                f"[CONTEXT COMPACTION \u2014 REFERENCE ONLY] {headline}\n"
+                f"[CONTEXT COMPACTION — REFERENCE ONLY] {headline}\n"
                 f"{summary['token_line']}\n"
                 + (summary["note"] + "\n" if summary.get("note") else "")
                 + "Compression completed."
@@ -24574,6 +24577,14 @@ def _handle_session_compress(handler, body):
         # Lock contract: hold for the in-memory mutation only, never across
         # network I/O.
         original_messages = list(messages)
+        original_request_shape = (
+            getattr(s, "workspace", None),
+            getattr(s, "model", None),
+            getattr(s, "model_provider", None),
+            getattr(s, "profile", None),
+            getattr(s, "personality", None),
+            tuple(getattr(s, "enabled_toolsets", None) or ()),
+        )
         original_stream_state = (
             getattr(s, "active_stream_id", None),
             getattr(s, "pending_user_message", None),
@@ -24581,6 +24592,47 @@ def _handle_session_compress(handler, body):
             getattr(s, "pending_started_at", None),
         )
         approx_tokens = _estimate_messages_tokens_rough(original_messages)
+
+        runtime_cfg = _cfg.get_config()
+        enabled_toolsets = list(original_request_shape[5]) or _resolve_cli_toolsets(runtime_cfg)
+        from api.streaming import (
+            _load_webui_prefill_context,
+            _normalize_prefill_messages_before_user_turn,
+            _prefill_messages_with_webui_context,
+            _webui_ephemeral_system_prompt,
+        )
+
+        prefill_context = _load_webui_prefill_context(runtime_cfg)
+        prefill_messages = _normalize_prefill_messages_before_user_turn(
+            _prefill_messages_with_webui_context(prefill_context, runtime_cfg)
+        )
+        personality_prompt = None
+        personality_name = original_request_shape[4]
+        personalities = runtime_cfg.get("agent", {}).get("personalities", {})
+        if personality_name and isinstance(personalities, dict):
+            personality_value = personalities.get(personality_name)
+            if isinstance(personality_value, dict):
+                personality_parts = [
+                    personality_value.get("system_prompt", "")
+                    or personality_value.get("prompt", "")
+                ]
+                if personality_value.get("tone"):
+                    personality_parts.append(f"Tone: {personality_value['tone']}")
+                if personality_value.get("style"):
+                    personality_parts.append(f"Style: {personality_value['style']}")
+                personality_prompt = "\n".join(part for part in personality_parts if part)
+            elif personality_value is not None:
+                personality_prompt = str(personality_value)
+        ephemeral_system_prompt = _webui_ephemeral_system_prompt(
+            personality_prompt,
+            surface_context={
+                "source": "webui",
+                "session_id": sid,
+                "profile": original_request_shape[3],
+                "workspace": original_request_shape[0],
+            },
+            config_data=runtime_cfg,
+        )
 
         agent = AIAgent(
             model=resolved_model,
@@ -24591,9 +24643,13 @@ def _handle_session_compress(handler, body):
             # does not inject CLI-specific terminal/output guidance.
             platform="webui",
             quiet_mode=True,
-            enabled_toolsets=_resolve_cli_toolsets(),
+            enabled_toolsets=enabled_toolsets,
             session_id=sid,
         )
+        # Mirror the request-only context used by the real WebUI streaming agent
+        # so the estimate covers prefill and ephemeral system guidance too.
+        agent.prefill_messages = prefill_messages
+        agent.ephemeral_system_prompt = ephemeral_system_prompt
         compressed = agent.context_compressor.compress(
             original_messages,
             current_tokens=approx_tokens,
@@ -24607,10 +24663,65 @@ def _handle_session_compress(handler, body):
             new_tokens,
             focus_topic=focus_topic,
         )
+        transcript_token_line = (
+            f"Conversation transcript estimate: ~{approx_tokens:,} → "
+            f"~{new_tokens:,} tokens"
+        )
+        from api.streaming import (
+            _estimate_post_compression_context_tokens,
+            _workspace_system_message,
+        )
+
+        workspace_system_message = _workspace_system_message(str(original_request_shape[0] or ""))
+        estimated_previous_context_tokens = _estimate_post_compression_context_tokens(
+            agent,
+            original_messages,
+            workspace_system_message,
+        )
+        estimated_next_context_tokens = _estimate_post_compression_context_tokens(
+            agent,
+            compressed,
+            workspace_system_message,
+        )
+        if not isinstance(summary, dict):
+            summary = {}
+        if (
+            estimated_previous_context_tokens is not None
+            and estimated_next_context_tokens is not None
+        ):
+            summary["token_line"] = (
+                f"Estimated model context: ~{estimated_previous_context_tokens:,} → "
+                f"~{estimated_next_context_tokens:,} tokens"
+            )
+            summary["transcript_token_line"] = transcript_token_line
+        else:
+            summary["token_line"] = transcript_token_line
+            summary.pop("transcript_token_line", None)
+        reference_lines = [
+            f"[CONTEXT COMPACTION — REFERENCE ONLY] {summary.get('headline') or 'Context compressed'}",
+            summary["token_line"],
+        ]
+        if summary.get("transcript_token_line"):
+            reference_lines.append(summary["transcript_token_line"])
+        if summary.get("note"):
+            reference_lines.append(str(summary["note"]))
+        reference_lines.append("Compression completed.")
+        summary["reference_message"] = "\n".join(reference_lines)
 
         with _cfg._get_session_agent_lock(sid):
-            # Re-read messages to detect concurrent edits during the LLM call.
-            # If the history changed, the compression result is stale — abort.
+            # Re-read request-shaping and stream state to detect concurrent edits
+            # while the compressor was running. A full-context estimate is only
+            # valid for the exact workspace/model/profile configuration it measured.
+            current_request_shape = (
+                getattr(s, "workspace", None),
+                getattr(s, "model", None),
+                getattr(s, "model_provider", None),
+                getattr(s, "profile", None),
+                getattr(s, "personality", None),
+                tuple(getattr(s, "enabled_toolsets", None) or ()),
+            )
+            if current_request_shape != original_request_shape:
+                return bad(handler, "Session request context changed during compression; please retry.", 409)
             current_stream_state = (
                 getattr(s, "active_stream_id", None),
                 getattr(s, "pending_user_message", None),
@@ -24648,7 +24759,7 @@ def _handle_session_compress(handler, body):
             s.truncation_watermark = compress_watermark
             s.truncation_boundary = compress_watermark
             s.compression_anchor_mode = "manual"
-            s.last_prompt_tokens = new_tokens
+            s.post_compression_context_tokens_estimate = estimated_next_context_tokens
             s.save()
             # Drop stale backups that would undo an intentional manual compress.
             try:

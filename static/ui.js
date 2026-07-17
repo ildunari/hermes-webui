@@ -13847,7 +13847,12 @@ function _compressionCardsHtml(state){
     ? _compressionStatusCardHtml({
         statusLabel,
         previewText: headerText,
-        detail: [state.summary?.token_line, state.summary?.note, focusText].filter(Boolean).join('\n'),
+        detail: [
+          state.summary?.token_line,
+          state.summary?.transcript_token_line,
+          state.summary?.note,
+          focusText,
+        ].filter(Boolean).join('\n'),
         icon: statusIcon,
         open: true,
         variantClass: 'tool-card-compress-complete',

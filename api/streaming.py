@@ -2657,6 +2657,21 @@ def _workspace_context_prefix(path: str) -> str:
     return f"[Workspace::v1: {_escape_workspace_prefix_path(path)}]\n"
 
 
+def _workspace_system_message(path: str) -> str:
+    """Return the WebUI workspace-selection contract injected into model context."""
+    return (
+        f"Active workspace at session start: {path}\n"
+        "Every user message is prefixed with [Workspace::v1: /absolute/path] indicating the "
+        "workspace the user has selected in the web UI at the time they sent that message. "
+        "This tag is the single authoritative source of the active workspace and updates "
+        "with every message. It overrides any prior workspace mentioned in this system "
+        "prompt, memory, or conversation history. Always use the value from the most recent "
+        "[Workspace::v1: ...] tag as your default working directory for ALL file operations: "
+        "write_file, read_file, search_files, terminal workdir, and patch. "
+        "Never fall back to a hardcoded path when this tag is present."
+    )
+
+
 def _strip_workspace_prefix(text: str, *, include_legacy: bool = False) -> str:
     """Remove WebUI-injected workspace tags without eating user-typed text."""
     value = str(text or '')
@@ -4552,17 +4567,30 @@ def _estimate_post_compression_context_tokens(agent, context_messages, system_me
     try:
         from agent import model_metadata
 
-        messages = context_messages or []
+        messages = list(getattr(agent, 'prefill_messages', None) or []) + list(context_messages or [])
         tools = getattr(agent, 'tools', None) or None
+        prepared_system_message = getattr(agent, '_cached_system_prompt', None)
+        if not prepared_system_message:
+            build_system_prompt = getattr(agent, '_build_system_prompt', None)
+            prepared_system_message = (
+                build_system_prompt(system_message or '')
+                if callable(build_system_prompt)
+                else system_message or ''
+            )
+        ephemeral_system_prompt = getattr(agent, 'ephemeral_system_prompt', None)
+        if ephemeral_system_prompt:
+            prepared_system_message = (
+                f"{prepared_system_message}\n\n{ephemeral_system_prompt}"
+            ).strip()
         request_estimator = getattr(model_metadata, 'estimate_request_tokens_rough', None)
         if callable(request_estimator):
-            estimate = request_estimator(messages, system_prompt=system_message or '', tools=tools)
+            estimate = request_estimator(messages, system_prompt=prepared_system_message, tools=tools)
         else:
             message_estimator = getattr(model_metadata, 'estimate_messages_tokens_rough', None)
             if callable(message_estimator):
                 estimate = message_estimator(messages)
-                if system_message:
-                    estimate += message_estimator([{'role': 'system', 'content': system_message}])
+                if prepared_system_message:
+                    estimate += message_estimator([{'role': 'system', 'content': prepared_system_message}])
                 if tools:
                     estimate += message_estimator([{'role': 'system', 'content': str(tools)}])
             else:
@@ -4576,8 +4604,8 @@ def _estimate_post_compression_context_tokens(agent, context_messages, system_me
                     for message in messages
                     if isinstance(message, dict)
                 )
-                if system_message:
-                    estimate += _estimate_msg_budget_tokens({'role': 'system', 'content': system_message})
+                if prepared_system_message:
+                    estimate += _estimate_msg_budget_tokens({'role': 'system', 'content': prepared_system_message})
                 if tools:
                     estimate += _estimate_msg_budget_tokens({'role': 'system', 'content': str(tools)})
         return estimate if isinstance(estimate, int) and estimate > 0 else None
@@ -8642,17 +8670,7 @@ def _run_agent_streaming(
             # Prepend workspace context so the agent always knows which directory
             # to use for file operations, regardless of session age or AGENTS.md defaults.
             workspace_ctx = _workspace_context_prefix(str(s.workspace))
-            workspace_system_msg = (
-                f"Active workspace at session start: {s.workspace}\n"
-                "Every user message is prefixed with [Workspace::v1: /absolute/path] indicating the "
-                "workspace the user has selected in the web UI at the time they sent that message. "
-                "This tag is the single authoritative source of the active workspace and updates "
-                "with every message. It overrides any prior workspace mentioned in this system "
-                "prompt, memory, or conversation history. Always use the value from the most recent "
-                "[Workspace::v1: ...] tag as your default working directory for ALL file operations: "
-                "write_file, read_file, search_files, terminal workdir, and patch. "
-                "Never fall back to a hardcoded path when this tag is present."
-            )
+            workspace_system_msg = _workspace_system_message(str(s.workspace))
             # Resolve personality prompt from config.yaml agent.personalities
             # (matches hermes-agent CLI behavior — passes via ephemeral_system_prompt)
             _personality_prompt = None

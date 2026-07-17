@@ -357,7 +357,14 @@ def test_session_compress_roundtrip(monkeypatch, cleanup_test_sessions):
     assert loaded.compression_anchor_mode == "manual"
     assert loaded.truncation_watermark is not None
     assert loaded.truncation_boundary == loaded.truncation_watermark
-    assert loaded.last_prompt_tokens is not None
+    assert loaded.last_prompt_tokens is None
+    assert loaded.post_compression_context_tokens_estimate is not None
+    assert payload["summary"]["token_line"].startswith(
+        "Estimated model context:"
+    )
+    assert payload["summary"]["transcript_token_line"].startswith(
+        "Conversation transcript estimate:"
+    )
     assert persisted.compression_anchor_mode == "manual"
     assert persisted.truncation_watermark == loaded.truncation_watermark
     assert persisted.truncation_boundary == loaded.truncation_boundary
@@ -366,6 +373,46 @@ def test_session_compress_roundtrip(monkeypatch, cleanup_test_sessions):
     assert persisted.compression_anchor_message_key == payload["session"]["compression_anchor_message_key"]
     assert _FakeAgent.last_instance is not None
     assert _FakeAgent.last_instance.context_compressor.calls[0]["focus_topic"] == "database schema"
+
+
+def test_session_compress_directly_estimates_full_context_and_preserves_provider_measurement(
+    monkeypatch, cleanup_test_sessions
+):
+    import agent
+
+    fake_model_metadata = types.ModuleType("agent.model_metadata")
+    fake_model_metadata.estimate_messages_tokens_rough = lambda messages: len(messages) * 100
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", fake_model_metadata)
+    monkeypatch.setattr(agent, "model_metadata", fake_model_metadata, raising=False)
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    session = get_session(sid)
+    session.last_prompt_tokens = 10_000
+    session.enabled_toolsets = ["web"]
+    session.save(touch_updated_at=False)
+
+    _install_fake_compression_runtime(monkeypatch, _FakeAgent)
+
+    handler = _FakeHandler()
+    _handle_session_compress(handler, {"session_id": sid})
+
+    assert handler.status == 200
+    payload = handler.payload()
+    assert payload["summary"]["token_line"] == "Estimated model context: ~500 → ~300 tokens"
+    assert payload["summary"]["transcript_token_line"] == (
+        "Conversation transcript estimate: ~400 → ~200 tokens"
+    )
+    assert payload["session"]["last_prompt_tokens"] == 10_000
+    assert payload["session"]["post_compression_context_tokens_estimate"] == 300
+    assert "Estimated model context: ~500 → ~300 tokens" in payload["session"]["compression_anchor_summary"]
+    assert "Conversation transcript estimate: ~400 → ~200 tokens" in payload["session"]["compression_anchor_summary"]
+
+    persisted = Session.load(sid)
+    assert persisted is not None
+    assert persisted.last_prompt_tokens == 10_000
+    assert persisted.post_compression_context_tokens_estimate == 300
+    assert _FakeAgent.last_instance.kwargs["enabled_toolsets"] == ["web"]
 
 
 def test_session_compress_start_is_async_and_reuses_running_job(monkeypatch, cleanup_test_sessions):
@@ -589,6 +636,36 @@ def test_session_compress_async_reports_stale_session_guard(monkeypatch, cleanup
     assert get_session(sid).messages[-1]["content"] == "concurrent edit"
 
 
+def test_session_compress_rejects_concurrent_request_context_change(
+    monkeypatch, cleanup_test_sessions
+):
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    original_toolsets = get_session(sid).enabled_toolsets
+
+    class RequestContextMutatingCompressor:
+        def compress(self, messages, current_tokens=None, focus_topic=None):
+            get_session(sid).enabled_toolsets = ["terminal"]
+            return [messages[0], messages[-1]]
+
+    class RequestContextMutatingAgent:
+        def __init__(self, **kwargs):
+            self.context_compressor = RequestContextMutatingCompressor()
+            self.tools = []
+
+    _install_fake_compression_runtime(monkeypatch, RequestContextMutatingAgent)
+
+    handler = _FakeHandler()
+    _handle_session_compress(handler, {"session_id": sid})
+
+    assert handler.status == 409
+    assert "request context changed during compression" in handler.payload()["error"]
+    session = get_session(sid)
+    assert session.enabled_toolsets != original_toolsets
+    assert session.context_messages == []
+    assert session.post_compression_context_tokens_estimate is None
+
+
 def test_session_compress_async_reports_stream_state_guard(monkeypatch, cleanup_test_sessions):
     import api.routes as routes
 
@@ -723,11 +800,16 @@ def test_static_commands_js_registers_compress_alias(cleanup_test_sessions):
 def test_static_commands_js_prefers_persisted_reference_message(cleanup_test_sessions):
     from pathlib import Path
 
-    with open(Path(__file__).resolve().parents[1] / "static" / "commands.js", encoding="utf-8") as f:
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    with open(static_dir / "commands.js", encoding="utf-8") as f:
         src = f.read()
 
     assert "const messageRef=referenceMsg?msgContent(referenceMsg)||String(referenceMsg.content||''):'';" in src
     assert "const referenceText=messageRef || summaryRef;" in src
+
+    with open(static_dir / "ui.js", encoding="utf-8") as f:
+        ui_src = f.read()
+    assert "state.summary?.transcript_token_line" in ui_src
 
 
 def test_static_session_load_resumes_manual_compression_polling(cleanup_test_sessions):
