@@ -2306,11 +2306,23 @@ def _collapse_adjacent_duplicate_partials(messages) -> tuple[list, bool]:
     return collapsed, changed
 
 
-def _find_existing_assistant_for_journal_content(session, content: str) -> int | None:
+def _find_existing_assistant_for_journal_content(
+    session,
+    content: str,
+    *,
+    max_index: int | None = None,
+    excluded_indexes: set[int] | None = None,
+) -> int | None:
     candidate = _normalize_journal_recovery_text(content)
     if not candidate:
         return None
-    for idx, message in enumerate(session.messages or []):
+    messages = session.messages or []
+    stop = len(messages) if max_index is None else min(len(messages), max_index)
+    substring_match = None
+    for idx in range(stop):
+        if excluded_indexes and idx in excluded_indexes:
+            continue
+        message = messages[idx]
         if not isinstance(message, dict) or message.get('role') != 'assistant':
             continue
         if message.get('_error'):
@@ -2320,9 +2332,9 @@ def _find_existing_assistant_for_journal_content(session, content: str) -> int |
             continue
         if existing == candidate:
             return idx
-        if len(candidate) >= 24 and candidate in existing:
-            return idx
-    return None
+        if substring_match is None and len(candidate) >= 24 and candidate in existing:
+            substring_match = idx
+    return substring_match
 
 
 def _journal_tool_already_present(
@@ -2394,6 +2406,12 @@ def _run_journal_has_visible_output(session, stream_id: str | None) -> bool:
                 continue
             if str(payload.get('text') or '').strip():
                 return True
+        if event_name == 'reasoning':
+            reasoning_text = str(
+                payload.get('text') or payload.get('reasoning') or payload.get('thinking') or ''
+            )
+            if reasoning_text.strip():
+                return True
         if event_name == 'tool':
             return True
     return False
@@ -2454,9 +2472,10 @@ def _append_journaled_partial_output(
     """Recover already-emitted visible output from a dead stream journal.
 
     This repair path is intentionally conservative: it restores user-visible
-    assistant text and tool-card metadata that had already been emitted over
-    SSE before the WebUI process died. It does not restore hidden reasoning and
-    it does not try to continue execution.
+    assistant text, display-only reasoning, and tool-card metadata that had
+    already been emitted over SSE before the WebUI process died. Restored
+    reasoning stays out of ``context_messages`` so it cannot become provider-
+    facing history. The repair does not try to continue execution.
     """
     if not stream_id:
         return False
@@ -2479,24 +2498,106 @@ def _append_journaled_partial_output(
 
     appended_any = False
     assistant_parts: list[str] = []
+    reasoning_parts: list[str] = []
     assistant_started_at: float | None = None
     current_assistant_idx: int | None = None
     recovered_tool_calls: list[dict] = []
+    initial_message_count = len(session.messages or [])
+    claimed_existing_assistant_indexes: set[int] = set()
+
+    def content_match_can_receive_reasoning(existing_idx: int) -> bool:
+        messages = session.messages or []
+        owner_idx = None
+        for candidate_idx in range(existing_idx - 1, -1, -1):
+            candidate = messages[candidate_idx]
+            if isinstance(candidate, dict) and candidate.get('role') == 'user':
+                owner_idx = candidate_idx
+                break
+        if owner_idx is None:
+            return False
+
+        pending_text = _normalize_journal_recovery_text(session.pending_user_message)
+        owner_text = _normalize_journal_recovery_text(messages[owner_idx].get('content'))
+        if pending_text and owner_text != pending_text:
+            return False
+
+        for candidate_idx in range(existing_idx + 1, initial_message_count):
+            candidate = messages[candidate_idx]
+            if not isinstance(candidate, dict) or candidate.get('role') != 'user':
+                continue
+            candidate_text = _normalize_journal_recovery_text(candidate.get('content'))
+            if pending_text and candidate.get('_recovered') and candidate_text == pending_text:
+                continue
+            return False
+        return True
+
+    def append_context_projection(message: dict) -> None:
+        context_projection = dict(message)
+        context_projection.pop('reasoning', None)
+        _append_recovered_turn_to_context(session, context_projection)
+
+    def attach_display_reasoning(message: dict, reasoning: str) -> bool:
+        if not reasoning:
+            return False
+        existing = str(message.get('reasoning') or '').strip()
+        if existing:
+            return False
+        message['reasoning'] = reasoning
+        return True
 
     def flush_assistant() -> int | None:
-        nonlocal appended_any, assistant_parts, assistant_started_at, current_assistant_idx
+        nonlocal appended_any, assistant_parts, reasoning_parts
+        nonlocal assistant_started_at, current_assistant_idx
         content = ''.join(assistant_parts).strip()
+        reasoning = ''.join(reasoning_parts).strip()
         assistant_parts = []
-        if not content:
+        reasoning_parts = []
+        if not content and not reasoning:
             return current_assistant_idx
-        if dedupe_existing:
-            existing_idx = _find_existing_assistant_for_journal_content(session, content)
+        if dedupe_existing and content:
+            search_excluded = set(claimed_existing_assistant_indexes)
+            existing_idx = None
+            while True:
+                candidate_idx = _find_existing_assistant_for_journal_content(
+                    session,
+                    content,
+                    max_index=initial_message_count,
+                    excluded_indexes=search_excluded,
+                )
+                if candidate_idx is None:
+                    break
+                if not reasoning or content_match_can_receive_reasoning(candidate_idx):
+                    existing_idx = candidate_idx
+                    break
+                search_excluded.add(candidate_idx)
             if existing_idx is not None:
+                claimed_existing_assistant_indexes.add(existing_idx)
                 current_assistant_idx = existing_idx
                 assistant_started_at = None
                 if 0 <= existing_idx < len(session.messages):
-                    _append_recovered_turn_to_context(session, session.messages[existing_idx])
+                    existing_message = session.messages[existing_idx]
+                    append_context_projection(existing_message)
+                    if attach_display_reasoning(existing_message, reasoning):
+                        appended_any = True
                 return existing_idx
+        if dedupe_existing and reasoning and not content:
+            for existing_idx in range(initial_message_count):
+                if existing_idx in claimed_existing_assistant_indexes:
+                    continue
+                existing_message = session.messages[existing_idx]
+                if not isinstance(existing_message, dict):
+                    continue
+                if (
+                    existing_message.get('_recovered_from_run_journal')
+                    and existing_message.get('_recovered_stream_id') == stream_id
+                    and existing_message.get('role') == 'assistant'
+                    and not str(existing_message.get('content') or '').strip()
+                    and str(existing_message.get('reasoning') or '').strip() == reasoning
+                ):
+                    claimed_existing_assistant_indexes.add(existing_idx)
+                    current_assistant_idx = existing_idx
+                    assistant_started_at = None
+                    return existing_idx
         timestamp = int(assistant_started_at or time.time())
         recovered_assistant = {
             'role': 'assistant',
@@ -2505,8 +2606,9 @@ def _append_journaled_partial_output(
             '_recovered_from_run_journal': True,
             '_recovered_stream_id': stream_id,
         }
+        attach_display_reasoning(recovered_assistant, reasoning)
         session.messages.append(recovered_assistant)
-        _append_recovered_turn_to_context(session, recovered_assistant)
+        append_context_projection(recovered_assistant)
         current_assistant_idx = len(session.messages) - 1
         assistant_started_at = None
         appended_any = True
@@ -2559,6 +2661,16 @@ def _append_journaled_partial_output(
         event_name = str(event.get('event') or event.get('type') or '')
         payload = event.get('payload') if isinstance(event.get('payload'), dict) else {}
         created_at = event.get('created_at') if isinstance(event.get('created_at'), (int, float)) else None
+        if event_name == 'reasoning':
+            text = str(
+                payload.get('text') or payload.get('reasoning') or payload.get('thinking') or ''
+            )
+            if not text:
+                continue
+            if not assistant_parts and not reasoning_parts and assistant_started_at is None:
+                assistant_started_at = created_at or time.time()
+            reasoning_parts.append(text)
+            continue
         if event_name == 'token':
             text = str(payload.get('text') or '')
             if not text:
