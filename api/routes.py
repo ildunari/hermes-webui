@@ -2734,6 +2734,7 @@ def _get_cached_session_list_payload(
     stale = cached  # now actually a stale payload when one exists, else None
     stale_reason = _session_list_cache_stale_reason(key) if stale is not None else None
     if stale is not None and stale_reason != "source":
+        rebuild_profile_name = (get_active_profile_name() or "default").strip() or "default"
         event, is_owner = _session_list_cache_claim_rebuild(key)
         if is_owner:
             if diag is not None:
@@ -2744,22 +2745,26 @@ def _get_cached_session_list_payload(
 
             def _rebuild_stale_session_list_cache():
                 try:
-                    rebuild_attempts = 0
-                    while True:
-                        invalidation_stamp = _session_list_cache_invalidation_stamp(key)
-                        try:
-                            payload = builder()
-                        except Exception:
-                            logger.exception(
-                                "session list stale-cache background rebuild failed"
-                            )
-                            return
-                        if _session_list_cache_invalidation_stamp(key) == invalidation_stamp:
-                            _session_list_cache_set(key, payload)
-                            return
-                        rebuild_attempts += 1
-                        if rebuild_attempts >= 3:
-                            return
+                    with profile_scope_for_detached_worker(
+                        rebuild_profile_name,
+                        "session list stale-cache rebuild",
+                    ):
+                        rebuild_attempts = 0
+                        while True:
+                            invalidation_stamp = _session_list_cache_invalidation_stamp(key)
+                            try:
+                                payload = builder()
+                            except Exception:
+                                logger.exception(
+                                    "session list stale-cache background rebuild failed"
+                                )
+                                return
+                            if _session_list_cache_invalidation_stamp(key) == invalidation_stamp:
+                                _session_list_cache_set(key, payload)
+                                return
+                            rebuild_attempts += 1
+                            if rebuild_attempts >= 3:
+                                return
                 finally:
                     _session_list_cache_done(key, event)
 

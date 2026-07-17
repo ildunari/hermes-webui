@@ -274,9 +274,27 @@ def test_session_list_cache_source_changed_owner_rebuilds_while_follower_reuses_
 def test_session_list_cache_owner_returns_stale_and_rebuilds_in_background(monkeypatch):
     routes._session_list_cache_clear()
     monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+    entered_profiles = []
+
+    class _DetachedProfileScope:
+        def __init__(self, profile_name):
+            self.profile_name = profile_name
+
+        def __enter__(self):
+            entered_profiles.append(self.profile_name)
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(routes, "get_active_profile_name", lambda: "work")
+    monkeypatch.setattr(
+        routes,
+        "profile_scope_for_detached_worker",
+        lambda profile_name, _reason: _DetachedProfileScope(profile_name),
+    )
 
     key = routes._session_list_cache_key(
-        active_profile="default",
+        active_profile="work",
         all_profiles=False,
         show_cli_sessions=False,
         show_previous_messaging_sessions=False,
@@ -295,6 +313,7 @@ def test_session_list_cache_owner_returns_stale_and_rebuilds_in_background(monke
     diag = _StageRecorder()
 
     def builder():
+        assert entered_profiles == ["work"]
         started.set()
         release.wait()
         return _session_cache_payload("fresh")
@@ -319,6 +338,7 @@ def test_session_list_cache_owner_returns_stale_and_rebuilds_in_background(monke
             break
         deadline.wait(0.05)
     assert cached == _session_cache_payload("fresh")
+    assert entered_profiles == ["work"]
 
 
 def test_session_list_cache_stale_background_rebuild_failure_releases_owner(monkeypatch):

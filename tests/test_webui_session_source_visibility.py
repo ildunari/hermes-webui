@@ -78,10 +78,10 @@ def test_default_session_list_hides_messaging_and_cron(monkeypatch):
     assert [row["session_id"] for row in payload["sessions"]] == ["webui-1", "cli-1"]
 
 
-def test_source_classifier_treats_bluebubbles_and_webhook_as_messaging():
+def test_source_classifier_keeps_webhook_separate_from_messaging():
     from api.agent_sessions import MESSAGING_SOURCES, normalize_agent_session_source
 
     assert "bluebubbles" in MESSAGING_SOURCES
-    assert "webhook" in MESSAGING_SOURCES
+    assert "webhook" not in MESSAGING_SOURCES
     assert normalize_agent_session_source("bluebubbles")["session_source"] == "messaging"
-    assert normalize_agent_session_source("webhook")["session_source"] == "messaging"
+    assert normalize_agent_session_source("webhook")["session_source"] == "webhook"

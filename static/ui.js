@@ -10198,7 +10198,7 @@ function _isInternalWakeupPendingSession(session,text){
 function getPendingSessionMessage(session, messagesOverride=null){
   const text=String(session?.pending_user_message||'').trim();
   if(!text) return null;
-  if(_isInternalWakeupPendingSession(session,text)) return null;
+  if(typeof _isInternalWakeupPendingSession==='function'&&_isInternalWakeupPendingSession(session,text)) return null;
   const attachments=Array.isArray(session?.pending_attachments)?session.pending_attachments.filter(Boolean):[];
   const sourceMessages=Array.isArray(messagesOverride)?messagesOverride:session?.messages;
   const messages=Array.isArray(sourceMessages)?sourceMessages:[];
@@ -10288,9 +10288,9 @@ function syncTopbar(){
     if(typeof syncAppTitlebar==='function') syncAppTitlebar();
     // Update profile chip even when no session is active (e.g. right after profile switch)
     const _profileLabel=$('profileChipLabel');
-    if(_profileLabel) _profileLabel.textContent=profileDisplayName(S.activeProfile||'default');
+    if(_profileLabel) _profileLabel.textContent=typeof profileDisplayName==='function'?profileDisplayName(S.activeProfile||'default'):(S.activeProfile||'default');
     const _titleLabel=$('titlebarProfileLabel');
-    if(_titleLabel) _titleLabel.textContent=profileDisplayName(S.activeProfile||'default');
+    if(_titleLabel) _titleLabel.textContent=typeof profileDisplayName==='function'?profileDisplayName(S.activeProfile||'default'):(S.activeProfile||'default');
     return;
   }
   const sessionTitle=S.session.title||t('untitled');
@@ -10415,9 +10415,9 @@ function syncTopbar(){
   // scoping project/session operations to the session's own profile — is
   // unaffected by this line.
   const profileLabel=$('profileChipLabel');
-  if(profileLabel) profileLabel.textContent=profileDisplayName(S.activeProfile||'default');
+  if(profileLabel) profileLabel.textContent=typeof profileDisplayName==='function'?profileDisplayName(S.activeProfile||'default'):(S.activeProfile||'default');
   const titleLabel=$('titlebarProfileLabel');
-  if(titleLabel) titleLabel.textContent=profileDisplayName(S.activeProfile||'default');
+  if(titleLabel) titleLabel.textContent=typeof profileDisplayName==='function'?profileDisplayName(S.activeProfile||'default'):(S.activeProfile||'default');
 }
 
 function msgContent(m){

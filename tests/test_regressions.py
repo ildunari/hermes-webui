@@ -621,7 +621,7 @@ def test_chat_start_persists_pending_turn_metadata_for_reload_recovery(cleanup_t
     assert 's.pending_user_message = msg' in routes_src
     assert 's.pending_attachments = attachments' in routes_src
     assert '"active_stream_id": getattr(s, "active_stream_id", None)' in routes_src
-    assert '"pending_user_message": getattr(s, "pending_user_message", None)' in routes_src
+    assert '"pending_user_message": _pending_user_message_for_client(s)' in routes_src
 
 
 def test_session_detail_uses_runtime_streaming_state(cleanup_test_sessions):
