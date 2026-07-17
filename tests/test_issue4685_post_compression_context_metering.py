@@ -1,9 +1,20 @@
 import json
 import subprocess
+import sys
+import types
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _fake_model_metadata(monkeypatch):
+    import agent
+
+    module = types.ModuleType("agent.model_metadata")
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", module)
+    monkeypatch.setattr(agent, "model_metadata", module, raising=False)
+    return module
 
 
 def _run_context_indicator(usage):
@@ -60,7 +71,8 @@ def test_post_compression_estimate_uses_pruned_request_and_preserves_last_prompt
         calls.append((messages, system_prompt, tools))
         return 4_096
 
-    monkeypatch.setattr("agent.model_metadata.estimate_request_tokens_rough", estimate, raising=False)
+    model_metadata = _fake_model_metadata(monkeypatch)
+    model_metadata.estimate_request_tokens_rough = estimate
     pruned = [{"role": "assistant", "content": "summary"}]
     agent = type("Agent", (), {"tools": [{"name": "read_file"}]})()
 
@@ -77,7 +89,8 @@ def test_post_compression_estimate_includes_prefill_and_ephemeral_system_context
         calls.append((messages, system_prompt, tools))
         return 5_120
 
-    monkeypatch.setattr("agent.model_metadata.estimate_request_tokens_rough", estimate, raising=False)
+    model_metadata = _fake_model_metadata(monkeypatch)
+    model_metadata.estimate_request_tokens_rough = estimate
     prefill = [{"role": "user", "content": "prefill"}]
     pruned = [{"role": "assistant", "content": "summary"}]
     agent = type(
@@ -106,8 +119,8 @@ def test_post_compression_estimate_falls_back_when_request_estimator_is_unavaila
         calls.append(messages)
         return len(messages) * 100
 
-    monkeypatch.delattr("agent.model_metadata.estimate_request_tokens_rough", raising=False)
-    monkeypatch.setattr("agent.model_metadata.estimate_messages_tokens_rough", estimate_messages, raising=False)
+    model_metadata = _fake_model_metadata(monkeypatch)
+    model_metadata.estimate_messages_tokens_rough = estimate_messages
     pruned = [{"role": "assistant", "content": "summary"}]
     agent = type("Agent", (), {"tools": [{"name": "read_file"}]})()
 
@@ -125,9 +138,8 @@ def test_post_compression_estimate_uses_compressor_budget_counter_without_metada
     from api.streaming import _estimate_post_compression_context_tokens
 
     context_compressor = pytest.importorskip("agent.context_compressor")
+    _fake_model_metadata(monkeypatch)
 
-    monkeypatch.delattr("agent.model_metadata.estimate_request_tokens_rough", raising=False)
-    monkeypatch.delattr("agent.model_metadata.estimate_messages_tokens_rough", raising=False)
     pruned = [{"role": "assistant", "content": "summary"}]
     agent = type("Agent", (), {"tools": [{"name": "read_file"}]})()
     expected_messages = [

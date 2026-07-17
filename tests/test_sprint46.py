@@ -67,6 +67,14 @@ def _install_fake_compression_runtime(monkeypatch, agent_cls):
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
+    import agent
+
+    if "agent.model_metadata" not in sys.modules:
+        fake_model_metadata = types.ModuleType("agent.model_metadata")
+        fake_model_metadata.estimate_messages_tokens_rough = lambda messages: len(messages) * 100
+        monkeypatch.setitem(sys.modules, "agent.model_metadata", fake_model_metadata)
+        monkeypatch.setattr(agent, "model_metadata", fake_model_metadata, raising=False)
+
     import api.config as _cfg
     fake_runtime_provider = types.ModuleType("hermes_cli.runtime_provider")
     fake_runtime_provider.resolve_runtime_provider = lambda requested=None: {
