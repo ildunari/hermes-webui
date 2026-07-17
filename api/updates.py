@@ -24,7 +24,9 @@ from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlparse
 
+from api.agent_health import get_active_profile_gateway_running_pid
 from api.gateway_restart import restart_active_profile_gateway
+from api.profiles import get_active_profile_name
 from api.config import REPO_ROOT, STREAMS, STREAMS_LOCK
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,7 @@ _cache_lock = threading.Lock()
 _check_in_progress = False
 _apply_lock = threading.Lock()   # prevents concurrent stash/pull/pop on same repo
 CACHE_TTL = 1800  # 30 minutes
+_AGENT_GATEWAY_RESTART_RETRY_DELAY_S = 1.0
 _GIT_DIAGNOSTIC_MAX_CHARS = 300
 _CREDENTIAL_IN_URL_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@\s'\"]+)@")
 _GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
@@ -58,6 +61,7 @@ _FETCH_NETWORK_FAILURE_SIGNATURES = (
     'tls connection was non-properly terminated',
     'ssl certificate problem',
 )
+_RELEASE_TAG_RE = re.compile(r'^v[0-9][0-9A-Za-z.+-]*$')
 # Phrases git emits when its own short-lived index/refs lock files block a
 # subsequent operation. Tuned to match only the true "lock file already exists"
 # semantics that warrant a lock-conflict response -- v2 deliberately drops the
@@ -272,7 +276,7 @@ def _inventory_locks(path: Path) -> dict:
     try:
         for entry in sorted(git_dir.rglob('*.lock')):
             try:
-                rel = str(entry.relative_to(git_dir))
+                rel = entry.relative_to(git_dir).as_posix()
             except ValueError:
                 continue
             if rel == 'index.lock':
@@ -787,6 +791,101 @@ def _count_channel_tags_ahead(path, channel=DEFAULT_UPDATE_CHANNEL):
     return sum(1 for line in out.splitlines() if line.strip())
 
 
+def _release_tag_sort_key(tag):
+    """Return a version-sort key that keeps release tags newest-first."""
+    raw = str(tag or '').strip()
+    if raw.startswith('v'):
+        raw = raw[1:]
+    parts = []
+    for chunk in re.split(r'(\d+)', raw):
+        if not chunk:
+            continue
+        parts.append((0, int(chunk)) if chunk.isdigit() else (1, chunk.lower()))
+    return tuple(parts)
+
+
+def _is_stable_release_tag(tag):
+    """Return True for stable release tags and False for prerelease tags."""
+    raw = str(tag or '').strip()
+    return bool(_RELEASE_TAG_RE.fullmatch(raw) and '-' not in raw[1:])
+
+
+def _github_release_tags(url='https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100', *, timeout=3.0):
+    """Return GitHub release tags newest-first, including commit SHAs when available."""
+    request = urllib.request.Request(
+        url,
+        headers={
+            'Accept': 'application/vnd.github+json',
+            'User-Agent': 'hermes-webui',
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode('utf-8'))
+    if not isinstance(payload, list):
+        return []
+    tags = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        name = item.get('name')
+        if not isinstance(name, str):
+            continue
+        name = name.strip()
+        if not _is_stable_release_tag(name):
+            continue
+        commit = item.get('commit')
+        sha = None
+        if isinstance(commit, dict):
+            commit_sha = commit.get('sha')
+            if isinstance(commit_sha, str):
+                commit_sha = commit_sha.strip()
+                if commit_sha:
+                    sha = commit_sha
+        tags.append({'name': name, 'sha': sha})
+    return sorted(tags, key=lambda item: _release_tag_sort_key(item['name']), reverse=True)
+
+
+def _check_webui_published_release_update():
+    """Return a manual-update payload when the baked WebUI version trails GitHub tags."""
+    current_version = str(WEBUI_VERSION or '').strip()
+    if not _RELEASE_TAG_RE.fullmatch(current_version):
+        return None
+    try:
+        tags = _github_release_tags()
+    except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+    if not tags:
+        return None
+
+    tag_names = [item['name'] for item in tags]
+    if current_version not in tag_names:
+        return None
+
+    latest = tags[0]
+    latest_version = latest['name']
+    behind = _release_gap(tag_names, current_version, latest_version)
+    if behind <= 0:
+        return None
+
+    current = next((item for item in tags if item['name'] == current_version), None) or {}
+    current_ref = current.get('sha') or current_version
+    latest_ref = latest.get('sha') or latest_version
+    repo_url = 'https://github.com/nesquena/hermes-webui'
+    return {
+        'name': 'webui',
+        'behind': behind,
+        'current_sha': current_ref,
+        'latest_sha': latest_ref,
+        'branch': latest_version,
+        'repo_url': repo_url,
+        'release_based': True,
+        'current_version': current_version,
+        'latest_version': latest_version,
+        'compare_url': _build_compare_url(repo_url, current_ref, latest_ref),
+        'manual_update': True,
+    }
+
+
 def _head_is_past_latest_tag(path, current_tag, channel=DEFAULT_UPDATE_CHANNEL):
     """Return True when HEAD has moved past the latest reachable channel tag.
 
@@ -1112,6 +1211,12 @@ def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
     """
     channel = _normalize_channel(channel)
     if path is None or not (path / '.git').exists():
+        if name == 'webui':
+            release_info = _check_webui_published_release_update()
+            if release_info is not None:
+                release_info = dict(release_info)
+                release_info['no_git'] = True
+                return release_info
         return {
             'name': name,
             'behind': None,
@@ -1712,11 +1817,62 @@ def _ensure_gateway_restart_for_agent_update() -> tuple[bool, dict]:
         - ok is False when restart did not complete and callers must abort success.
         - restart_payload contains helper status fields for response shaping.
     """
-    restart_result = restart_active_profile_gateway()
+    target_profile = str(get_active_profile_name() or "default").strip() or "default"
+    gateway_pid_before_restart = get_active_profile_gateway_running_pid(profile=target_profile)
+    restart_result = restart_active_profile_gateway(profile=target_profile)
     status = str(restart_result.get("status") or "")
     if status in {"completed", "in_progress"}:
         return True, restart_result
-    return False, restart_result
+    if status != "failed":
+        return False, restart_result
+
+    # launchd can briefly fail to spawn the replacement gateway while it is
+    # rotating the supervised process (#6045). Retry exactly once after a
+    # bounded delay so an already-applied Agent update is not reported as a
+    # complete failure because of that transient process handoff.
+    time.sleep(_AGENT_GATEWAY_RESTART_RETRY_DELAY_S)
+    retry_result = restart_active_profile_gateway(profile=target_profile)
+    retry_status = str(retry_result.get("status") or "")
+    if retry_status in {"completed", "in_progress"}:
+        return True, {
+            **retry_result,
+            "retry_attempted": True,
+            "initial_failure": restart_result.get("message"),
+        }
+    if retry_status != "failed":
+        return False, {
+            **retry_result,
+            "retry_attempted": True,
+            "initial_failure": restart_result.get("message"),
+        }
+
+    # A restart command can still exit non-zero after launchd has recovered the
+    # service. Only accept that recovery when the confirmed local PID changed;
+    # a merely-alive old gateway has not loaded the updated Agent checkout.
+    time.sleep(_AGENT_GATEWAY_RESTART_RETRY_DELAY_S)
+    gateway_pid_after_retry = get_active_profile_gateway_running_pid(profile=target_profile)
+    if (
+        gateway_pid_before_restart is not None
+        and gateway_pid_after_retry is not None
+        and gateway_pid_after_retry != gateway_pid_before_restart
+    ):
+        return True, {
+            "status": "completed",
+            "message": "Gateway service recovered after a transient restart failure",
+            "retry_attempted": True,
+            "process_replaced": True,
+            "initial_failure": restart_result.get("message"),
+            "retry_failure": retry_result.get("message"),
+        }
+
+    initial_message = str(restart_result.get("message") or "Restart failed")
+    retry_message = str(retry_result.get("message") or "retry did not complete")
+    return False, {
+        **retry_result,
+        "message": f"{initial_message}; recovery retry did not complete: {retry_message}",
+        "retry_attempted": True,
+        "initial_failure": restart_result.get("message"),
+    }
 
 
 def _agent_gateway_restart_failure_message(target: str, restart_result: dict) -> str:

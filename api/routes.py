@@ -34,6 +34,11 @@ from contextlib import closing
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
+from api.agent_runtime import (
+    AgentRuntimeChangedError,
+    ensure_agent_runtime_current,
+    require_ai_agent_class,
+)
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     _looks_like_default_cli_title,
@@ -55,6 +60,7 @@ from api.session_events import (
     unsubscribe_session_events,
 )
 from api.gateway_restart import restart_active_profile_gateway
+from api.shares import create_or_refresh_share, load_share, revoke_share
 
 logger = logging.getLogger(__name__)
 
@@ -5005,6 +5011,146 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
     return s
 
 
+def _share_snapshot_messages_for_session(session, *, cli_meta: dict | None = None) -> list:
+    """Return the visible transcript that a public share should snapshot.
+
+    External sessions (Telegram/Discord/Slack/CLI/etc.) may have no WebUI sidecar
+    or may persist only local metadata in the sidecar while the transcript lives
+    in state.db. Public sharing should snapshot the same visible conversation the
+    session page renders, not the bare local sidecar payload.
+    """
+    sid = str(getattr(session, "session_id", "") or "").strip()
+    current_messages = list(getattr(session, "messages", None) or [])
+    if not sid:
+        return current_messages
+    profile = getattr(session, "profile", None)
+    is_messaging = (
+        _is_messaging_session_record(session)
+        or _is_messaging_session_record(cli_meta)
+    )
+    if is_messaging or not current_messages:
+        cli_messages = get_cli_session_messages(sid, profile=profile)
+        if cli_messages:
+            if is_messaging:
+                return _merged_session_messages_for_display(session, cli_messages)
+            return list(cli_messages)
+    return current_messages
+
+
+def _build_share_metadata_sidecar(
+    sid: str,
+    snapshot_session,
+    *,
+    cli_meta: dict | None = None,
+):
+    """Create a minimal WebUI sidecar for share metadata on external sessions."""
+    cli_meta = dict(cli_meta or {})
+    workspace = (
+        cli_meta.get("workspace")
+        or cli_meta.get("cwd")
+        or getattr(snapshot_session, "workspace", None)
+    )
+    if not workspace:
+        workspace = get_last_workspace()
+    session = Session(
+        session_id=sid,
+        title=(
+            cli_meta.get("title")
+            or getattr(snapshot_session, "title", None)
+            or title_from(getattr(snapshot_session, "messages", None) or [], "CLI Session")
+        ),
+        workspace=workspace,
+        messages=[],
+        model=cli_meta.get("model") or getattr(snapshot_session, "model", None) or "unknown",
+        model_provider=(
+            cli_meta.get("model_provider")
+            or getattr(snapshot_session, "model_provider", None)
+        ),
+        created_at=cli_meta.get("created_at") or getattr(snapshot_session, "created_at", None),
+        updated_at=cli_meta.get("updated_at") or getattr(snapshot_session, "updated_at", None),
+        profile=cli_meta.get("profile") or getattr(snapshot_session, "profile", None),
+    )
+    session.is_cli_session = bool(
+        getattr(snapshot_session, "is_cli_session", False)
+        or is_cli_session_row(cli_meta)
+    )
+    session.source_tag = cli_meta.get("source_tag") or getattr(snapshot_session, "source_tag", None)
+    session.raw_source = (
+        cli_meta.get("raw_source")
+        or getattr(snapshot_session, "raw_source", None)
+        or session.source_tag
+    )
+    session.session_source = (
+        cli_meta.get("session_source")
+        or getattr(snapshot_session, "session_source", None)
+    )
+    session.source_label = (
+        cli_meta.get("source_label")
+        or getattr(snapshot_session, "source_label", None)
+    )
+    session.read_only = bool(
+        cli_meta.get("read_only") or getattr(snapshot_session, "read_only", False)
+    )
+    for attr in (
+        "user_id",
+        "chat_id",
+        "chat_type",
+        "thread_id",
+        "session_key",
+        "platform",
+        "origin_chat_id",
+        "origin_user_id",
+        "parent_session_id",
+    ):
+        value = cli_meta.get(attr)
+        if value is None:
+            value = getattr(snapshot_session, attr, None)
+        if value is not None:
+            setattr(session, attr, value)
+    return session
+
+
+def _resolve_share_session_pair(sid: str, handler):
+    """Resolve a shareable session plus the sidecar that stores share metadata.
+
+    Returns ``(snapshot_session, stored_session_or_none, cli_meta)``. The
+    snapshot session always carries the transcript that should become the public
+    share payload. ``stored_session`` is the WebUI-owned sidecar to mutate for
+    share_token/share_created_at persistence; it may be absent for pure external
+    sessions that have not yet created local metadata.
+    """
+    try:
+        stored_session = get_session(sid)
+        cli_meta = (
+            _lookup_cli_session_metadata(sid)
+            if _session_requires_cli_metadata_lookup(stored_session)
+            else {}
+        )
+        effective_profile = (
+            (cli_meta or {}).get("profile")
+            or getattr(stored_session, "profile", None)
+            or None
+        )
+        if not _session_visible_to_active_profile(effective_profile, handler):
+            raise KeyError(sid)
+        stored_session = _ensure_full_session_before_mutation(sid, stored_session)
+        snapshot_session = copy.copy(stored_session)
+        snapshot_session.messages = _share_snapshot_messages_for_session(
+            stored_session,
+            cli_meta=cli_meta,
+        )
+        return snapshot_session, stored_session, cli_meta or {}
+    except KeyError:
+        cli_meta = _lookup_cli_session_metadata(sid) or {}
+        effective_profile = cli_meta.get("profile") or None
+        if not _session_visible_to_active_profile(effective_profile, handler):
+            raise KeyError(sid) from None
+        synth, reason = _claim_or_synthesize_cli_session(sid, cli_meta=cli_meta)
+        if reason == "was_webui" or synth is None:
+            raise KeyError(sid) from None
+        return synth, None, cli_meta
+
+
 def _reconcile_stale_stream_state_for_session_rows(session_rows) -> bool:
     """Clear stale persisted stream fields before /api/sessions serializes rows."""
     changed = False
@@ -7447,6 +7593,39 @@ def _rescale_threshold_tokens_for_context_window(
     return max(1, int(threshold * new_window / old_window))
 
 
+def _worktree_default_from_config(profile: str | None) -> bool:
+    """Return the agent's config-level ``worktree:`` default for *profile*.
+
+    The agent CLI honors ``worktree: true`` in config.yaml for every session
+    it creates (``use_worktree = worktree or w or CLI_CONFIG.get("worktree",
+    False)``).  /api/session/new consults this only when the request body has
+    no explicit ``worktree`` key, so both entry points to the same repo agree
+    on isolation (#6022).  Explicit body values always win.
+
+    Profile-aware on purpose: the WebUI serves multiple profiles from one
+    process, and a user with ``worktree: true`` in one profile but not another
+    expects per-profile behavior.  ``get_config_for_profile_home`` handles the
+    ambient/common case via the mtime-tracked cache and reads a diverging
+    profile's config.yaml directly off disk (see #3294).
+    """
+    try:
+        if profile:
+            from api.profiles import get_hermes_home_for_profile
+
+            cfg_dict = get_config_for_profile_home(get_hermes_home_for_profile(profile))
+        else:
+            cfg_dict = get_config_for_profile_home(None)
+        # Strict boolean: only a real YAML `true` opts in.  Any other shape
+        # ("true", 1, [], {}, null, ...) is malformed for this key and must
+        # fall to the safe no-worktree default rather than truthiness-coerce
+        # into minting worktrees.
+        return (cfg_dict or {}).get("worktree", False) is True
+    except Exception:
+        # Config resolution must never break session creation.
+        logger.warning("failed to read worktree config default", exc_info=True)
+        return False
+
+
 def _session_model_state_from_request(
     model: str | None,
     requested_provider: str | None,
@@ -8281,6 +8460,42 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None, expan
 
 
 _LIMITED_TOOL_CONTENT_MAX_CHARS = 4096
+# Defensive row backstop for the GET /api/session display path's state.db read.
+# This is NOT a semantic window (the display window counts visible rows
+# post-reconciliation via _message_window_for_display); it is a safety net so a
+# pathological/huge state.db cannot materialize unbounded rows into memory on the
+# display path. Legitimate sessions stay far below this; the compressed-session
+# case where _state_db_since_timestamp_for_limited_display bails (and would
+# otherwise full-scan) is the main beneficiary. Generous on purpose: no real
+# conversation approaches it, and the existing since_timestamp optimization
+# already handles the common tail-load case. The full-history model-context
+# callers (reconciliation, new-turn context) do NOT use this cap.
+_STATE_DB_DISPLAY_ROW_BACKSTOP = 50000
+
+
+def _state_db_backstop_limit_for_display(session, msg_before) -> int | None:
+    """Return the row backstop to apply to the display path's state.db read, or
+    ``None`` for an uncapped (full-history) read.
+
+    The backstop is a defensive net against a pathological/huge state.db, NOT a
+    semantic window. It is applied ONLY on provably-safe reads where no
+    ``truncation_boundary`` prefix is required for the merge:
+    ``merge_session_messages_append_only`` needs the rows at/around the session's
+    ``truncation_boundary`` to reconcile correctly, and a newest-N-only SQL cap
+    would drop those boundary rows for a >N-row session and corrupt the merge
+    (silently losing the preserved prefix). So this mirrors the same conditions
+    ``_state_db_since_timestamp_for_limited_display`` uses to decide a read is
+    boundary-free: not ``msg_before`` paging, and no ``truncation_watermark`` /
+    ``truncation_boundary``. Extracted for direct test coverage.
+    """
+    has_boundary_prefix = (
+        msg_before is not None
+        or getattr(session, "truncation_watermark", None) not in (None, "")
+        or getattr(session, "truncation_boundary", None) not in (None, "")
+    )
+    return None if has_boundary_prefix else _STATE_DB_DISPLAY_ROW_BACKSTOP
+
+
 _LIMITED_TOOL_CONTENT_NOTICE = (
     "\n\n[Tool output truncated in paginated session response; "
     "load the full transcript to inspect the complete result.]"
@@ -8397,6 +8612,24 @@ def _state_db_since_timestamp_for_limited_display(session, msg_limit, msg_before
         return None, sidecar_messages
 
     floor = min(sidecar_timestamps[-raw_budget:])
+    sidecar_before_count = sum(1 for ts in sidecar_timestamps if ts < floor)
+    prefix_summary = get_state_db_session_message_prefix_summary(
+        getattr(session, "session_id", None),
+        floor,
+        profile=getattr(session, "profile", None) or None,
+    )
+    if prefix_summary is None:
+        return None, sidecar_messages
+    try:
+        state_before_count = int(prefix_summary["count"])
+        null_timestamp_count = int(prefix_summary["null_timestamp_count"])
+    except (KeyError, TypeError, ValueError):
+        return None, sidecar_messages
+    if null_timestamp_count or state_before_count != sidecar_before_count:
+        return None, sidecar_messages
+    if sidecar_before_count == 0:
+        return floor, sidecar_messages
+
     sidecar_before_keys = [
         _session_message_visible_key(msg)
         for msg, ts in zip(sidecar_messages, sidecar_timestamps, strict=True)
@@ -9032,6 +9265,7 @@ from api.models import (
     get_cli_sessions,
     get_cli_session_messages,
     get_state_db_session_messages,
+    get_state_db_session_message_prefix_summary,
     get_state_db_session_message_keys_before_timestamp,
     get_state_db_session_summary,
     merge_session_messages_append_only,
@@ -9371,6 +9605,7 @@ def _session_attention_summary(session_id: str) -> dict | None:
     """Return sidebar attention metadata for pending approval/clarify work."""
     approval_count = 0
     with _lock:
+        reconcile_gateway_pending_mirror_locked(session_id)
         queue_list = _pending.get(session_id)
         if isinstance(queue_list, list):
             approval_count = len(queue_list)
@@ -9475,8 +9710,28 @@ def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None
     }
     if isinstance(item.get("title"), str):
         item["title"] = _redact_text(item["title"], _enabled=redact_enabled)
+    _redact_sidebar_title_fields(item, redact_enabled)
     item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
     return item
+
+
+def _redact_sidebar_title_fields(item: dict, redact_enabled: bool | None = None) -> None:
+    """Redact every user-content-derived title field on a sidebar/search row in place.
+
+    `title` is redacted by the callers directly (they special-case it), but
+    `display_title`, `_state_db_title`, and `parent_title` can ALSO carry raw
+    user-message-derived text — e.g. #6056 derives a delegated subagent's
+    `display_title` from its first user message, and `parent_title` copies a
+    parent session's (possibly derived) title. Without this a credential-shaped
+    value in a delegated goal would surface in the sidebar / search results even
+    with `api_redact_enabled=True`. Shared by `_sidebar_session_response_item`
+    (`/api/sessions`) and every `/api/sessions/search` response branch so the two
+    endpoints can never drift on which fields get redacted.
+    """
+    for field in ("display_title", "_state_db_title", "parent_title"):
+        value = item.get(field)
+        if isinstance(value, str):
+            item[field] = _redact_text(value, _enabled=redact_enabled)
 
 
 # ── Login page locale strings ─────────────────────────────────────────────────
@@ -11606,6 +11861,8 @@ def handle_get(handler, parsed) -> bool:
 
                 if is_auth_enabled():
                     cookie_val = parse_cookie(handler)
+                    if not cookie_val:
+                        cookie_val = getattr(handler, "_trusted_auth_session_cookie_value", None)
                     if cookie_val and verify_session(cookie_val):
                         csrf_token = csrf_token_for_session(cookie_val) or ""
             except Exception:
@@ -11624,6 +11881,17 @@ def handle_get(handler, parsed) -> bool:
             )
         except Exception as exc:
             return _serve_shell_unavailable(handler, exc)
+
+    if parsed.path == "/share" or parsed.path.startswith("/share/"):
+        share_path = (Path(__file__).parent.parent / "static" / "share.html").resolve()
+        return t(
+            handler,
+            share_path.read_text(encoding="utf-8"),
+            content_type="text/html; charset=utf-8",
+            extra_headers={
+                "X-Robots-Tag": "noindex, nofollow",
+            },
+        )
 
     if parsed.path == "/login":
         _settings = load_settings()
@@ -11711,19 +11979,27 @@ def handle_get(handler, parsed) -> bool:
         return True
 
     if parsed.path == "/api/auth/status":
-        from api.auth import _passkey_feature_flag_enabled, get_password_hash, is_auth_enabled, is_oidc_auth_enabled, parse_cookie, verify_session
+        from api.auth import (
+            _passkey_feature_flag_enabled,
+            ensure_trusted_auth_session,
+            get_password_hash,
+            is_auth_enabled,
+            is_oidc_auth_enabled,
+            is_trusted_auth_enabled,
+        )
         from api.passkeys import registered_credentials
 
         logged_in = False
+        session_info = None
         auth_enabled = is_auth_enabled()
         oidc_enabled = is_oidc_auth_enabled()
         if auth_enabled:
-            cv = parse_cookie(handler)
-            logged_in = bool(cv and verify_session(cv))
+            session_info = ensure_trusted_auth_session(handler)
+            logged_in = bool(session_info)
         passkey_flag = _passkey_feature_flag_enabled()
         passkeys = registered_credentials() if passkey_flag else []
         password_auth_enabled = get_password_hash() is not None
-        return j(handler, {
+        payload = {
             "auth_enabled": auth_enabled,
             "logged_in": logged_in,
             "oidc_enabled": oidc_enabled,
@@ -11733,7 +12009,28 @@ def handle_get(handler, parsed) -> bool:
             "passkeys_count": len(passkeys),
             "passkey_feature_flag": passkey_flag,
             "auth_disabled_acknowledged": bool(load_settings().get("auth_disabled_acknowledged")) if not auth_enabled else False,
-        })
+        }
+        if is_trusted_auth_enabled() or (session_info and session_info.get("auth_type") == "trusted"):
+            payload["trusted_auth_enabled"] = True
+        if session_info and session_info.get("auth_type") == "trusted":
+            payload["auth_type"] = session_info.get("auth_type")
+            payload["user"] = session_info.get("username")
+            payload["bound_profile"] = session_info.get("bound_profile")
+        return j(handler, payload)
+
+    if parsed.path.startswith("/api/share/"):
+        token = parsed.path[len("/api/share/"):].strip()
+        share = load_share(token)
+        if not share:
+            return bad(handler, "Shared conversation not found", 404)
+        return j(
+            handler,
+            {"share": share},
+            extra_headers={
+                "Cache-Control": "no-store",
+                "X-Robots-Tag": "noindex, nofollow",
+            },
+        )
 
     if parsed.path in ("/manifest.json", "/manifest.webmanifest"):
         return _serve_manifest(handler)
@@ -12204,6 +12501,14 @@ def handle_get(handler, parsed) -> bool:
                 _state_db_reader_kwargs = {"profile": _session_profile}
                 if state_db_since_timestamp is not None:
                     _state_db_reader_kwargs["since_timestamp"] = state_db_since_timestamp
+                # Apply the display-path row backstop ONLY on provably-safe
+                # reads where no truncation_boundary prefix is required for the
+                # merge — see _state_db_backstop_limit_for_display. Compressed
+                # sessions and msg_before paging need their full prefix rows for
+                # correct reconciliation, so those stay uncapped.
+                _backstop = _state_db_backstop_limit_for_display(s, msg_before)
+                if _backstop is not None:
+                    _state_db_reader_kwargs["limit"] = _backstop
                 state_db_messages = get_state_db_session_messages(
                     sid,
                     **_state_db_reader_kwargs,
@@ -13523,7 +13828,12 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/updates/check":
         settings = load_settings()
         if not settings.get("check_for_updates", True):
-            return j(handler, {"disabled": True})
+            force = bool(body.get("force", False)) if isinstance(body, dict) else False
+            if force:
+                # Manual force-check bypasses auto-check toggle (#6082)
+                pass
+            else:
+                return j(handler, {"disabled": True})
         include_agent_updates = not bool(settings.get("ignore_agent_updates"))
         force = bool(body.get("force", False))
         # Allow the client to pass the channel explicitly in the POST body. This
@@ -13640,16 +13950,116 @@ def handle_post(handler, parsed) -> bool:
         _save_saved_prompts(prompts)
         return j(handler, {"ok": True, "prompt": new_prompt})
 
+    if parsed.path == "/api/share/create":
+        sid = str(body.get("session_id") or "").strip()
+        if not sid:
+            return bad(handler, "session_id is required", 400)
+        try:
+            snapshot_session, stored_session, cli_meta = _resolve_share_session_pair(sid, handler)
+        except KeyError:
+            return bad(handler, "Session not found", 404)
+        try:
+            share_meta = create_or_refresh_share(snapshot_session)
+        except ValueError as exc:
+            return bad(handler, str(exc), 400)
+        persisted_session = stored_session
+        if persisted_session is None:
+            persisted_session = _build_share_metadata_sidecar(
+                sid,
+                snapshot_session,
+                cli_meta=cli_meta,
+            )
+        persisted_session.share_token = share_meta["share_token"]
+        persisted_session.share_created_at = share_meta["share_created_at"]
+        persisted_session.save(touch_updated_at=False)
+        _publish_session_list_changed(
+            "session_share_create",
+            profile=getattr(persisted_session, "profile", None),
+            session_id=sid,
+        )
+        response_session = copy.copy(persisted_session)
+        response_session.messages = list(getattr(snapshot_session, "messages", None) or [])
+        return j(
+            handler,
+            {
+                "ok": True,
+                "share": {
+                    "token": share_meta["share_token"],
+                    "url": f"/share/{share_meta['share_token']}",
+                    "title": share_meta["share_title"],
+                    "message_count": share_meta["share_message_count"],
+                    "created_at": share_meta["share_created_at"],
+                    "updated_at": share_meta["share_updated_at"],
+                },
+                "session": response_session.compact() | {"messages": response_session.messages},
+            },
+        )
+
+    if parsed.path == "/api/share/revoke":
+        sid = str(body.get("session_id") or "").strip()
+        if not sid:
+            return bad(handler, "session_id is required", 400)
+        try:
+            snapshot_session, stored_session, cli_meta = _resolve_share_session_pair(sid, handler)
+        except KeyError:
+            return bad(handler, "Session not found", 404)
+        target_session = stored_session
+        if target_session is None:
+            token = str(getattr(snapshot_session, "share_token", "") or "").strip()
+            if not token:
+                return bad(handler, "Session not found", 404)
+            target_session = _build_share_metadata_sidecar(
+                sid,
+                snapshot_session,
+                cli_meta=cli_meta,
+            )
+            target_session.share_token = token
+            target_session.share_created_at = getattr(snapshot_session, "share_created_at", None)
+        revoke_share(target_session)
+        target_session.share_token = None
+        target_session.share_created_at = None
+        target_session.save(touch_updated_at=False)
+        _publish_session_list_changed(
+            "session_share_revoke",
+            profile=getattr(target_session, "profile", None),
+            session_id=sid,
+        )
+        response_session = copy.copy(target_session)
+        response_session.messages = list(getattr(snapshot_session, "messages", None) or [])
+        return j(
+            handler,
+            {
+                "ok": True,
+                "session": response_session.compact() | {"messages": response_session.messages},
+            },
+        )
+
     if parsed.path == "/api/session/new":
         try:
             workspace = str(resolve_trusted_workspace(body.get("workspace"))) if body.get("workspace") else None
         except (TypeError, ValueError) as e:
             return bad(handler, str(e))
         worktree_info = None
-        worktree_requested = (
-            body.get("worktree") is True
-            or str(body.get("worktree")).strip().lower() in {"1", "true", "yes", "on"}
-        )
+        worktree_skipped = None
+        # Three-value worktree model (#6022): an explicit body value always
+        # wins; an ABSENT key falls back to the agent's config-level
+        # ``worktree:`` default so WebUI sessions and CLI sessions agree on
+        # isolation for the same repo.  Clients that must never create a
+        # worktree (e.g. the boot-time auto-bind) send ``worktree: false``
+        # explicitly.
+        raw_worktree = body.get("worktree")
+        # Presence-based, not truthiness-based: a client that sends the key at
+        # all (even ``worktree: null``) has spoken explicitly and never falls
+        # through to the config default.  ``null`` parses as non-true below,
+        # i.e. an explicit opt-out — only a genuinely ABSENT key inherits.
+        worktree_explicit = "worktree" in body
+        if worktree_explicit:
+            worktree_requested = (
+                raw_worktree is True
+                or str(raw_worktree).strip().lower() in {"1", "true", "yes", "on"}
+            )
+        else:
+            worktree_requested = _worktree_default_from_config(body.get("profile") or None)
         if worktree_requested:
             try:
                 from api.worktrees import create_worktree_for_workspace
@@ -13659,7 +14069,15 @@ def handle_post(handler, parsed) -> bool:
                 worktree_info = create_worktree_for_workspace(base_workspace)
                 workspace = worktree_info["path"]
             except (TypeError, ValueError) as e:
-                return bad(handler, str(e), status=400)
+                # Explicit requests keep the hard failure.  A config-default
+                # request on a non-git workspace (create_worktree_for_workspace
+                # raises ValueError) degrades to a plain session instead —
+                # otherwise `worktree: true` in config.yaml would 400 every
+                # session in every non-git directory.
+                if worktree_explicit:
+                    return bad(handler, str(e), status=400)
+                worktree_info = None
+                worktree_skipped = str(e)
             except Exception as e:
                 logger.exception("failed to create worktree-backed session")
                 return bad(handler, f"Failed to create worktree: {e}", status=500)
@@ -13742,7 +14160,12 @@ def handle_post(handler, parsed) -> bool:
                 profile=getattr(s, "profile", None),
                 session_id=getattr(s, "session_id", None),
             )
-        return j(handler, {"session": s.compact() | {"messages": s.messages}})
+        payload = {"session": s.compact() | {"messages": s.messages}}
+        if worktree_skipped:
+            # Config-default worktree was skipped (non-git workspace); tell the
+            # client the session is plain so the UI doesn't assume isolation.
+            payload["worktree_skipped"] = worktree_skipped
+        return j(handler, payload)
 
     if parsed.path == "/api/session/compression-recovery/start":
         return _handle_session_compression_recovery_start(handler, body)
@@ -14354,15 +14777,24 @@ def handle_post(handler, parsed) -> bool:
             logger.debug("Failed to close workspace terminal for deleted session %s", sid)
         # Also delete from CLI state.db for CLI sessions shown in sidebar,
         # but never erase external messaging channel memory via WebUI delete.
+        state_db_cleanup_failed = False
         if not is_messaging_session:
             try:
                 from api.models import delete_cli_session
 
-                delete_cli_session(sid)
+                state_db_cleanup_failed = not delete_cli_session(sid)
             except Exception:
-                logger.debug("Failed to delete CLI session %s", sid)
+                state_db_cleanup_failed = True
+                logger.warning("Failed to delete CLI session %s", sid, exc_info=True)
         _publish_session_list_changed("session_delete", profile=event_profile)
-        return j(handler, {"ok": True, **worktree_retained})
+        return j(
+            handler,
+            {
+                "ok": True,
+                "state_db_cleanup_failed": state_db_cleanup_failed,
+                **worktree_retained,
+            },
+        )
 
     if parsed.path == "/api/session/clear":
         try:
@@ -14919,10 +15351,17 @@ def handle_post(handler, parsed) -> bool:
         if not name:
             return bad(handler, "name is required")
         try:
+            from api.auth import ensure_trusted_auth_session
             from api.profiles import switch_profile, _validate_profile_name
             from api.helpers import build_profile_cookie
             if name != 'default':
                 _validate_profile_name(name)
+            session_info = ensure_trusted_auth_session(handler)
+            if getattr(handler, '_trusted_auth_session_rejected', False):
+                return bad(handler, 'Authentication required', 401)
+            bound_profile = str((session_info or {}).get("bound_profile") or "").strip() or None
+            if bound_profile and name != bound_profile:
+                return bad(handler, "Profile is bound to the current session", 403)
             # process_wide=False: don't mutate the process-global _active_profile.
             # Per-client profile is managed via cookie + thread-local (#798).
             result = switch_profile(name, process_wide=False)
@@ -14936,8 +15375,15 @@ def handle_post(handler, parsed) -> bool:
                 restart_watcher_for_profile(name)
             except Exception as exc:
                 logger.warning("Failed to restart gateway watcher for profile %s: %s", name, exc)
+            session_cookie_value = getattr(handler, '_trusted_auth_session_cookie_value', None)
+            if session_cookie_value:
+                if bound_profile and name == bound_profile:
+                    return j(handler, result)
+                extra_header = build_profile_cookie(name, session_cookie_value=session_cookie_value)
+            else:
+                extra_header = build_profile_cookie(name, handler)
             return j(handler, result, extra_headers={
-                'Set-Cookie': build_profile_cookie(name, handler),
+                'Set-Cookie': extra_header,
             })
         except PermissionError as e:
             return bad(handler, _sanitize_error(e), 403)
@@ -15691,6 +16137,7 @@ def handle_post(handler, parsed) -> bool:
                     "api_key": _main_api_key,
                 }
 
+                ensure_agent_runtime_current()
                 try:
                     from agent.auxiliary_client import get_text_auxiliary_client
 
@@ -15711,7 +16158,7 @@ def handle_post(handler, parsed) -> bool:
                 except Exception as _e:
                     logger.debug("update summary auxiliary model failed; falling back to main model: %s", _e)
 
-                from run_agent import AIAgent
+                AIAgent = require_ai_agent_class()
 
                 agent = AIAgent(
                     model=_main_model,
@@ -15873,18 +16320,26 @@ def handle_post(handler, parsed) -> bool:
         return j(handler, {"credentials": registered_credentials()})
 
     if parsed.path == "/api/auth/logout":
-        from api.auth import clear_auth_cookie, invalidate_session, parse_cookie
+        from api.auth import clear_auth_cookie, ensure_trusted_auth_session, get_trusted_auth_logout_url, invalidate_session, parse_cookie
+        from api.helpers import clear_profile_cookie
 
-        cookie_val = parse_cookie(handler)
+        session_info = ensure_trusted_auth_session(handler)
+        cookie_val = getattr(handler, '_trusted_auth_session_cookie_value', None) or parse_cookie(handler)
         if cookie_val:
             invalidate_session(cookie_val)
-        body = json.dumps({"ok": True}).encode()
+        payload = {"ok": True}
+        if session_info and session_info.get("auth_type") == "trusted":
+            logout_url = get_trusted_auth_logout_url()
+            if logout_url:
+                payload["trusted_logout_url"] = logout_url
+        body = json.dumps(payload).encode()
         handler.send_response(200)
         handler.send_header("Content-Type", "application/json")
         handler.send_header("Content-Length", str(len(body)))
         handler.send_header("Cache-Control", "no-store")
         _security_headers(handler)
         clear_auth_cookie(handler)
+        clear_profile_cookie(handler)
         handler.end_headers()
         handler.wfile.write(body)
         return True
@@ -16219,12 +16674,21 @@ def _handle_sessions_search(handler, parsed):
         depth = max(0, int(qs.get("depth", ["5"])[0]))
     except (ValueError, TypeError):
         depth = 5
+    # Read the redaction setting ONCE for the whole response (mirrors the
+    # /api/sessions read-once optimization, #4662) and thread it through every
+    # branch + the shared title-field redactor so search rows redact the same
+    # fields as the sidebar list.
+    try:
+        _search_redact_enabled = bool(load_settings().get("api_redact_enabled", True))
+    except Exception:
+        _search_redact_enabled = True  # fail safe: redact when settings unreadable
     if not q:
         safe_sessions = []
         for s in sessions:
             item = dict(s)
             if isinstance(item.get("title"), str):
-                item["title"] = _redact_text(item["title"])
+                item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
+            _redact_sidebar_title_fields(item, _search_redact_enabled)
             safe_sessions.append(item)
         return j(handler, {
             "sessions": safe_sessions,
@@ -16237,7 +16701,8 @@ def _handle_sessions_search(handler, parsed):
         if title_match:
             item = dict(s, match_type="title")
             if isinstance(item.get("title"), str):
-                item["title"] = _redact_text(item["title"])
+                item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
+            _redact_sidebar_title_fields(item, _search_redact_enabled)
             results.append(item)
             continue
         if content_search:
@@ -16250,9 +16715,10 @@ def _handle_sessions_search(handler, parsed):
                         item = dict(s, match_type="content")
                         preview = _session_search_preview(c, q)
                         if preview:
-                            item["match_preview"] = _redact_text(preview)
+                            item["match_preview"] = _redact_text(preview, _enabled=_search_redact_enabled)
                         if isinstance(item.get("title"), str):
-                            item["title"] = _redact_text(item["title"])
+                            item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
+                        _redact_sidebar_title_fields(item, _search_redact_enabled)
                         results.append(item)
                         break
             except (KeyError, Exception):
@@ -20045,6 +20511,9 @@ def _handle_btw(handler, body):
         require(body, "question")
     except ValueError as e:
         return bad(handler, str(e))
+    stale_response = _agent_runtime_barrier_response(runner_local_owned=False)
+    if stale_response is not None:
+        return j(handler, stale_response, status=409)
     if _session_is_subagent_view_only(str(body.get("session_id") or "")):
         return bad(handler, "Subagent sessions are view-only and cannot be used for /btw from WebUI", 400)
     try:
@@ -20104,6 +20573,9 @@ def _handle_background(handler, body):
         require(body, "prompt")
     except ValueError as e:
         return bad(handler, str(e))
+    stale_response = _agent_runtime_barrier_response(runner_local_owned=False)
+    if stale_response is not None:
+        return j(handler, stale_response, status=409)
     try:
         s = get_session(body["session_id"])
     except KeyError:
@@ -20257,6 +20729,7 @@ def _prepare_chat_start_session_for_stream(
     s.model = model
     s.model_provider = model_provider
     s.active_stream_id = stream_id
+    s.post_compression_context_tokens_estimate = None
     s.pending_user_message = msg
     s.pending_attachments = attachments
     s.pending_started_at = started_at if started_at is not None else time.time()
@@ -20389,6 +20862,31 @@ def _active_run_stream_for_session(session_id: str | None) -> str | None:
     return None
 
 
+def _agent_runtime_barrier_response(
+    *,
+    runner_local_owned: bool = False,
+    external_runtime_owned: bool | None = None,
+) -> dict | None:
+    """Return the typed stale-runtime response for local in-process turns."""
+    if external_runtime_owned is True:
+        return None
+    if runner_local_owned and webui_gateway_chat_enabled(get_config()):
+        return None
+    from api.runtime_adapter import runtime_adapter_runner_enabled
+
+    if runner_local_owned and runtime_adapter_runner_enabled():
+        return None
+    try:
+        ensure_agent_runtime_current()
+    except AgentRuntimeChangedError as exc:
+        return {
+            "error": str(exc),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }
+    return None
+
+
 def _start_chat_stream_for_session(
     s,
     *,
@@ -20402,8 +20900,18 @@ def _start_chat_stream_for_session(
     goal_related: bool = False,
     source: str = "webui",
     moa_config=None,
+    external_runtime_owned: bool | None = None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
+    if external_runtime_owned is None:
+        external_runtime_owned = webui_gateway_chat_enabled(get_config())
+    backend_is_gateway = bool(external_runtime_owned)
+    stale_response = _agent_runtime_barrier_response(
+        external_runtime_owned=backend_is_gateway,
+    )
+    if stale_response is not None:
+        stale_response["_status"] = 409
+        return stale_response
     attachments = attachments or []
     # Prevent duplicate runs in the same session while a stream is still active.
     # This commonly happens after page refresh/reconnect races and can produce
@@ -20522,7 +21030,6 @@ def _start_chat_stream_for_session(
     if goal_related:
         STREAM_GOAL_RELATED[stream_id] = True
     diag.stage("worker_thread_start") if diag else None
-    backend_is_gateway = webui_gateway_chat_enabled(get_config())
     worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
     worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
     if moa_config and not backend_is_gateway:
@@ -20693,6 +21200,7 @@ def _start_run(
         diag=diag,
         source=source,
         moa_config=moa_config,
+        external_runtime_owned=webui_gateway_chat_enabled(get_config()),
     )
 
 
@@ -20786,6 +21294,10 @@ def start_session_turn(
     msg = str(message or "").strip()
     if not msg:
         return {"error": "message is required", "_status": 400}
+    stale_response = _agent_runtime_barrier_response(runner_local_owned=True)
+    if stale_response is not None:
+        stale_response["_status"] = 409
+        return stale_response
     turn_source = str(source or "process_wakeup").strip() or "process_wakeup"
     try:
         s = get_session(session_id)
@@ -21262,6 +21774,7 @@ def _handle_goal_command(handler, body):
             model_provider=model_provider,
             normalized_model=normalized_model,
             goal_related=True,
+            external_runtime_owned=webui_gateway_chat_enabled(get_config()),
         )
         status = int(stream_response.pop("_status", 200) or 200)
         payload.update(stream_response)
@@ -21280,6 +21793,12 @@ def _handle_chat_start(handler, body, diag=None):
             require(body, "session_id")
         except ValueError as e:
             return bad(handler, str(e))
+        # Reject a stale local Agent runtime before materialising, claiming, or
+        # mutating any session state. Gateway-backed turns run in the gateway's
+        # process and do not depend on this WebUI process's imported checkout.
+        stale_response = _agent_runtime_barrier_response(runner_local_owned=True)
+        if stale_response is not None:
+            return j(handler, stale_response, status=409)
         diag.stage("get_session") if diag else None
         try:
             s = _get_or_materialize_session(body["session_id"], refresh_cli_messages=True)
@@ -21426,6 +21945,20 @@ def _handle_chat_start(handler, body, diag=None):
             profile_config=_pp_cfg,
             explicit_model_pick=explicit_model_pick,
         )
+        # #5979: record a SIGNATURE of the deliberately-picked model+provider so
+        # the streaming resolver can preserve a custom-proxy vendor namespace on a
+        # cold catalog — but ONLY while the routing context still matches. On a
+        # fresh explicit pick, stamp the signature of the resolved model+provider;
+        # otherwise leave any prior signature in place (it self-invalidates when
+        # the model/provider changes, since the streaming side recomputes and
+        # compares). This survives same-model follow-up sends (the onchange marker
+        # is one-shot) yet can't outlive a real switch.
+        try:
+            if explicit_model_pick:
+                from api.models import model_explicit_pick_signature as _mk_sig
+                s.model_explicit_pick_signature = _mk_sig(model, model_provider)
+        except Exception:
+            pass
         catalog_profile_provider = _pp_provider
         if catalog_profile_provider is None and isinstance(_pp_cfg, dict):
             profile_model_config = _pp_cfg.get("model") or {}
@@ -21561,6 +22094,9 @@ def _normalize_chat_attachments(raw_attachments):
 
 def _handle_chat_sync(handler, body):
     """Fallback synchronous chat endpoint (POST /api/chat). Not used by frontend."""
+    stale_response = _agent_runtime_barrier_response(runner_local_owned=False)
+    if stale_response is not None:
+        return j(handler, stale_response, status=409)
     if _session_is_subagent_view_only(str(body.get("session_id") or "")):
         return bad(handler, "Subagent sessions are view-only and cannot be written from WebUI", 400)
     s = get_session(body["session_id"])
@@ -21596,7 +22132,7 @@ def _handle_chat_sync(handler, body):
         os.environ["HERMES_EXEC_ASK"] = "1"
         os.environ["HERMES_SESSION_KEY"] = s.session_id
     try:
-        from run_agent import AIAgent
+        AIAgent = require_ai_agent_class()
 
         with CHAT_LOCK:
             from api.config import (
@@ -22227,6 +22763,7 @@ def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) 
             "base_url": _main_base_url,
             "api_key": _main_api_key,
         }
+        ensure_agent_runtime_current()
         try:
             from agent.auxiliary_client import get_text_auxiliary_client
 
@@ -22243,7 +22780,7 @@ def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) 
         except Exception as _e:
             logger.debug("git commit message auxiliary model failed; falling back to main model: %s", _e)
 
-        from run_agent import AIAgent
+        AIAgent = require_ai_agent_class()
 
         agent = AIAgent(
             model=_main_model,
@@ -22289,6 +22826,12 @@ def _handle_git_commit_message(handler, body):
         return bad(handler, str(e))
     except GitWorkspaceError as e:
         return _git_bad(handler, e)
+    except AgentRuntimeChangedError as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.exception("git commit message generation failed")
         return bad(handler, _sanitize_error(e), 500)
@@ -22320,6 +22863,12 @@ def _handle_git_commit_message_selected(handler, body):
         return bad(handler, str(e))
     except GitWorkspaceError as e:
         return _git_bad(handler, e)
+    except AgentRuntimeChangedError as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.exception("selected git commit message generation failed")
         return bad(handler, _sanitize_error(e), 500)
@@ -23076,7 +23625,7 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str) -> bool:
     # Collect keys from both _pending and _gateway_queues
     keys_from_pending = pending.get("pattern_keys") or [pending.get("pattern_key", "")] if pending else []
     all_keys = [k for k in keys_from_pending if k] + [k for k in gateway_keys if k]
-    if choice in ("once", "session"):
+    if choice == "session":
         for k in all_keys:
             approve_session(sid, k)
     elif choice == "always":
@@ -23084,6 +23633,11 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str) -> bool:
             approve_session(sid, k)
             approve_permanent(k)
         save_permanent_allowlist(_permanent_approved)
+    # choice == "once": no persistence — approval lasts this single call only.
+    # resolve_gateway_approval() below unblocks the parked agent thread for
+    # every choice, so "once" still lets the current tool run; we just must not
+    # call approve_session() here, or the next matching guarded call would find
+    # the pattern already session-approved and skip its approval card (#6017).
     # Unblock the agent thread waiting in the gateway approval queue.
     # This is the primary signal when streaming is active — the agent
     # thread is parked in entry.event.wait() and needs to be woken up.
@@ -23339,6 +23893,10 @@ def _manual_compression_status_payload(job):
         payload["ok"] = False
         payload["error"] = job.get("error") or "Compression failed"
         payload["error_status"] = int(job.get("error_status") or 400)
+        if job.get("error_type"):
+            payload["type"] = job["error_type"]
+        if job.get("retryable") is not None:
+            payload["retryable"] = bool(job["retryable"])
     elif status == "cancelled":
         payload["ok"] = False
         payload["error"] = job.get("error") or "Compression cancelled"
@@ -23373,6 +23931,8 @@ def _run_manual_compression_job(sid, body):
                         "status": "error",
                         "error": str((payload or {}).get("error") or "Compression failed"),
                         "error_status": status,
+                        "error_type": (payload or {}).get("type"),
+                        "retryable": (payload or {}).get("retryable"),
                         "updated_at": now,
                     }
                 )
@@ -23382,6 +23942,21 @@ def _run_manual_compression_job(sid, body):
                         "status": "done",
                         "result": payload,
                         "updated_at": now,
+                    }
+                )
+    except AgentRuntimeChangedError as exc:
+        logger.warning("Manual compression worker found stale Agent runtime for session %s", sid)
+        with _MANUAL_COMPRESSION_JOBS_LOCK:
+            job = _MANUAL_COMPRESSION_JOBS.get(sid)
+            if job:
+                job.update(
+                    {
+                        "status": "error",
+                        "error": str(exc),
+                        "error_status": 409,
+                        "error_type": "agent_runtime_stale",
+                        "retryable": True,
+                        "updated_at": time.time(),
                     }
                 )
     except Exception as exc:
@@ -23420,6 +23995,34 @@ def _handle_session_compress_start(handler, body):
     if focus_topic:
         job_body["focus_topic"] = focus_topic
 
+    # Repeated start requests observe an existing running job and do not admit
+    # new Agent work, so preserve that idempotent read even if the checkout has
+    # since changed. Do not hold the job lock while running Git subprocesses.
+    now = time.time()
+    with _MANUAL_COMPRESSION_JOBS_LOCK:
+        _manual_compression_cleanup_locked(now)
+        existing = _MANUAL_COMPRESSION_JOBS.get(sid)
+        if existing:
+            existing_payload = _manual_compression_status_payload(existing)
+            if existing_payload.get("status") == "running":
+                return j(handler, existing_payload)
+
+    # Reject a stale local Agent runtime before creating the asynchronous job.
+    try:
+        ensure_agent_runtime_current()
+    except AgentRuntimeChangedError as exc:
+        return j(
+            handler,
+            {
+                "error": str(exc),
+                "type": "agent_runtime_stale",
+                "retryable": True,
+            },
+            status=409,
+        )
+
+    # Another start request may have admitted a job while the runtime check ran.
+    # Re-check under the lock so only one worker is created.
     now = time.time()
     with _MANUAL_COMPRESSION_JOBS_LOCK:
         _manual_compression_cleanup_locked(now)
@@ -23635,10 +24238,11 @@ def _handle_session_compress(handler, body):
                     focus_topic,
                 )
 
+        ensure_agent_runtime_current()
         import api.config as _cfg
         from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
         import hermes_cli.runtime_provider as _runtime_provider
-        import run_agent as _run_agent
+        AIAgent = require_ai_agent_class()
 
         resolved_model, resolved_provider, resolved_base_url = _cfg.resolve_model_provider(
             _cfg.model_with_provider_context(s.model, getattr(s, "model_provider", None))
@@ -23681,7 +24285,7 @@ def _handle_session_compress(handler, body):
         )
         approx_tokens = _estimate_messages_tokens_rough(original_messages)
 
-        agent = _run_agent.AIAgent(
+        agent = AIAgent(
             model=resolved_model,
             provider=resolved_provider,
             base_url=resolved_base_url,
@@ -23776,6 +24380,12 @@ def _handle_session_compress(handler, body):
                 "focus_topic": focus_topic,
             },
         )
+    except AgentRuntimeChangedError as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.warning("Manual session compression failed: %s", e)
         return bad(handler, f"Compression failed: {_sanitize_error(e)}")
@@ -24285,10 +24895,11 @@ def _handle_handoff_summary(handler, body):
 
         # Call LLM for summary.
     try:
+        ensure_agent_runtime_current()
         import api.config as _cfg
         from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
         import hermes_cli.runtime_provider as _runtime_provider
-        import run_agent as _run_agent
+        AIAgent = require_ai_agent_class()
 
         # Try to resolve model from an existing session, fall back to default.
         resolved_model = None
@@ -24344,7 +24955,7 @@ def _handle_handoff_summary(handler, body):
                 "fallback": True,
             })
 
-        agent = _run_agent.AIAgent(
+        agent = AIAgent(
             model=resolved_model,
             provider=resolved_provider,
             base_url=resolved_base_url,
@@ -24424,6 +25035,12 @@ def _handle_handoff_summary(handler, body):
             "rounds": rounds,
             "fallback": fallback,
         })
+    except AgentRuntimeChangedError as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.warning("Handoff summary generation failed: %s", e)
         summary_text = _fallback_handoff_summary(msgs)

@@ -1,9 +1,9 @@
-// Stable Assistant Turn Anchors scaffold (#3926).
+// Stable Assistant Turn Anchors implementation (#3926 / #3400).
 //
-// This file defines the current ownership inventory, event classifications, and
-// small owner helpers. It does not register anchors globally. The only renderer
-// wiring in this slice is settled assistant final-answer projection; live
-// streaming, replay hydration, tools, and DOM ownership remain unwired.
+// This file defines the ownership inventory, event normalization, registry, and
+// activity-scene projection consumed by current live, settled, replay-hydration,
+// and session-reentry paths. Runtime execution and transport remain outside the
+// Anchor's presentation/reconciliation ownership boundary.
 (function(){
   const ROOT=(typeof window!=='undefined')?window:globalThis;
 
@@ -176,6 +176,12 @@
 
   function _cleanString(value){
     return typeof value==='string'?value.trim():'';
+  }
+
+  function _activityDisplayMode(value){
+    return value==='transparent_stream'||value==='compact_worklog'||value==='hide_all_activity'
+      ? value
+      : 'compact_worklog';
   }
 
   function _terminalStateKey(value){
@@ -1013,7 +1019,7 @@
     const anchor=_anchorFromProjectionInput(input);
     const opts=(options&&typeof options==='object')?options:{};
     const requestedMode=_cleanString(_own(opts,'mode'));
-    const mode=requestedMode==='transparent_stream'?'transparent_stream':'compact_worklog';
+    const mode=_activityDisplayMode(requestedMode);
     if(!anchor){
       return Object.freeze({
         version:'activity_scene_v1',
@@ -1319,7 +1325,7 @@
     const item=(input&&typeof input==='object')?input:{};
     const opts=(options&&typeof options==='object')?options:{};
     const requested=_cleanString(_own(item,'mode'))||_cleanString(_own(opts,'mode'));
-    return requested==='transparent_stream'?'transparent_stream':'compact_worklog';
+    return _activityDisplayMode(requested);
   }
 
   function _rendererSnapshotRowsInput(input, options){

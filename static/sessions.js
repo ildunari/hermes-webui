@@ -505,15 +505,24 @@ function _saveSessionCompletionUnread() {
   }
 }
 
-function _markSessionCompletionUnread(sid, messageCount = 0) {
+function _markSessionCompletionUnread(sid, messageCount = 0, meta = null) {
   if (!sid) return;
   const unread = _getSessionCompletionUnread();
   const count = Number.isFinite(messageCount) ? Number(messageCount) : 0;
-  unread[sid] = {message_count: count, completed_at: Date.now()};
+  const entry = {message_count: count, completed_at: Date.now()};
+  // Cron markers carry source+profile so profile switches can clear only that
+  // cross-profile leak without wiping ordinary chat completion unread (#5960).
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+    if (meta.source) entry.source = String(meta.source);
+    if (typeof meta.profile === 'string' && meta.profile.trim()) {
+      entry.profile = meta.profile.trim();
+    }
+  }
+  unread[sid] = entry;
   _saveSessionCompletionUnread();
 }
 
-function _markSessionCompletionUnreadIfBackground(sid, messageCount = null) {
+function _markSessionCompletionUnreadIfBackground(sid, messageCount = null, meta = null) {
   if (!sid) return false;
   let count = Number.isFinite(messageCount) ? Number(messageCount) : NaN;
   if (!Number.isFinite(count)) {
@@ -527,7 +536,7 @@ function _markSessionCompletionUnreadIfBackground(sid, messageCount = null) {
     if (typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
     return false;
   }
-  _markSessionCompletionUnread(sid, count);
+  _markSessionCompletionUnread(sid, count, meta);
   if (typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
   return true;
 }
@@ -538,6 +547,132 @@ function _clearSessionCompletionUnread(sid) {
   if (!Object.prototype.hasOwnProperty.call(unread, sid)) return;
   delete unread[sid];
   _saveSessionCompletionUnread();
+}
+
+// True when a session row is a cron-origin session for unread-dot scoping.
+function _isCronSessionForUnread(session) {
+  if (!session) return false;
+  const key = (typeof _sourceKeyForSession === 'function')
+    ? _sourceKeyForSession(session)
+    : String(
+      session.raw_source
+      || session.source_tag
+      || session.source
+      || session.session_source
+      || ''
+    ).toLowerCase();
+  if (key === 'cron') return true;
+  return String(session.session_source || '').toLowerCase() === 'cron';
+}
+
+// Build {source, profile} for a cron session row; null for ordinary chat.
+function _cronCompletionUnreadMetaForSession(session) {
+  if (!_isCronSessionForUnread(session)) return null;
+  const fromRow = (session && typeof session.profile === 'string' && session.profile.trim())
+    ? session.profile.trim()
+    : '';
+  const active = (typeof S !== 'undefined' && S && typeof S.activeProfile === 'string' && S.activeProfile.trim())
+    ? S.activeProfile.trim()
+    : 'default';
+  return {source: 'cron', profile: fromRow || active};
+}
+
+// Resolve whether a persisted marker is cron and which profile owns it.
+// Untagged/legacy markers are migrated from the sidebar session row when known.
+function _resolveCronCompletionMarkerOrigin(sid, marker) {
+  let isCron = !!(marker && marker.source === 'cron');
+  let profile = (marker && typeof marker.profile === 'string' && marker.profile.trim())
+    ? marker.profile.trim()
+    : '';
+  let session = null;
+  if (Array.isArray(_allSessions)) {
+    session = _allSessions.find((s) => s && s.session_id === sid) || null;
+  }
+  if (!session && typeof _sessionListSnapshotById !== 'undefined'
+    && _sessionListSnapshotById && typeof _sessionListSnapshotById.get === 'function') {
+    // Snapshot alone lacks source/profile; keep null.
+    session = null;
+  }
+  if (session) {
+    if (!isCron && _isCronSessionForUnread(session)) isCron = true;
+    if (!profile) {
+      const sp = (typeof session.profile === 'string' && session.profile.trim())
+        ? session.profile.trim()
+        : '';
+      if (sp) profile = sp;
+    }
+  }
+  // Persist migration so later switches don't re-resolve from a cleared list.
+  if (marker && isCron) {
+    if (marker.source !== 'cron') marker.source = 'cron';
+    if (profile && marker.profile !== profile) marker.profile = profile;
+  }
+  return {isCron, profile: profile || ''};
+}
+
+// A profile name provably resolving to the root profile: the literal
+// 'default' alias, or a roster entry flagged is_default (renamed root).
+// Unknown names fail closed — exact-name matching still applies to them.
+function _cronProfileNameIsRootAlias(name) {
+  if (name === 'default') return true;
+  if (typeof _profilesCache !== 'undefined' && _profilesCache
+    && Array.isArray(_profilesCache.profiles)) {
+    const entry = _profilesCache.profiles.find((p) => p && p.name === name);
+    if (entry && entry.is_default) return true;
+  }
+  return false;
+}
+
+// default/renamed-root equivalence for cron-marker ownership (mirrors server
+// _profiles_match enough for the active surface: literal 'default' ↔ root).
+function _cronMarkerProfileMatchesActive(origin, activeProfile) {
+  const originName = (typeof origin === 'string' && origin.trim()) ? origin.trim() : '';
+  const activeName = (typeof activeProfile === 'string' && activeProfile.trim())
+    ? activeProfile.trim()
+    : 'default';
+  if (!originName) return false;
+  if (originName === activeName) return true;
+  if (typeof _profileMatchesActiveProfile === 'function'
+    && _profileMatchesActiveProfile(originName, activeName)) {
+    return true;
+  }
+  // Reverse alias: marker tagged with the renamed-root name while the active
+  // root surface reports a different alias. Match only when the origin name
+  // ITSELF provably resolves to the root — never "active is default → match
+  // all", which under-cleared other profiles' markers on switch to 'default'.
+  if (typeof S !== 'undefined' && S && S.activeProfileIsDefault
+    && typeof _cronProfileNameIsRootAlias === 'function'
+    && _cronProfileNameIsRootAlias(originName)) {
+    return true;
+  }
+  return false;
+}
+
+// Drop persisted cron unread dots that belong to inactive profiles. Ordinary
+// (non-cron) completion markers stay put — sticky all-profile sidebars still
+// need those. Called from the shared profile-switch reset in panels.js.
+function _clearCronSessionCompletionUnreadForInactiveProfiles(activeProfile) {
+  const active = (typeof activeProfile === 'string' && activeProfile.trim())
+    ? activeProfile.trim()
+    : 'default';
+  const unread = _getSessionCompletionUnread();
+  let changed = false;
+  for (const sid of Object.keys(unread)) {
+    const marker = unread[sid];
+    if (!marker || typeof marker !== 'object' || Array.isArray(marker)) continue;
+    const resolved = _resolveCronCompletionMarkerOrigin(sid, marker);
+    if (!resolved.isCron) continue;
+    // Only clear when we know the owning profile AND it is not the active one
+    // (incl. default/renamed-root equivalence). Untagged + unresolvable stays.
+    if (!resolved.profile) continue;
+    if (_cronMarkerProfileMatchesActive(resolved.profile, active)) continue;
+    delete unread[sid];
+    changed = true;
+  }
+  if (!changed) return false;
+  _saveSessionCompletionUnread();
+  if (typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
+  return true;
 }
 
 function _clearSessionViewedCount(sid) {
@@ -601,6 +736,60 @@ function _hasUnreadForSession(s) {
   }
   if (!Number.isFinite(s.message_count)) return false;
   return s.message_count > Number(counts[s.session_id] || 0);
+}
+
+// Keep the sidebar polling snapshot current for a just-visited session so a
+// deferred /api/sessions list refresh landing across the async message-load gap
+// cannot treat the unchanged, already-open session as a fresh background
+// completion and re-flag a stale unread dot (#4946).
+function _syncSessionListSnapshotOnVisit(sid, messageCount, lastMessageAt) {
+  if (!sid) return;
+  const count = Number(messageCount || 0);
+  const last = Number(lastMessageAt || 0);
+  _sessionListSnapshotById.set(sid, {message_count: count, last_message_at: last});
+  // #5917 gate finding: derive the visited session's streaming state from its
+  // OWN (target-owned) metadata, NOT the global S.busy / S.activeStreamId
+  // flags. When switching from a BUSY session A to an IDLE session B, those
+  // globals can still belong to A at this point in the load, so reading them
+  // here would wrongly record idle B as streaming — a later hidden-tab poll
+  // would then see a streaming->stopped transition and manufacture a phantom
+  // unread completion for B. Only the session object's own is_streaming /
+  // active_stream_id / pending-message fields describe THIS session.
+  const target = (S.session && S.session.session_id === sid) ? S.session : null;
+  const isStreaming = Boolean(
+    target && (
+      target.is_streaming ||
+      target.active_stream_id ||
+      target.pending_user_message ||
+      target.has_pending_user_message
+    )
+  );
+  _sessionStreamingById.set(sid, isStreaming);
+  if (!isStreaming) _forgetObservedStreamingSession(sid);
+}
+
+// Acknowledge that the user actually visited/opened `sid`: clear its viewed
+// count (which also clears any stale completion-unread marker, #3020), sync the
+// polling snapshot so a deferred list poll cannot re-flag it, then repaint from
+// cache. Repainting via renderSessionListFromCache() recomputes each row's
+// aggregated unread state (own + children) authoritatively, so a lineage
+// PARENT keeps its own / other children's unread dot instead of being stripped
+// by ad-hoc DOM surgery (Greptile concern (b) on #4946).
+function _acknowledgeSessionVisit(sid, messageCount = 0, lastMessageAt = 0) {
+  if (!sid) return;
+  _setSessionViewedCount(sid, messageCount);
+  _syncSessionListSnapshotOnVisit(sid, messageCount, lastMessageAt);
+  if (typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
+}
+
+// Does the session currently carry any unread state that a visit should clear?
+// Used by the same-session no-op guard so re-selecting the already-open session
+// still clears a stale dot before short-circuiting.
+function _sessionVisitHasUnreadState(sid) {
+  if (!sid) return false;
+  if (_hasSessionCompletionUnread(sid)) return true;
+  if (!S.session || S.session.session_id !== sid) return false;
+  return _hasUnreadForSession(S.session);
 }
 
 function _isSessionActivelyViewedForList(sid) {
@@ -894,7 +1083,7 @@ function _renderRuntimeJournalAnchorActivityScene(activeStreamId, sid){
   if(!activeStreamId||typeof window==='undefined'||typeof window._renderLiveAnchorActivitySceneSnapshotForStream!=='function') return false;
   const scene=_runtimeJournalAnchorActivitySceneForSession(sid);
   if(!scene) return false;
-  return !!window._renderLiveAnchorActivitySceneSnapshotForStream(activeStreamId, scene, sid, {mode:'compact_worklog'});
+  return !!window._renderLiveAnchorActivitySceneSnapshotForStream(activeStreamId, scene, sid);
 }
 
 function _rememberRenderedSessionSnapshot(s) {
@@ -995,7 +1184,26 @@ function _markPollingCompletionUnreadTransitions(sessions) {
     const completedPersistedObservedStream = Boolean(observedStreaming && !isStreaming);
     if (completedObservedStream || completedPersistedObservedStream || completedWithNewMessages) {
       if (!_isSessionActivelyViewedForList(sid)) {
-        _markSessionCompletionUnread(sid, s.message_count);
+        // Tag cron session-list markers with source+profile so profile-switch
+        // reset can clear only inactive-profile cron dots (#5960 / #5975 re-gate).
+        const meta = (typeof _cronCompletionUnreadMetaForSession === 'function')
+          ? _cronCompletionUnreadMetaForSession(s)
+          : null;
+        // Defense: never re-create a cron unread for a non-active profile while
+        // the sidebar is single-profile (stale pre-switch payloads).
+        const allProfilesOn = (typeof _showAllProfiles !== 'undefined' && !!_showAllProfiles);
+        if (
+          meta
+          && meta.source === 'cron'
+          && meta.profile
+          && !allProfilesOn
+          && typeof _cronMarkerProfileMatchesActive === 'function'
+          && !_cronMarkerProfileMatchesActive(meta.profile, (typeof S !== 'undefined' && S && S.activeProfile) || 'default')
+        ) {
+          // Skip mark for inactive-profile cron row.
+        } else {
+          _markSessionCompletionUnread(sid, s.message_count, meta);
+        }
       } else {
         // Sync viewed count so we don't flag stale unread on tab switch (#3020)
         _setSessionViewedCount(sid, messageCount);
@@ -1154,7 +1362,11 @@ async function newSession(flash, options={}){
       profile:S.activeProfile||'default',
     };
     if(S.session&&S.session.session_id) reqBody.prev_session_id=S.session.session_id;
-    if(options&&options.worktree) reqBody.worktree=true;
+    // Three-value worktree contract (#6022): explicit true/false is forwarded
+    // verbatim; an ABSENT key lets the server apply the agent's config-level
+    // `worktree:` default. Auto-bind paths pass worktree:false explicitly so a
+    // config default can never mint a worktree (+ branch) on mere page load.
+    if(options&&Object.prototype.hasOwnProperty.call(options,'worktree')) reqBody.worktree=!!options.worktree;
     if(Object.prototype.hasOwnProperty.call(options,'project_id')){
       reqBody.project_id=options.project_id;
     } else if(_activeProject&&_activeProject!==NO_PROJECT_FILTER){
@@ -1287,6 +1499,7 @@ async function newSession(flash, options={}){
         cache_hit_percent:data.session.cache_hit_percent,
         context_length:data.session.context_length||0,
         last_prompt_tokens:data.session.last_prompt_tokens||0,
+        post_compression_context_tokens_estimate:data.session.post_compression_context_tokens_estimate||null,
         threshold_tokens:data.session.threshold_tokens||0,
       });
     }
@@ -1383,10 +1596,16 @@ async function _switchProfileForSessionLoad(profile){
     const data=await api('/api/profile/switch',{method:'POST',body:JSON.stringify({name}),timeoutToast:false});
     S.activeProfile=data.active||name;
     S.activeProfileIsDefault=!!data.is_default;
+    if(typeof _resetCronUnreadForProfileSwitch==='function'){
+      _resetCronUnreadForProfileSwitch();
+    }
     if(typeof _clearPersistedModelState==='function') _clearPersistedModelState();
     else localStorage.removeItem('hermes-webui-model');
     if(data.default_model) window._defaultModel=data.default_model;
     if(data.default_model_provider) window._activeProvider=data.default_model_provider;
+    if(typeof refreshProfileTransitionReasoningChip==='function'){
+      refreshProfileTransitionReasoningChip(data.default_model,data.default_model_provider);
+    }
     if(typeof startGatewaySSE==='function') startGatewaySSE();
     if(typeof syncTopbar==='function') syncTopbar();
     if(typeof _setProfileSwitchListEmbargo==='function') _setProfileSwitchListEmbargo(false);
@@ -1425,7 +1644,19 @@ async function loadSession(sid){
   // #2971: idempotent re-arm before the no-op guard revives a stream a prior
   // failed loadSession killed; no-ops on real switches.
   _rearmActiveSessionStream();
-  if(currentSid===sid && !forceReload && (!_loadingSessionId || _loadingSessionId===sid)) return;
+  if(currentSid===sid && !forceReload && (!_loadingSessionId || _loadingSessionId===sid)){
+    // Re-selecting the already-open session is a no-op for transcript/scroll, but
+    // it is still a *visit*: clear a stale sidebar unread dot (e.g. one a
+    // background completion left on the open, unfocused pane) before returning.
+    if(_sessionVisitHasUnreadState(sid)){
+      _acknowledgeSessionVisit(
+        sid,
+        Number(S.session.message_count || 0),
+        Number(S.session.last_message_at || S.session.updated_at || 0)
+      );
+    }
+    return;
+  }
   // Mark this session as the in-flight load. Subsequent loadSession() calls
   // will overwrite this; stale awaits use the mismatch to bail out (#1060).
   const _loadGeneration = ++_loadSessionGeneration;
@@ -1711,24 +1942,23 @@ async function loadSession(sid){
   // Sync workspace display immediately so the chip label reflects the new session's workspace
   // before any async message-loading begins (mirrors how model is handled).
   if(typeof syncTopbar==='function') syncTopbar();
-  _setSessionViewedCount(S.session.session_id, Number(data.session.message_count || 0));
-  _clearSessionCompletionUnread(S.session.session_id);
-  try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
-  _setActiveSessionUrl(S.session.session_id);
-  if(typeof startSessionStream==='function') startSessionStream(S.session.session_id);
-
+  // Acknowledge the visit as soon as the session metadata is accepted for the
+  // in-flight load: clears the viewed count + any stale completion-unread marker
   // `let` (not const): re-read below, after the awaited _ensureMessagesLoaded,
   // so a server_turn_started that attaches a live stream MID-RELOAD is honored
   // by the attach/idle decision instead of being clobbered by the stale snapshot.
   let activeStreamId=S.session.active_stream_id||null;
   // If the server says the session is idle, reset browser-side streaming flags
-  // NOW — before the async _ensureMessagesLoaded gap below. Without this,
-  // S.busy can remain true from a still-running stream in the PREVIOUS session
-  // while S.session.session_id has already advanced to the new one.
-  // _isSessionLocallyStreaming() checks (isActive && S.busy), so during the
-  // async window the new session would appear locally-streaming (sidebar spinner,
-  // Stop button, thinking state on an idle chat). Also clears stale INFLIGHT
-  // entries left behind by a crashed/restarted stream.
+  // NOW — BEFORE _acknowledgeSessionVisit() below (whose sidebar repaint would
+  // otherwise inherit the PREVIOUS session's busy/stream state) and before the
+  // async _ensureMessagesLoaded gap. Without this, S.busy can remain true from a
+  // still-running stream in the PREVIOUS session while S.session.session_id has
+  // already advanced to the new one. _isSessionLocallyStreaming() checks
+  // (isActive && S.busy), so the new session would appear locally-streaming
+  // (sidebar spinner, Stop button, thinking state on an idle chat) and the visit
+  // repaint would manufacture a phantom unread. Also clears stale INFLIGHT
+  // entries left behind by a crashed/restarted stream. (#5917 gate: reset must
+  // precede the acknowledge repaint.)
   if(!activeStreamId){
     S.activeStreamId=null;
     S.busy=false;
@@ -1737,6 +1967,18 @@ async function loadSession(sid){
       if(typeof clearInflightState==='function') clearInflightState(sid);
     }
   }
+
+  // and syncs the polling snapshot so a deferred /api/sessions poll landing
+  // during the async message-load gap below cannot re-flag a stale unread dot.
+  _acknowledgeSessionVisit(
+    S.session.session_id,
+    Number(data.session.message_count || 0),
+    Number(data.session.last_message_at || data.session.updated_at || 0)
+  );
+  try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
+  _setActiveSessionUrl(S.session.session_id);
+  if(typeof startSessionStream==='function') startSessionStream(S.session.session_id);
+
 
   function _mergePendingSessionMessage(session,messages){
     if(!Array.isArray(messages)) return false;
@@ -1859,7 +2101,7 @@ async function loadSession(sid){
     }
     syncTopbar();renderMessages(sameSessionForceReload?{preserveScroll:true}:undefined);
     const restoredAnchorScene=activeStreamId&&typeof window!=='undefined'
-      ? ((typeof window._renderLiveAnchorActivitySceneForStream==='function'&&window._renderLiveAnchorActivitySceneForStream(activeStreamId, sid, {mode:'compact_worklog'}))||
+      ? ((typeof window._renderLiveAnchorActivitySceneForStream==='function'&&window._renderLiveAnchorActivitySceneForStream(activeStreamId, sid))||
         _renderRuntimeJournalAnchorActivityScene(activeStreamId, sid))
       : false;
     if(typeof ensureRunActivityForCurrentTurn==='function') ensureRunActivityForCurrentTurn();
@@ -1990,7 +2232,7 @@ async function loadSession(sid){
       setComposerStatus('');
       syncTopbar();renderMessages(sameSessionForceReload?{preserveScroll:true}:undefined);
       const restoredAnchorScene=activeStreamId&&typeof window!=='undefined'
-        ? ((typeof window._renderLiveAnchorActivitySceneForStream==='function'&&window._renderLiveAnchorActivitySceneForStream(activeStreamId, sid, {mode:'compact_worklog'}))||
+        ? ((typeof window._renderLiveAnchorActivitySceneForStream==='function'&&window._renderLiveAnchorActivitySceneForStream(activeStreamId, sid))||
           _renderRuntimeJournalAnchorActivityScene(activeStreamId, sid))
         : false;
       let restoredLiveTurn=!!restoredAnchorScene;
@@ -2037,6 +2279,7 @@ async function loadSession(sid){
       cache_hit_percent: _pick(u.cache_hit_percent, _s.cache_hit_percent, null),
       context_length:    _pickPositive(u.context_length, _s.context_length),
       last_prompt_tokens:_pick(u.last_prompt_tokens,_s.last_prompt_tokens),
+      post_compression_context_tokens_estimate:_s.post_compression_context_tokens_estimate||null,
       threshold_tokens:  _pick(_s.threshold_tokens,  u.threshold_tokens),
     });
   }
@@ -2052,6 +2295,27 @@ async function loadSession(sid){
 
   // Clear the in-flight session marker now that this load has completed (#1060).
   if (_isCurrentLoad()) _loadingSessionId = null;
+
+  // Re-acknowledge the visit after the async message-load gap. A deferred
+  // sidebar /api/sessions poll can land while _ensureMessagesLoaded is in
+  // flight and re-mark the open session unread; re-syncing here clears that
+  // sticky dot once the transcript is settled (#4946).
+  //
+  // Gate the final ack on _isSessionActivelyViewedForList(sid): a completion
+  // that lands while _ensureMessagesLoaded() is in flight AND the tab then goes
+  // hidden is correctly marked unread — an UNCONDITIONAL ack here would wrongly
+  // clear that hidden-tab-completion marker. Only clear when the session is
+  // still actively viewed. (#5917 gate finding)
+  if (
+    S.session && S.session.session_id === sid &&
+    (typeof _isSessionActivelyViewedForList !== 'function' || _isSessionActivelyViewedForList(sid))
+  ) {
+    _acknowledgeSessionVisit(
+      sid,
+      Number(S.session.message_count || 0),
+      Number(S.session.last_message_at || S.session.updated_at || 0)
+    );
+  }
 
   if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
 
@@ -2184,7 +2448,7 @@ function _isCliSession(session) {
     || session.source_label
     || ''
   ).toLowerCase();
-  if (raw === 'cli' || raw === 'tui') return true;
+  if (raw === 'cli' || raw === 'tui' || raw === 'acp') return true;
   // If messaging-like, don't classify as legacy CLI even when is_cli_session is true.
   if (_isMessagingSession(session)) return false;
   return session.is_cli_session === true;
@@ -2625,6 +2889,7 @@ function _resolveSessionModelForDisplaySoon(sid){
       S.session.context_length=resolvedContextLength;
       S.session.threshold_tokens=data.session.threshold_tokens||0;
       S.session.last_prompt_tokens=data.session.last_prompt_tokens||0;
+      S.session.post_compression_context_tokens_estimate=data.session.post_compression_context_tokens_estimate||null;
       S.session._modelResolutionDeferred=false;
       syncTopbar();
       if(typeof _syncCtxIndicator==='function'){
@@ -2639,6 +2904,7 @@ function _resolveSessionModelForDisplaySoon(sid){
           cache_hit_percent:_pick(u.cache_hit_percent,S.session.cache_hit_percent,null),
           context_length:resolvedContextLength||u.context_length||0,
           last_prompt_tokens:_pick(u.last_prompt_tokens,S.session.last_prompt_tokens),
+          post_compression_context_tokens_estimate:S.session.post_compression_context_tokens_estimate,
           threshold_tokens:data.session.threshold_tokens||0,
         });
       }
@@ -2845,7 +3111,15 @@ async function _ensureMessagesLoaded(sid, opts) {
     if(typeof scheduleTodosRefresh === 'function'){
       scheduleTodosRefresh();
     }
-    _setSessionViewedCount(sid, Number(S.session.message_count || msgs.length));
+    // Only sync the viewed count (which also clears any completion-unread
+    // marker via _setSessionViewedCount -> _clearSessionCompletionUnread)
+    // when the session is STILL actively viewed. A hidden-tab completion that
+    // lands during the awaited message fetch above must NOT be silently marked
+    // read here — mirror the same _isSessionActivelyViewedForList(sid) guard
+    // used on the post-load re-ack in loadSession(). (#5917 gate finding)
+    if(typeof _isSessionActivelyViewedForList !== 'function' || _isSessionActivelyViewedForList(sid)){
+      _setSessionViewedCount(sid, Number(S.session.message_count || msgs.length));
+    }
     if(typeof syncTopbar==='function') syncTopbar();
   }
 }
@@ -2907,7 +3181,11 @@ function _currentTailUserMessage(messages){
   for(let i=list.length-1;i>=0;i--){
     const msg=list[i];
     if(!msg) continue;
-    if(String(msg.role||'')==='user') return msg;
+    if(String(msg.role||'')==='user'){
+      // Compaction rows are synthetic user-role markers, not submitted turns.
+      if(typeof _isContextCompactionMessage==='function'&&_isContextCompactionMessage(msg)) continue;
+      return msg;
+    }
     if(msg._live||String(msg.role||'')==='tool') continue;
     return null;
   }
@@ -3503,6 +3781,8 @@ _restoreSessionSourceFilter();
 let _sessionActionMenu = null;
 let _sessionActionAnchor = null;
 let _sessionActionSessionId = null;
+let _sessionActionMenuId = 0;
+let _sessionActionPreviousFocus = null;
 const _expandedChildSessionKeys = new Set();
 const _expandedLineageKeys = new Set();
 const _lineageReportCache = new Map();
@@ -3690,6 +3970,32 @@ function _composerPrefillIntentFromLocation(){
     };
   }catch(_e){return empty;}
 }
+function _profileQueryIntentFromLocation(){
+  const empty={hasParam:false,valid:false,name:''};
+  if(typeof window==='undefined'||!window.location) return empty;
+  try{
+    const qs=new URLSearchParams(window.location.search||'');
+    if(!qs.has('profile')) return empty;
+    const name=String(qs.get('profile')||'');
+    return {
+      hasParam:true,
+      valid:/^[a-z0-9][a-z0-9_-]{0,63}$/.test(name),
+      name
+    };
+  }catch(_e){return empty;}
+}
+function _consumeProfileQueryParamFromLocation(){
+  if(typeof window==='undefined'||!window.location||!window.history||typeof window.history.replaceState!=='function') return;
+  try{
+    const current=new URL(window.location.href);
+    const before=current.searchParams.toString();
+    current.searchParams.delete('profile');
+    const after=current.searchParams.toString();
+    if(after===before) return;
+    const next=current.pathname+(after?`?${after}`:'')+(current.hash||'');
+    window.history.replaceState(window.history.state||null,'',next);
+  }catch(_e){}
+}
 function _consumeComposerPrefillParamsFromLocation(){
   if(typeof window==='undefined'||!window.location||!window.history||typeof window.history.replaceState!=='function') return;
   try{
@@ -3837,6 +4143,7 @@ function _renderBatchActionBar(){
         return {response,session:sessionsById.get(sid)||null};
       }));
       const retainedCount=_worktreeResponseCount(results);
+      const cleanupFailedCount=results.filter(result=>result.response&&result.response.state_db_cleanup_failed).length;
       ids.forEach(_clearHandoffStorageForSession);
       if(S.session&&ids.includes(S.session.session_id)){
         S.session=null;S.messages=[];S.entries=[];localStorage.removeItem('hermes-webui-session');
@@ -3845,7 +4152,9 @@ function _renderBatchActionBar(){
         if(remaining.sessions&&remaining.sessions.length){await loadSession(remaining.sessions[0].session_id);}
         else{$('msgInner').innerHTML='';$('emptyState').style.display='';}
       }
-      showToast((retainedCount?t('session_deleted_worktree'):t('session_delete'))+' ('+ids.length+')');exitSessionSelectMode();await renderSessionList();
+      if(cleanupFailedCount) showToast(t('delete_failed')+' ('+cleanupFailedCount+'/'+ids.length+')',0,'error');
+      else showToast((retainedCount?t('session_deleted_worktree'):t('session_delete'))+' ('+ids.length+')');
+      exitSessionSelectMode();await renderSessionList();
     }catch(e){showToast('Delete failed: '+(e.message||e));}
   };bar.appendChild(deleteBtn);
 }
@@ -3876,7 +4185,15 @@ function _showBatchProjectPicker(){
   setTimeout(()=>document.addEventListener('click',close),0);
 }
 
-function closeSessionActionMenu(){
+function _focusSessionActionMenuRestoreTarget(target){
+  if(!target||!target.isConnected||typeof target.focus!=='function') return false;
+  try{target.focus({preventScroll:true});}catch(_){target.focus();}
+  return document.activeElement===target;
+}
+
+function closeSessionActionMenu({restoreFocus=false}={}){
+  const focusTarget=restoreFocus?_sessionActionAnchor:null;
+  const fallbackFocusTarget=restoreFocus?_sessionActionPreviousFocus:null;
   if(_sessionActionMenu){
     _sessionActionMenu.remove();
     _sessionActionMenu = null;
@@ -3884,12 +4201,16 @@ function closeSessionActionMenu(){
   if(_sessionActionAnchor){
     if(_sessionActionAnchor.classList&&_sessionActionAnchor.classList.contains('session-actions-trigger')){
       _sessionActionAnchor.classList.remove('active');
+      _sessionActionAnchor.setAttribute('aria-expanded','false');
+      _sessionActionAnchor.removeAttribute('aria-controls');
     }
     const row=_sessionActionAnchor.closest('.session-item,.session-child-session');
     if(row) row.classList.remove('menu-open','long-pressing');
     _sessionActionAnchor = null;
   }
   _sessionActionSessionId = null;
+  _sessionActionPreviousFocus = null;
+  if(!_focusSessionActionMenuRestoreTarget(focusTarget)) _focusSessionActionMenuRestoreTarget(fallbackFocusTarget);
 }
 
 function _sessionActionMenuShouldIgnoreScrollTarget(target){
@@ -3941,6 +4262,7 @@ function _buildSessionAction(label, meta, icon, onSelect, extraClass=''){
   const opt=document.createElement('button');
   opt.type='button';
   opt.className='ws-opt session-action-opt'+(extraClass?` ${extraClass}`:'');
+  opt.setAttribute('role','menuitem');
   // Compact context-menu shape (#3223 redesign, Nathan 2026-06-01): show only
   // icon + label, matching VS Code / browser / ChatGPT conversation menus. The
   // descriptive `meta` is preserved as a hover tooltip (title=) so the
@@ -4010,15 +4332,44 @@ async function _copySessionLink(session){
 }
 
 function _mountSessionActionMenu(menu, session, anchorEl){
+  _sessionActionPreviousFocus=document.activeElement;
   document.body.appendChild(menu);
   _sessionActionMenu = menu;
   _sessionActionAnchor = anchorEl;
   _sessionActionSessionId = session.session_id;
-  if(anchorEl.classList&&anchorEl.classList.contains('session-actions-trigger')) anchorEl.classList.add('active');
+  if(anchorEl.classList&&anchorEl.classList.contains('session-actions-trigger')){
+    anchorEl.classList.add('active');
+    anchorEl.setAttribute('aria-expanded','true');
+    anchorEl.setAttribute('aria-controls',menu.id);
+  }
   const row=anchorEl.closest('.session-item,.session-child-session');
   if(row) row.classList.add('menu-open');
   _positionSessionActionMenu(anchorEl);
   _playSessionActionMenuEntrance(menu);
+  const menuItems=()=>Array.from(menu.querySelectorAll('.session-action-opt:not([disabled])'));
+  menu.addEventListener('keydown',e=>{
+    const items=menuItems();
+    if(e.key==='Escape'){
+      e.preventDefault();
+      e.stopPropagation();
+      closeSessionActionMenu({restoreFocus:true});
+      return;
+    }
+    if(!items.length) return;
+    const currentIndex=Math.max(0,items.indexOf(document.activeElement));
+    let nextIndex=null;
+    if(e.key==='ArrowDown') nextIndex=(currentIndex+1)%items.length;
+    else if(e.key==='ArrowUp') nextIndex=(currentIndex-1+items.length)%items.length;
+    else if(e.key==='Home') nextIndex=0;
+    else if(e.key==='End') nextIndex=items.length-1;
+    if(nextIndex===null) return;
+    e.preventDefault();
+    try{items[nextIndex].focus({preventScroll:true});}catch(_){items[nextIndex].focus();}
+  });
+  const firstAction=menuItems()[0];
+  if(firstAction){
+    try{firstAction.focus({preventScroll:true});}catch(_){firstAction.focus();}
+  }
 }
 
 function _findSessionRenameRow(sessionId){
@@ -4107,6 +4458,128 @@ function _appendSessionCopyLinkAction(menu, session){
       closeSessionActionMenu();
       await _copySessionLink(session);
     }
+  ));
+}
+
+function _sessionPublicShareUrl(session){
+  const token=session&&session.share_token?String(session.share_token).trim():'';
+  if(!token) return '';
+  return new URL(`/share/${encodeURIComponent(token)}`,location.origin).href;
+}
+
+function _syncSessionShareState(session, nextSession){
+  if(!session||!nextSession) return;
+  session.share_token=nextSession.share_token||null;
+  session.share_created_at=nextSession.share_created_at||null;
+  const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);
+  if(cached){
+    cached.share_token=session.share_token;
+    cached.share_created_at=session.share_created_at;
+  }
+  if(S.session&&S.session.session_id===session.session_id){
+    S.session.share_token=session.share_token;
+    S.session.share_created_at=session.share_created_at;
+    if(typeof _syncHermesPanelSessionActions==='function') _syncHermesPanelSessionActions();
+  }
+  renderSessionListFromCache();
+  void renderSessionList();
+}
+
+async function _createOrRefreshSessionShare(session){
+  if(!session||!session.session_id) return;
+  const existing=_sessionPublicShareUrl(session);
+  if(existing){
+    const reuse=await showConfirmDialog({
+      title:t('share_session'),
+      message:t('share_session_existing_confirm'),
+      confirmLabel:t('share_session_copy_existing'),
+      cancelLabel:t('share_session_refresh_snapshot'),
+    });
+    if(reuse){
+      let copied=true;
+      try{ await _copyTextToClipboard(existing); }catch(_){ copied=false; }
+      showToast(copied?t('share_session_link_copied'):(t('share_session_status_active')+' — '+existing),copied?2500:6000);
+      window.open(existing,'_blank','noopener');
+      return;
+    }
+  }
+  const res=await api('/api/share/create',{method:'POST',body:JSON.stringify({session_id:session.session_id})});
+  if(res&&res.session) _syncSessionShareState(session,res.session);
+  const href=new URL(String(res&&res.share&&res.share.url||''),location.origin).href;
+  // The share is now created server-side. A clipboard-copy failure (permissions,
+  // focus, non-secure context) must NOT be reported as "Share failed" — the link
+  // exists and we still open it. Only surface the copied-vs-not-copied distinction.
+  let copied=true;
+  try{ await _copyTextToClipboard(href); }catch(_){ copied=false; }
+  if(copied){
+    showToast(existing?t('share_session_link_copied'):t('share_session_created'));
+  }else{
+    showToast((existing?t('share_session_created'):t('share_session_created'))+' — '+href,6000);
+  }
+  window.open(href,'_blank','noopener');
+}
+
+async function _revokeSessionShare(session){
+  if(!session||!session.session_id||!session.share_token) return;
+  const ok=await showConfirmDialog({
+    title:t('stop_sharing_session'),
+    message:t('stop_sharing_session_confirm'),
+    confirmLabel:t('stop_sharing_session'),
+    danger:true,
+  });
+  if(!ok) return;
+  const res=await api('/api/share/revoke',{method:'POST',body:JSON.stringify({session_id:session.session_id})});
+  if(res&&res.session) _syncSessionShareState(session,res.session);
+  showToast(t('share_session_revoked'));
+}
+
+function _appendSessionShareActions(menu, session){
+  const hasMessages=Number(session&&session.message_count||0)>0;
+  if(!hasMessages) return;
+  menu.appendChild(_buildSessionAction(
+    t('share_session'),
+    session&&session.share_token?t('share_session_status_active'):t('share_session_tooltip'),
+    ICONS.link,
+    async()=>{
+      closeSessionActionMenu();
+      try{
+        await _createOrRefreshSessionShare(session);
+      }catch(err){
+        showToast(t('share_session_failed')+(err&&err.message?err.message:String(err||'')),4000,'error');
+      }
+    },
+    session&&session.share_token?'is-active':''
+  ));
+  if(!(session&&session.share_token)) return;
+  menu.appendChild(_buildSessionAction(
+    t('share_session_copy_existing'),
+    t('share_session_tooltip'),
+    ICONS.link,
+    async()=>{
+      closeSessionActionMenu();
+      try{
+        const href=_sessionPublicShareUrl(session);
+        if(!href) return;
+        await _copyTextToClipboard(href);
+        showToast(t('share_session_link_copied'));
+      }catch(err){
+        showToast(t('share_session_failed')+(err&&err.message?err.message:String(err||'')),4000,'error');
+      }
+    }
+  ));
+  menu.appendChild(_buildSessionAction(
+    t('stop_sharing_session'),
+    t('stop_sharing_session_tooltip'),
+    ICONS.trash,
+    async()=>{
+      closeSessionActionMenu();
+      try{
+        await _revokeSessionShare(session);
+      }catch(err){
+        showToast(t('share_session_revoke_failed')+(err&&err.message?err.message:String(err||'')),4000,'error');
+      }
+    },
+    'danger'
   ));
 }
 
@@ -4201,6 +4674,9 @@ function _openSessionActionMenu(session, anchorEl){
   const isExternalSession = isMessagingSession || isCliSession;
   const menu=document.createElement('div');
   menu.className='session-action-menu';
+  menu.id='sessionActionMenu-'+(++_sessionActionMenuId);
+  menu.setAttribute('role','menu');
+  menu.setAttribute('aria-label', 'Conversation actions');
   _appendSessionCopyLinkAction(menu, session);
   if(isReadOnly){
     _appendSessionExportHtmlAction(menu, session);
@@ -4234,6 +4710,7 @@ function _openSessionActionMenu(session, anchorEl){
       }
     ));
   }
+  _appendSessionShareActions(menu, session);
   menu.appendChild(_buildSessionAction(
     session.pinned?t('session_unpin'):t('session_pin'),
     session.pinned?t('session_unpin_desc'):t('session_pin_desc'),
@@ -4390,7 +4867,7 @@ document.addEventListener('scroll',e=>{
   closeSessionActionMenu();
 }, true);
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape' && _sessionActionMenu) closeSessionActionMenu();
+  if(e.key==='Escape' && _sessionActionMenu) closeSessionActionMenu({restoreFocus:true});
 });
 window.addEventListener('resize',()=>{
   if(_sessionActionMenu && _sessionActionAnchor) _positionSessionActionMenu(_sessionActionAnchor);
@@ -4648,7 +5125,11 @@ function _schedulePendingSessionListApply(){
     const payload=_pendingSessionListPayload;
     _pendingSessionListPayload=null;
     if(payload.gen!==_renderSessionListGen) return;
-    _applySessionListPayload(payload.sessData,payload.projData);
+    // Profile switch may have bumped unread gen after the list gen check
+    // window; still drop completion-marking for the stale pre-switch payload.
+    _applySessionListPayload(payload.sessData,payload.projData,{
+      unreadGen:payload.unreadGen,
+    });
   }, Math.max(120, SESSION_LIST_INTERACTION_IDLE_MS));
 }
 
@@ -4718,10 +5199,11 @@ function _sessionListRenderSignature(){
     ]);
   }catch(_){ return null; }
 }
-function _applySessionListPayload(sessData, projData){
+function _applySessionListPayload(sessData, projData, opts){
   // Server's other_profile_count tells us how many sessions exist outside the
   // active profile so the "Show N from other profiles" toggle can render
   // without a second round-trip. Stashed on the module for renderSessionListFromCache.
+  const applyOpts = (opts && typeof opts === 'object') ? opts : {};
   _otherProfileCount = sessData.other_profile_count || 0;
   _archivedWebuiCount = Number(sessData.archived_webui_count ?? sessData.archived_count ?? 0);
   _archivedCliCount = Number(sessData.archived_cli_count ?? 0);
@@ -4785,7 +5267,16 @@ function _applySessionListPayload(sessData, projData){
   const _hadSessionListLoadError = !!_sessionListLoadError;
   _sessionListLoadError = null;
   _sessionListHasLoadedOnce = true;
-  _markPollingCompletionUnreadTransitions(_allSessions);
+  // Greptile #5975 P1: a /api/sessions request started under profile A can
+  // finish after a switch to B already cleared A's cron markers. The list gen
+  // check can already have passed (TOCTOU) or a deferred apply can land later.
+  // Re-validate the profile-switch unread generation (shared with cron poll
+  // reset via _cronPollGeneration) immediately before marking completions.
+  const expectedUnreadGen = applyOpts.unreadGen;
+  const currentUnreadGen = (typeof _cronPollGeneration === 'number') ? _cronPollGeneration : 0;
+  if (typeof expectedUnreadGen !== 'number' || expectedUnreadGen === currentUnreadGen) {
+    _markPollingCompletionUnreadTransitions(_allSessions);
+  }
   const isStreaming = _allSessions.some(s => _isSessionEffectivelyStreaming(s));
   if (isStreaming) {
     startStreamingPoll();
@@ -4924,6 +5415,10 @@ function _renderSessionListLoadErrorNote(){
 async function _runRenderSessionListRefresh(opts, _gen){
   const deferWhileInteracting=Boolean(opts&&opts.deferWhileInteracting);
   if(!deferWhileInteracting) _pendingSessionListPayload=null;
+  // Capture profile-switch unread generation BEFORE the await so a switch
+  // mid-flight (which increments _cronPollGeneration) invalidates completion
+  // marking for this response even if list gen checks already passed.
+  const unreadGen = (typeof _cronPollGeneration === 'number') ? _cronPollGeneration : 0;
   try{
     if(!($('sessionSearch').value||'').trim()) _contentSearchResults = [];
     const sessionListQS = _sessionListQueryString();
@@ -4952,11 +5447,11 @@ async function _runRenderSessionListRefresh(opts, _gen){
     // renderSessionList(), so that render's payload is the first allowed to paint.
     if (_profileSwitchListEmbargo) return;
     if(deferWhileInteracting&&_isSessionListUserInteracting()){
-      _pendingSessionListPayload={gen:_gen,sessData,projData};
+      _pendingSessionListPayload={gen:_gen,sessData,projData,unreadGen};
       _schedulePendingSessionListApply();
       return;
     }
-    _applySessionListPayload(sessData,projData);
+    _applySessionListPayload(sessData,projData,{unreadGen});
   }catch(e){
     if (_gen !== _renderSessionListGen) return;
     // #4671: same embargo guard as the success path — a mid-switch /api/sessions that
@@ -7820,6 +8315,7 @@ function renderSessionListFromCache(){
             menuBtn.className='session-actions-trigger';
             menuBtn.title='Conversation actions';
             menuBtn.setAttribute('aria-haspopup','menu');
+            menuBtn.setAttribute('aria-expanded','false');
             menuBtn.setAttribute('aria-label','Conversation actions');
             menuBtn.innerHTML=ICONS.more;
             const stopMenuPointer=(e)=>e.stopPropagation();
@@ -7918,6 +8414,7 @@ function renderSessionListFromCache(){
       menuBtn.className='session-actions-trigger';
       menuBtn.title='Conversation actions';
       menuBtn.setAttribute('aria-haspopup','menu');
+      menuBtn.setAttribute('aria-expanded','false');
       menuBtn.setAttribute('aria-label','Conversation actions');
       menuBtn.innerHTML=ICONS.more;
       const stopMenuPointer=(e)=>e.stopPropagation();
@@ -8404,6 +8901,7 @@ async function deleteSession(sid, beforeDelete=null){
     return false;
   }
   const response=deleteResult&&deleteResult.response;
+  const cleanupFailed=!!(response&&response.state_db_cleanup_failed);
   if(typeof _clearPersistedSessionQueue==='function') _clearPersistedSessionQueue(sid);
   if(!optimisticRendered){
     _pendingSessionReflowPositions=reflowPositions;
@@ -8427,10 +8925,11 @@ async function deleteSession(sid, beforeDelete=null){
       if(typeof syncAppTitlebar==='function') syncAppTitlebar();
     }
   }
-  showToast(_sessionResponseRetainsWorktree(response,session)?t('session_deleted_worktree'):t('session_deleted'));
+  if(cleanupFailed) showToast(t('delete_failed'),0,'error');
+  else showToast(_sessionResponseRetainsWorktree(response,session)?t('session_deleted_worktree'):t('session_deleted'));
   if(optimisticRendered) void renderSessionList().finally(()=>_optimisticallyRemovedSessionIds.delete(sid));
   else await renderSessionList();
-  return true;
+  return !cleanupFailed;
 }
 
 // ── Project helpers ─────────────────────────────────────────────────────
