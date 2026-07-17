@@ -6257,7 +6257,6 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
     pending_text = str(getattr(session, 'pending_user_message', None) or '')
     if not pending_text:
         return False
-<<<<<<< HEAD
     if _is_internal_wakeup_source(getattr(session, 'pending_user_source', None)):
         return False
     normalized_pending = " ".join(pending_text.split())
@@ -6268,17 +6267,6 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
             existing_text = " ".join(str(existing.get('content') or '').split())
             if existing_text == normalized_pending:
                 return False
-||||||| 63fe02e2
-    normalized_pending = " ".join(pending_text.split())
-    if normalized_pending:
-        for existing in reversed(list(getattr(session, 'messages', None) or [])[-8:]):
-            if not isinstance(existing, dict) or existing.get('role') != 'user':
-                continue
-            existing_text = " ".join(str(existing.get('content') or '').split())
-            if existing_text == normalized_pending:
-                return False
-=======
->>>>>>> origin/master
     recovered_ts = int(time.time())
     pending_started_at = getattr(session, 'pending_started_at', None)
     if isinstance(pending_started_at, (int, float)) and pending_started_at > 0:
