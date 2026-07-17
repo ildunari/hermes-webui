@@ -65,19 +65,55 @@ from api.shares import create_or_refresh_share, load_share, revoke_share
 logger = logging.getLogger(__name__)
 
 
+def _is_internal_wakeup_source(source) -> bool:
+    """Return True for server-internal prompts that should remain model-only."""
+    return str(source or "").strip() == "process_wakeup"
+
+
+def _is_internal_wakeup_text(text) -> bool:
+    """Recognize current and legacy internal wakeup prompt formats."""
+    value = str(text or "").lstrip()
+    return (
+        value.startswith("[IMPORTANT: Background process")
+        or value.startswith("[IMPORTANT: Watch-pattern overflow")
+        or value.startswith("[IMPORTANT: Watch patterns")
+        or value.startswith("[ASYNC DELEGATION")
+    )
+
+
 def _is_internal_wakeup_message_for_display(msg) -> bool:
-    """Return True for server-internal wakeup prompts that clients must not render."""
+    """Return True for model-facing wakeup rows that clients must not render."""
     if not isinstance(msg, dict) or msg.get("role") != "user":
         return False
-    if str(msg.get("_source") or "").strip() == "process_wakeup":
-        return True
-    text = str(msg.get("content") or "").lstrip()
-    return text.startswith("[IMPORTANT: Background process") or text.startswith("[ASYNC DELEGATION")
+    return _is_internal_wakeup_source(msg.get("_source")) or _is_internal_wakeup_text(
+        msg.get("content")
+    )
 
 
 def _visible_messages_for_client(messages) -> list:
-    """Filter internal process/subagent wakeup rows out of API-visible transcripts."""
-    return [m for m in list(messages or []) if not _is_internal_wakeup_message_for_display(m)]
+    """Filter internal process/subagent wakeup rows out of client transcripts."""
+    return [
+        message
+        for message in list(messages or [])
+        if not _is_internal_wakeup_message_for_display(message)
+    ]
+
+
+def _pending_user_message_for_client(session):
+    """Hide an internal pending prompt while preserving the active stream itself."""
+    pending = getattr(session, "pending_user_message", None)
+    if not pending:
+        return pending
+    if _is_internal_wakeup_source(getattr(session, "pending_user_source", None)):
+        return None
+    return None if _is_internal_wakeup_text(pending) else pending
+
+
+def _pending_user_source_for_client(session):
+    """Do not expose a source tag for a pending message hidden from the client."""
+    if _pending_user_message_for_client(session) is None:
+        return None
+    return getattr(session, "pending_user_source", None)
 
 
 def _publish_session_list_changed(
@@ -1917,6 +1953,7 @@ def _session_list_cache_key(
     show_cli_sessions: bool,
     show_previous_messaging_sessions: bool,
     show_cron_sessions: bool,
+    show_messaging_sessions: bool = False,
     include_archived: bool = False,
     exclude_hidden: bool = False,
     visible_only: bool = False,
@@ -1941,7 +1978,7 @@ def _session_list_cache_key(
         sidebar_source=sidebar_source,
         archived_limit=archived_limit,
         archived_offset=archived_offset,
-    ) + (bool(show_claude_code_sessions),)
+    ) + (bool(show_claude_code_sessions), bool(show_messaging_sessions))
 
 _ROUTE_SESSION_LIST_CACHE_DYNAMIC_EXPORTS = {
     "_SESSIONS_CACHE_ALL_PROFILES_INVALIDATION_VERSION",
@@ -2177,6 +2214,7 @@ def _build_session_list_cache_payload(
     show_cli_sessions: bool,
     show_previous_messaging_sessions: bool,
     show_cron_sessions: bool,
+    show_messaging_sessions: bool = False,
     show_claude_code_sessions: bool = True,
     include_archived: bool = False,
     exclude_hidden: bool = False,
@@ -2230,6 +2268,7 @@ def _build_session_list_cache_payload(
         webui_sessions = _all_sessions_for_sidebar()
     diag_stage("normalize_cli_rows")
     show_cli_sessions = bool(show_cli_sessions)
+    show_messaging_sessions = bool(show_messaging_sessions)
     show_previous_messaging_sessions = bool(show_previous_messaging_sessions)
     show_cron_sessions = bool(show_cron_sessions)
     show_webhook_sessions = bool(show_webhook_sessions)
@@ -2437,6 +2476,15 @@ def _build_session_list_cache_payload(
     else:
         scoped = [s for s in merged if _profiles_match(s.get("profile"), active_profile)]
         other_profile_count = 0 if _is_isolated_profile_mode() else len(merged) - len(scoped)
+    diag_stage("source_visibility")
+    scoped = [
+        s for s in scoped
+        if _session_allowed_by_webui_source_visibility(
+            s,
+            show_messaging_sessions=show_messaging_sessions,
+            show_cron_sessions=show_cron_sessions,
+        )
+    ]
     diag_stage("messaging_dedupe")
     archived_scoped = _keep_latest_messaging_session_per_source(
         list(scoped),
@@ -2562,6 +2610,7 @@ def _build_session_list_cache_payload(
         "other_profile_count": other_profile_count,
         "settings": {
             "show_cli_sessions": show_cli_sessions,
+            "show_messaging_sessions": show_messaging_sessions,
             "show_previous_messaging_sessions": show_previous_messaging_sessions,
             "show_cron_sessions": show_cron_sessions,
             "show_claude_code_sessions": show_claude_code_sessions if show_cli_sessions else False,
@@ -8317,6 +8366,32 @@ def _is_messaging_session_record(session) -> bool:
     return _is_known_messaging_source(raw)
 
 
+def _is_cron_session_record(session) -> bool:
+    """Return true for rows backed by scheduled cron-job runs."""
+    if not session:
+        return False
+    values = []
+    for key in ("raw_source", "source_tag", "source", "session_source", "source_label"):
+        values.append(
+            getattr(session, key, None) if not isinstance(session, dict) else session.get(key)
+        )
+    return any(_normalized_source_marker(value) == "cron" for value in values)
+
+
+def _session_allowed_by_webui_source_visibility(
+    session,
+    *,
+    show_messaging_sessions: bool = False,
+    show_cron_sessions: bool = False,
+) -> bool:
+    """Default WebUI history policy: local/WebUI/terminal rows yes, messaging+cron no."""
+    if not show_messaging_sessions and _is_messaging_session_record(session):
+        return False
+    if not show_cron_sessions and _is_cron_session_record(session):
+        return False
+    return True
+
+
 def _messages_include_tool_metadata(messages) -> bool:
     """Return true when returned messages can reconstruct their own tool cards."""
     if not isinstance(messages, list):
@@ -12726,10 +12801,10 @@ def handle_get(handler, parsed) -> bool:
                 "message_count": _merged_message_count,
                 "tool_calls": _session_tool_calls,
                 "active_stream_id": getattr(s, "active_stream_id", None),
-                "pending_user_message": getattr(s, "pending_user_message", None),
+                "pending_user_message": _pending_user_message_for_client(s),
                 "pending_attachments": getattr(s, "pending_attachments", []) if load_messages else [],
                 "pending_started_at": getattr(s, "pending_started_at", None),
-                "pending_user_source": getattr(s, "pending_user_source", None),
+                "pending_user_source": _pending_user_source_for_client(s),
                 "context_length": _persisted_cl,
                 "threshold_tokens": _threshold_tokens,
                 "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
@@ -12989,6 +13064,7 @@ def handle_get(handler, parsed) -> bool:
             settings = load_settings()
             show_cli_sessions = bool(settings.get("show_cli_sessions"))
             show_claude_code_sessions = bool(settings.get("show_claude_code_sessions"))
+            show_messaging_sessions = bool(settings.get("show_messaging_sessions"))
             show_previous_messaging_sessions = bool(
                 settings.get("show_previous_messaging_sessions")
             )
@@ -13011,6 +13087,7 @@ def handle_get(handler, parsed) -> bool:
                 all_profiles=all_profiles,
                 show_cli_sessions=show_cli_sessions,
                 show_claude_code_sessions=show_claude_code_sessions,
+                show_messaging_sessions=show_messaging_sessions,
                 show_previous_messaging_sessions=show_previous_messaging_sessions,
                 show_cron_sessions=show_cron_sessions,
                 include_archived=include_archived,
@@ -13033,6 +13110,7 @@ def handle_get(handler, parsed) -> bool:
                     all_profiles=all_profiles,
                     show_cli_sessions=show_cli_sessions,
                     show_claude_code_sessions=show_claude_code_sessions,
+                    show_messaging_sessions=show_messaging_sessions,
                     show_previous_messaging_sessions=show_previous_messaging_sessions,
                     show_cron_sessions=show_cron_sessions,
                     include_archived=include_archived,
@@ -20775,11 +20853,11 @@ def _prepare_chat_start_session_for_stream(
     s.pending_started_at = started_at if started_at is not None else time.time()
     s.pending_user_source = source
     current_title = getattr(s, "title", None)
-    if _is_default_or_empty_session_title(current_title):
+    if not _is_internal_wakeup_source(source) and _is_default_or_empty_session_title(current_title):
         provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
         if provisional_title and not _is_default_or_empty_session_title(provisional_title):
             s.title = provisional_title
-    if get_webui_session_save_mode() == "eager" and source != "process_wakeup":
+    if get_webui_session_save_mode() == "eager":
         _checkpoint_user_message_for_eager_session_save(
             s,
             msg,
@@ -24582,7 +24660,7 @@ def _handle_session_compress(handler, body):
                 "messages": _visible_messages_for_client(s.messages),
                 "tool_calls": s.tool_calls,
                 "active_stream_id": s.active_stream_id,
-                "pending_user_message": s.pending_user_message,
+                "pending_user_message": _pending_user_message_for_client(s),
                 "pending_attachments": s.pending_attachments,
                 "pending_started_at": s.pending_started_at,
                 "compression_anchor_visible_idx": getattr(s, "compression_anchor_visible_idx", None),
