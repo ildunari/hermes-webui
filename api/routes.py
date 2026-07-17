@@ -91,12 +91,8 @@ def _is_internal_wakeup_message_for_display(msg) -> bool:
 
 
 def _visible_messages_for_client(messages) -> list:
-    """Filter internal process/subagent wakeup rows out of client transcripts."""
-    return [
-        message
-        for message in list(messages or [])
-        if not _is_internal_wakeup_message_for_display(message)
-    ]
+    """Preserve persisted wakeup boundaries; the frontend renders them compactly."""
+    return list(messages or [])
 
 
 def _pending_user_message_for_client(session):
@@ -20853,7 +20849,7 @@ def _prepare_chat_start_session_for_stream(
     s.pending_started_at = started_at if started_at is not None else time.time()
     s.pending_user_source = source
     current_title = getattr(s, "title", None)
-    if not _is_internal_wakeup_source(source) and _is_default_or_empty_session_title(current_title):
+    if _is_default_or_empty_session_title(current_title):
         provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
         if provisional_title and not _is_default_or_empty_session_title(provisional_title):
             s.title = provisional_title
