@@ -132,7 +132,9 @@ def test_ollama_cloud_manual_credential_shows_group(monkeypatch, tmp_path):
     groups = _group_by_provider(result)
     assert "Ollama Cloud" in groups, f"Expected Ollama Cloud in {list(groups)}"
     model_ids = [m["id"] for m in groups["Ollama Cloud"]]
-    assert model_ids == ["@ollama-cloud:gpt-oss:20b", "@ollama-cloud:qwen3:30b-a3b"], model_ids
+    # Colon-containing ids stay bare (frontend parses @provider:model on the
+    # last colon); the optgroup provider_id carries the route hint.
+    assert model_ids == ["gpt-oss:20b", "qwen3:30b-a3b"], model_ids
 
 
 def test_copilot_gh_cli_only_credential_hidden(monkeypatch, tmp_path):
@@ -355,14 +357,21 @@ def test_load_pool_explicit_credential_shows_provider(monkeypatch, tmp_path):
 # --- _apply_provider_prefix helper ---
 
 
-def test_apply_provider_prefix_ollama_cloud_non_active():
-    """Bare ollama-cloud model ids get @ollama-cloud: prefix when not active."""
+def test_apply_provider_prefix_ollama_cloud_colon_ids_stay_bare():
+    """Colon-containing model ids are never prefixed — in ANY group.
+
+    The frontend parses '@provider:model' on the LAST colon, so
+    '@ollama-cloud:gpt-oss:20b' would be mis-split into provider
+    'ollama-cloud:gpt-oss'. Keeping colon ids bare in every group (active or
+    not) is still stable across active-provider flips; the optgroup's
+    provider_id carries the route hint.
+    """
     from api.config import _apply_provider_prefix
 
     raw = [{"id": "gpt-oss:20b", "label": "gpt-oss:20b"}, {"id": "qwen3:30b-a3b", "label": "qwen3:30b-a3b"}]
     result = _apply_provider_prefix(raw, "ollama-cloud", "openai-codex")
     ids = [m["id"] for m in result]
-    assert ids == ["@ollama-cloud:gpt-oss:20b", "@ollama-cloud:qwen3:30b-a3b"], ids
+    assert ids == ["gpt-oss:20b", "qwen3:30b-a3b"], ids
 
 
 def test_apply_provider_prefix_copilot_non_active():
@@ -390,14 +399,21 @@ def test_apply_provider_prefix_no_double_prefix():
     assert [m["supports_fast_tier"] for m in result] == [True, True, False]
 
 
-def test_apply_provider_prefix_active_provider_no_prefix():
-    """No prefix is added when the provider is already the active one."""
+def test_apply_provider_prefix_active_provider_also_prefixed():
+    """Active provider models get the same stable @provider: prefix.
+
+    Stability contract: a model's ID must not change spelling when the
+    active provider flips, because clients persist the exact ID string
+    (favorites/recents/session state). Prefix must therefore be identical
+    whether or not the provider is active.
+    """
     from api.config import _apply_provider_prefix
 
     raw = [{"id": "gpt-5.4", "label": "GPT-5.4"}]
-    result = _apply_provider_prefix(raw, "openai-codex", "openai-codex")
-    ids = [m["id"] for m in result]
-    assert ids == ["gpt-5.4"], ids
+    as_active = _apply_provider_prefix(raw, "openai-codex", "openai-codex")
+    as_inactive = _apply_provider_prefix(raw, "openai-codex", "vibeproxy")
+    assert [m["id"] for m in as_active] == ["@openai-codex:gpt-5.4"]
+    assert as_active == as_inactive, (as_active, as_inactive)
 
 
 def test_copilot_mixed_pool_prefixed_models(monkeypatch, tmp_path):
@@ -444,13 +460,15 @@ def test_auth_store_active_provider_alias_is_resolved(monkeypatch, tmp_path):
 
     result = _call_get_available_models(monkeypatch, tmp_path, auth_payload)
     groups = _group_by_provider(result)
-    # Gemini should appear under its canonical display name and its model
-    # ids should NOT be prefixed (it's the active provider).
+    # Gemini should appear under its canonical display name. Under the
+    # stable-ID contract every provider group is prefixed with its CANONICAL
+    # slug — the alias table must still resolve 'google' → 'gemini' so the
+    # prefix is '@gemini:' and never '@google:'.
     assert "Gemini" in groups, f"Expected Gemini in {list(groups)}"
     model_ids = [m["id"] for m in groups["Gemini"]]
     assert model_ids, "Gemini group should have models"
-    assert not any(mid.startswith("@") for mid in model_ids), (
-        f"Active provider models must not be prefixed; got {model_ids}"
+    assert all(mid.startswith("@gemini:") for mid in model_ids), (
+        f"Models must carry the canonical @gemini: prefix; got {model_ids}"
     )
 
 

@@ -212,7 +212,7 @@ def test_minimax_cn_detected_from_os_environ(monkeypatch, tmp_path):
     # import time, so assert the curated entries are a subset rather than an
     # exact match (#4413).
     cn_ids = {m['id'] for m in groups['minimax-cn']['models']}
-    assert {'MiniMax-M3', 'MiniMax-M2.7'}.issubset(cn_ids), (
+    assert {'@minimax-cn:MiniMax-M3', '@minimax-cn:MiniMax-M2.7'}.issubset(cn_ids), (
         f"Expected curated MiniMax-CN models in {cn_ids}"
     )
     assert 'minimax' not in groups, (

@@ -161,7 +161,7 @@ def test_memory_models_cache_invalidates_when_static_catalog_changes(tmp_path, m
     result = config.get_available_models()
 
     opencode_group = next(g for g in result["groups"] if g.get("provider_id") == "opencode-go")
-    assert any(m.get("id") == "new-catalog-model" for m in opencode_group["models"])
+    assert any(m.get("id") == "@opencode-go:new-catalog-model" for m in opencode_group["models"])
 
 
 def test_disk_models_cache_invalidates_when_static_catalog_changes(tmp_path, monkeypatch):
@@ -179,4 +179,4 @@ def test_disk_models_cache_invalidates_when_static_catalog_changes(tmp_path, mon
 
     assert result != stale_opencode
     opencode_group = next(g for g in result["groups"] if g.get("provider_id") == "opencode-go")
-    assert any(m.get("id") == "new-disk-catalog-model" for m in opencode_group["models"])
+    assert any(m.get("id") == "@opencode-go:new-disk-catalog-model" for m in opencode_group["models"])

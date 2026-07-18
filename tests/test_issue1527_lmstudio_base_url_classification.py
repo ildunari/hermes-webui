@@ -161,7 +161,7 @@ providers:
     assert "ollama" not in groups
     assert "custom" in groups
     model_ids = {model["id"] for model in groups["custom"]["models"]}
-    assert {"custom-model", "custom-extra"} <= model_ids
+    assert {"@custom:custom-model", "@custom:custom-extra"} <= model_ids
 
 
 def test_lmstudio_session_model_resolves_to_configured_base_url(tmp_path, monkeypatch):

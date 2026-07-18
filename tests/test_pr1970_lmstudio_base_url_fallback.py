@@ -283,8 +283,8 @@ providers:
             f"lmstudio group missing when hermes_cli unavailable; groups={list(groups)}"
         )
         model_ids = {m["id"] for m in groups["lmstudio"]["models"]}
-        assert "qwen3.6-35b-a3b@q6_k" in model_ids
-        assert "another-model" in model_ids
+        assert "@lmstudio:qwen3.6-35b-a3b@q6_k" in model_ids
+        assert "@lmstudio:another-model" in model_ids
     finally:
         try:
             sys.meta_path.remove(blocker)
@@ -358,8 +358,8 @@ providers:
             f"lmstudio group missing for malformed providers list; groups={list(groups)}"
         )
         model_ids = {model["id"] for model in groups["lmstudio"]["models"]}
-        assert "qwen3.6-35b-a3b@q6_k" in model_ids
-        assert "another-model" in model_ids
+        assert "@lmstudio:qwen3.6-35b-a3b@q6_k" in model_ids
+        assert "@lmstudio:another-model" in model_ids
     finally:
         try:
             sys.meta_path.remove(blocker)

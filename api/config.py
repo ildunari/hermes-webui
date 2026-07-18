@@ -2260,24 +2260,63 @@ def _apply_provider_prefix(
     provider_id: str,
     active_provider: str | None,
 ) -> list[dict]:
-    """Return *raw_models* with @provider: prefixes applied when needed.
+    """Return *raw_models* with stable @provider: prefixes applied.
 
-    Prefixing is skipped when (a) the provider is already the active one, or
-    (b) a model id already starts with '@' or contains '/' (already routable).
+    Model IDs must be STABLE across active-provider changes: clients (Hermex,
+    Desktop, browser) persist the exact ID string in favorites/recents/session
+    state, so an ID that changes spelling when the active provider flips
+    (bare today, ``@provider:`` tomorrow) permanently strands those references.
+    Therefore prefixing is applied to EVERY provider group, including the
+    currently-active one (``active_provider`` is kept for signature
+    compatibility but no longer suppresses prefixing).
+
+    Prefixing is still skipped when:
+      (a) a model id already starts with '@' or contains '/' (already
+          routable as-is), or
+      (b) the prefixed form would not round-trip through
+          ``_parse_provider_qualified_model_id`` back to the same
+          ``(model, provider)`` — e.g. colon-containing model ids under the
+          anonymous ``custom`` provider. Those stay bare (fail closed) so we
+          never emit an ID the resolver would mis-route.
     """
-    _active = (active_provider or "").lower()
-    if not _active or provider_id == _active:
-        return list(raw_models)
+    del active_provider  # stability contract: prefix regardless of active provider
+    pid = str(provider_id or "").strip()
+    if not pid:
+        return [dict(m) for m in raw_models]
     result = []
     for m in raw_models:
-        mid = m["id"]
         entry = dict(m)
-        if mid.startswith("@") or "/" in mid:
-            result.append(entry)
-        else:
-            entry["id"] = f"@{provider_id}:{mid}"
-            result.append(entry)
+        entry["id"] = _stable_prefixed_model_id(entry["id"], pid)
+        result.append(entry)
     return result
+
+
+def _stable_prefixed_model_id(model_id: str, provider_id: str) -> str:
+    """Return the stable ``@provider:model`` spelling of *model_id*, or the
+    original id when prefixing would be unsafe.
+
+    Skipped (id returned unchanged) when:
+      (a) the id already starts with '@' or contains '/' (already routable), or
+      (b) the bare id contains ':' (e.g. ollama's ``gpt-oss:20b``). The
+          frontend parses ``@provider:model`` on the LAST colon, so a
+          colon-containing model would be mis-split into a bogus provider.
+          Keeping such ids bare in EVERY group (active or not) is still
+          stable — the optgroup's provider_id carries the route hint, or
+      (c) the prefixed form would not round-trip through
+          ``_parse_provider_qualified_model_id`` back to the same
+          ``(model, provider)``. Fail closed: never emit an ID the resolver
+          would mis-route.
+    """
+    mid = str(model_id or "")
+    pid = str(provider_id or "").strip()
+    if not pid or not mid:
+        return mid
+    if mid.startswith("@") or "/" in mid or ":" in mid:
+        return mid
+    candidate = f"@{pid}:{mid}"
+    if _parse_provider_qualified_model_id(candidate) != (mid, pid):
+        return mid
+    return candidate
 
 
 def _deduplicate_model_ids(groups: list[dict]) -> None:
@@ -4751,12 +4790,26 @@ def _endpoint_advertised_model_ids(provider_id: str | None) -> frozenset | None:
             # so an id the endpoint genuinely advertised may live in either. Only
             # reading ``models`` would miss it and mis-resolve (e.g. leave the
             # #433 bare id unstripped because it sits in extra_models).
-            ids = frozenset(
+            #
+            # Catalog ids carry the display-stable ``@slug:`` prefix (stable-ID
+            # contract), but the ENDPOINT advertised the bare form — and the
+            # resolver compares bare/vendor ids against this set. Index both
+            # spellings so display prefixing never hides real provenance.
+            raw_ids = [
                 str(m.get("id"))
                 for bucket in ("models", "extra_models")
                 for m in (group.get(bucket) or [])
                 if isinstance(m, dict) and m.get("id")
-            )
+            ]
+            own_prefix = f"@{slug}:"
+            expanded: set[str] = set()
+            for mid in raw_ids:
+                expanded.add(mid)
+                if mid.lower().startswith(own_prefix):
+                    bare_form = mid[len(own_prefix):]
+                    if bare_form:
+                        expanded.add(bare_form)
+            ids = frozenset(expanded)
             by_slug[slug] = by_slug.get(slug, frozenset()) | ids
         memo = (snapshot, by_slug)
         _advertised_model_ids_memo = memo
@@ -7384,8 +7437,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                             continue
                         _seen_custom_ids.add(_dedup_key)
                         detected_providers.add(_slug)
+                        # Stable-ID contract: prefix regardless of active
+                        # provider. Named-custom ids keep the prefix even for
+                        # slash ids ('vendor/model' must not be misread as an
+                        # OpenRouter path when routed).
                         _cp_option_id = _live_id
-                        if active_provider != _slug and not _cp_option_id.startswith("@"):
+                        if not _cp_option_id.startswith("@"):
                             _cp_option_id = f"@{_slug}:{_cp_option_id}"
                         _named_custom_groups[_slug][1].append(
                             {"id": _cp_option_id, "label": _live_model.get("label") or _get_label_for_model(_live_id, [])}
@@ -7407,8 +7464,10 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         _seen_custom_ids.add(_dedup_key)
                         if _slug:
                             detected_providers.add(_slug)
+                            # Stable-ID contract: prefix regardless of active
+                            # provider (same rule as the live branch above).
                             _cp_option_id = _cp_model
-                            if active_provider != _slug and not _cp_option_id.startswith("@"):
+                            if not _cp_option_id.startswith("@"):
                                 _cp_option_id = f"@{_slug}:{_cp_option_id}"
                             _named_custom_groups[_slug][1].append(
                                 {"id": _cp_option_id, "label": _cp_label}

@@ -996,16 +996,20 @@ def test_no_duplicate_when_default_model_is_prefixed():
         _cfg.cfg.update(old_cfg)
 
 
-def test_default_provider_models_not_prefixed(monkeypatch):
-    """The active provider's models remain bare (no @prefix added)."""
+def test_default_provider_models_stable_prefixed(monkeypatch):
+    """The active provider's models carry the same stable @provider: prefix.
+
+    Stability contract: IDs must not change spelling when the active provider
+    flips, because clients persist the exact ID string (favorites/recents).
+    """
     import api.config as _cfg
     monkeypatch.setattr(_cfg, "_read_live_provider_model_ids", lambda pid: ["claude-sonnet-5.0"] if pid == "anthropic" else [])
     result = _available_models_with_provider('anthropic')
     groups = {g['provider']: g['models'] for g in result['groups']}
     if 'Anthropic' in groups:
         returned_ids = {m['id'] for m in groups['Anthropic']}
-        assert "claude-sonnet-5.0" in returned_ids
-        assert not any(mid.startswith('@anthropic:') for mid in returned_ids), returned_ids
+        assert "@anthropic:claude-sonnet-5.0" in returned_ids, returned_ids
+        assert "claude-sonnet-5.0" not in returned_ids, returned_ids
 
 
 def test_provider_config_object_list_catalog_uses_picker_supported_keys_6121(monkeypatch):
@@ -1039,12 +1043,13 @@ def test_provider_config_object_list_catalog_uses_picker_supported_keys_6121(mon
     groups = {group['provider_id']: group['models'] for group in result['groups']}
     model_rows = groups.get('myprov') or []
     model_ids = [row['id'] for row in model_rows]
-    assert 'by-model-key' in model_ids
-    assert 'by-name-key' in model_ids
-    assert 'by-id-key' in model_ids
+    # Stable-ID contract: every provider group is @provider:-prefixed.
+    assert '@myprov:by-model-key' in model_ids
+    assert '@myprov:by-name-key' in model_ids
+    assert '@myprov:by-id-key' in model_ids
     labels = {row['id']: row['label'] for row in model_rows}
-    assert labels['by-model-key'] == 'By Model Key'
-    assert labels['by-id-key'] == 'By Id Key'
+    assert labels['@myprov:by-model-key'] == 'By Model Key'
+    assert labels['@myprov:by-id-key'] == 'By Id Key'
 
 
 # ── get_available_models(): phantom "Custom" group regression ─────────────

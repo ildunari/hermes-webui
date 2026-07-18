@@ -89,10 +89,10 @@ class TestConfigYamlModelsLoading:
         for g in result["groups"]:
             if g["provider"] == "Anthropic":
                 model_ids = [m["id"] for m in g["models"]]
-                assert "claude-custom-1" in model_ids, (
+                assert "@anthropic:claude-custom-1" in model_ids, (
                     f"claude-custom-1 not in Anthropic models: {model_ids}"
                 )
-                assert "claude-custom-2" in model_ids, (
+                assert "@anthropic:claude-custom-2" in model_ids, (
                     f"claude-custom-2 not in Anthropic models: {model_ids}"
                 )
                 break
@@ -111,7 +111,7 @@ class TestConfigYamlModelsLoading:
         for g in result["groups"]:
             if g["provider"] == "Anthropic":
                 model_ids = [m["id"] for m in g["models"]]
-                assert "claude-list-only-1" in model_ids, (
+                assert "@anthropic:claude-list-only-1" in model_ids, (
                     f"claude-list-only-1 not in Anthropic models: {model_ids}"
                 )
                 break
@@ -129,7 +129,12 @@ class TestConfigYamlModelsLoading:
             },
         }
         result = _available_models_with_cfg(cfg)
-        raw_ids = {m["id"] for m in _cfg._PROVIDER_MODELS.get("anthropic", [])}
+        # Stable-ID contract: catalog ids are @provider:-prefixed; compare
+        # against the prefixed spelling of the static fallback list.
+        raw_ids = {
+            f"@anthropic:{m['id']}"
+            for m in _cfg._PROVIDER_MODELS.get("anthropic", [])
+        }
         for g in result["groups"]:
             if g["provider"] == "Anthropic":
                 returned_ids = {m["id"] for m in g["models"]}

@@ -49,7 +49,7 @@ def test_xiaomi_api_key_env_var_detects_model_group(monkeypatch, tmp_path):
 
     assert "xiaomi" in groups
     assert groups["xiaomi"]["provider"] == "Xiaomi"
-    assert "mimo-v2.5-pro" in {model["id"] for model in groups["xiaomi"]["models"]}
+    assert "@xiaomi:mimo-v2.5-pro" in {model["id"] for model in groups["xiaomi"]["models"]}
 
 
 def test_xiaomi_provider_settings_detects_env_key(monkeypatch, tmp_path):

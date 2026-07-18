@@ -127,7 +127,7 @@ def test_generic_provider_uses_hermes_cli_catalog_before_static_snapshot(monkeyp
     group = _provider_group(result, "anthropic")
 
     assert calls == ["anthropic"]
-    assert _ids(group) == ["claude-opus-4.7", "claude-sonnet-5.0"]
+    assert _ids(group) == ["@anthropic:claude-opus-4.7", "@anthropic:claude-sonnet-5.0"]
     assert group["models"][1]["label"] == "Claude Sonnet 5.0"
 
 
@@ -145,8 +145,8 @@ def test_generic_provider_keeps_static_catalog_as_cli_failure_fallback(monkeypat
     group = _provider_group(result, "anthropic")
 
     assert calls == ["anthropic"]
-    assert "claude-opus-4.7" in _ids(group)
-    assert "claude-sonnet-4.6" in _ids(group)
+    assert "@anthropic:claude-opus-4.7" in _ids(group)
+    assert "@anthropic:claude-sonnet-4.6" in _ids(group)
 
 
 def test_generic_provider_prefixes_live_ids_when_not_active_provider(monkeypatch, tmp_path):
