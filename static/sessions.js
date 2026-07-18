@@ -3888,7 +3888,7 @@ function _pinnedSessionCount(){
 }
 function _getPinnedSessionsLimit(){
   const limit=parseInt(window._pinnedSessionsLimit,10);
-  return (Number.isFinite(limit)&&limit>=0)?limit:3;
+  return (Number.isFinite(limit)&&limit>=0)?limit:0;
 }
 function _pinnedSessionsLimitMessage(){
   const limit=_getPinnedSessionsLimit();

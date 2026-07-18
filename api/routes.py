@@ -15845,7 +15845,9 @@ def handle_post(handler, parsed) -> bool:
         # LOCK is a non-reentrant `threading.Lock`. We snapshot the
         # persisted index outside the lock, then re-check the in-memory
         # mutation set inside the lock and commit the pin atomically.
-        pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3))
+        pinned_sessions_limit = api_config.normalize_pinned_sessions_limit(
+            load_settings().get("pinned_sessions_limit")
+        )
         if pin_requested and not getattr(s, "pinned", False) and pinned_sessions_limit > 0:
             # Pre-snapshot from persisted index (acquires LOCK internally,
             # so must run outside our own LOCK acquire below).

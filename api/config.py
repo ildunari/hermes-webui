@@ -9466,7 +9466,7 @@ _SETTINGS_DEFAULTS = {
     "hide_composer_status": False,  # hide status text in composer footer
     "hide_composer_context": False,  # hide context indicator in composer footer/mobile config panel
     "hide_composer_bg_badge": False,  # hide background-jobs badge in composer footer
-    "pinned_sessions_limit": 3,  # maximum active pinned sessions; 0 disables the limit
+    "pinned_sessions_limit": 0,  # maximum active pinned sessions; 0 disables the limit (default)
     "inflight_state_max_sessions": 8,  # max active-stream recovery snapshots kept in browser localStorage
     "inflight_state_max_messages": 24,  # max recent messages kept per recovery snapshot
     "inflight_state_max_tool_calls": 48,  # max recent tool-call records kept per recovery snapshot
@@ -9604,6 +9604,26 @@ def _read_raw_settings_file() -> dict:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def normalize_pinned_sessions_limit(value, default: int = 0) -> int:
+    """Return a valid pin limit without letting malformed state break pinning."""
+    fallback = (
+        default
+        if isinstance(default, int)
+        and not isinstance(default, bool)
+        and 0 <= default <= 99
+        else 0
+    )
+    if isinstance(value, bool):
+        return fallback
+    if isinstance(value, int):
+        limit = value
+    elif isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        limit = int(value.strip())
+    else:
+        return fallback
+    return limit if 0 <= limit <= 99 else fallback
+
+
 def _extract_persisted_speech_keys(stored: dict) -> set[str]:
     if not isinstance(stored, dict):
         return set()
@@ -9683,6 +9703,9 @@ def load_settings() -> dict:
         # Honor a stored True only when that marker is present.
         if not bool(stored.get("virtualize_transcript_optin")):
             settings["virtualize_transcript"] = False
+    settings["pinned_sessions_limit"] = normalize_pinned_sessions_limit(
+        settings.get("pinned_sessions_limit")
+    )
     settings["theme"], settings["skin"] = _normalize_appearance(
         stored.get("theme") if isinstance(stored, dict) else settings.get("theme"),
         stored.get("skin") if isinstance(stored, dict) else settings.get("skin"),
@@ -9929,6 +9952,11 @@ def save_settings(settings: dict) -> dict:
                 continue
             # Validate bounded integer settings.
             if k in _SETTINGS_INT_RANGES:
+                if k == "pinned_sessions_limit":
+                    v = normalize_pinned_sessions_limit(
+                        v,
+                        normalize_pinned_sessions_limit(current.get(k)),
+                    )
                 try:
                     v = int(v)
                 except (TypeError, ValueError):

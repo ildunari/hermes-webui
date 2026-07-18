@@ -43,6 +43,12 @@ def make_session(created):
     return sid
 
 
+def set_pin_limit(limit):
+    data, status = post("/api/settings", {"pinned_sessions_limit": limit})
+    assert status == 200
+    assert data["pinned_sessions_limit"] == limit
+
+
 
 def inject_hidden_pinned_snapshot(sid="hidden-pinned-snapshot"):
     """Add a persisted legacy hidden snapshot without touching server memory."""
@@ -81,6 +87,7 @@ def inject_hidden_pinned_snapshot(sid="hidden-pinned-snapshot"):
 def test_session_pin_endpoint_caps_pinned_sessions_at_three():
     created = []
     try:
+        set_pin_limit(3)
         pinned = [make_session(created) for _ in range(3)]
         for sid in pinned:
             d, status = post("/api/session/pin", {"session_id": sid, "pinned": True})
@@ -100,6 +107,7 @@ def test_session_pin_endpoint_caps_pinned_sessions_at_three():
         assert status == 200
         assert d["session"]["pinned"] is True
     finally:
+        set_pin_limit(0)
         for sid in created:
             post("/api/session/delete", {"session_id": sid})
 
@@ -108,6 +116,7 @@ def test_session_pin_endpoint_ignores_hidden_snapshot_when_enforcing_cap():
     created = []
     hidden_sid = "hidden-pinned-snapshot-quota-route"
     try:
+        set_pin_limit(3)
         hidden = inject_hidden_pinned_snapshot(hidden_sid)
         pinned = [make_session(created) for _ in range(2)]
         for sid in pinned:
@@ -121,6 +130,7 @@ def test_session_pin_endpoint_ignores_hidden_snapshot_when_enforcing_cap():
         assert d["session"]["pinned"] is True
         assert hidden not in {third_visible, *pinned}
     finally:
+        set_pin_limit(0)
         for sid in created:
             post("/api/session/delete", {"session_id": sid})
         (TEST_STATE_DIR / "sessions" / f"{hidden_sid}.json").unlink(missing_ok=True)
@@ -171,7 +181,7 @@ def test_session_pin_cap_has_backend_and_frontend_guards():
     assert 'persisted_rows = [' in ROUTES_PY
     assert 'candidate_rows.extend(' in ROUTES_PY
     assert 'pinned_lineage_ids = _visible_pinned_lineage_ids(candidate_rows)' in ROUTES_PY
-    assert 'pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3))' in ROUTES_PY
+    assert 'pinned_sessions_limit = api_config.normalize_pinned_sessions_limit(' in ROUTES_PY
     assert 'pinned_sessions_limit > 0' in ROUTES_PY
     assert 'if len(pinned_lineage_ids) >= pinned_sessions_limit:' in ROUTES_PY
     assert 'Up to {pinned_sessions_limit} sessions can be pinned' in ROUTES_PY

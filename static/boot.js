@@ -3188,7 +3188,8 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     window._workspaceTodosTab=!!s.workspace_todos_tab;
     if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
     window._sidebarDensity=(s.sidebar_density==='detailed'?'detailed':'compact');
-    window._pinnedSessionsLimit=parseInt(s.pinned_sessions_limit||3,10)||3;
+    const pinnedSessionsLimit=parseInt(s.pinned_sessions_limit,10);
+    window._pinnedSessionsLimit=(Number.isFinite(pinnedSessionsLimit)&&pinnedSessionsLimit>=0)?pinnedSessionsLimit:0;
     window._inflightStateLimits={
       maxSessions:parseInt(s.inflight_state_max_sessions||8,10)||8,
       messages:parseInt(s.inflight_state_max_messages||24,10)||24,
@@ -3334,7 +3335,7 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     window._structuredCodeDefaultView='auto';
     window._structuredCodeAutoTreeLines=10;
     window._sidebarDensity='compact';
-    window._pinnedSessionsLimit=3;
+    window._pinnedSessionsLimit=0;
     // Settings load failed: keep the persisted default-message-mode preference
     // (the eager default already read it from the localStorage mirror) instead
     // of clobbering it, so a saved 'steer'/'interrupt'/'queue' still applies

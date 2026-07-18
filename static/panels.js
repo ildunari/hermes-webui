@@ -8667,7 +8667,7 @@ function _preferencesPayloadFromUi(){
   const sidebarDensitySel=$('settingsSidebarDensity');
   if(sidebarDensitySel) payload.sidebar_density=sidebarDensitySel.value;
   const pinnedLimitField=$('settingsPinnedSessionsLimit');
-  if(pinnedLimitField) payload.pinned_sessions_limit=parseInt(pinnedLimitField.value,10);
+  if(pinnedLimitField) payload.pinned_sessions_limit=_normalizePinnedSessionsLimit(pinnedLimitField.value,window._pinnedSessionsLimit);
   const autoTitleRefreshSel=$('settingsAutoTitleRefresh');
   if(autoTitleRefreshSel) payload.auto_title_refresh_every=parseInt(autoTitleRefreshSel.value,10);
   const defaultMessageModeSel=$('settingsDefaultMessageMode');
@@ -8739,6 +8739,11 @@ function _applyWorkspaceTodosTabVisibility(){
   }
 }
 
+function _normalizePinnedSessionsLimit(value,fallback=0){
+  const limit=(typeof value==='string'&&value.trim()==='')?NaN:Number(value);
+  return (Number.isInteger(limit)&&limit>=0&&limit<=99)?limit:fallback;
+}
+
 function _schedulePreferencesAutosave(){
   const payload=_preferencesPayloadFromUi();
   _rememberPreferencesSaved(payload);
@@ -8760,8 +8765,7 @@ async function _autosavePreferencesSettings(payload){
     }
     if(payload&&Object.prototype.hasOwnProperty.call(payload,'fade_text_effect')) window._fadeTextEffect=!!payload.fade_text_effect;
     if(saved&&Object.prototype.hasOwnProperty.call(saved,'pinned_sessions_limit')){
-      const pinnedSessionsLimit=parseInt(saved.pinned_sessions_limit,10);
-      window._pinnedSessionsLimit=(Number.isFinite(pinnedSessionsLimit)&&pinnedSessionsLimit>=0)?pinnedSessionsLimit:3;
+      window._pinnedSessionsLimit=_normalizePinnedSessionsLimit(saved.pinned_sessions_limit);
     }
     if(payload&&payload.show_tps!==undefined){
       window._showTps=!!(saved&&saved.show_tps);
@@ -9202,13 +9206,11 @@ async function loadSettingsPanel(){
     if(showTpsCb){showTpsCb.checked=!!settings.show_tps;showTpsCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const pinnedLimitField=$('settingsPinnedSessionsLimit');
     if(pinnedLimitField){
-      const pinnedSessionsLimit=parseInt(settings.pinned_sessions_limit,10);
-      pinnedLimitField.value=(Number.isFinite(pinnedSessionsLimit)&&pinnedSessionsLimit>=0)?pinnedSessionsLimit:3;
-      window._pinnedSessionsLimit=parseInt(pinnedLimitField.value,10);
+      pinnedLimitField.value=_normalizePinnedSessionsLimit(settings.pinned_sessions_limit);
+      window._pinnedSessionsLimit=_normalizePinnedSessionsLimit(pinnedLimitField.value);
       pinnedLimitField.addEventListener('change',_schedulePreferencesAutosave,{once:false});
       pinnedLimitField.addEventListener('input',()=>{
-        const nextPinnedSessionsLimit=parseInt(pinnedLimitField.value,10);
-        window._pinnedSessionsLimit=(Number.isFinite(nextPinnedSessionsLimit)&&nextPinnedSessionsLimit>=0)?nextPinnedSessionsLimit:3;
+        window._pinnedSessionsLimit=_normalizePinnedSessionsLimit(pinnedLimitField.value,window._pinnedSessionsLimit);
         _schedulePreferencesAutosave();
       },{once:false});
     }
@@ -12424,7 +12426,7 @@ async function saveSettings(andClose){
   const showCronSessions=!!($('settingsShowCronSessions')||{}).checked;
   const showWebhookSessions=!!($('settingsShowWebhookSessions')||{}).checked;
   const showPreviousMessagingSessions=!!($('settingsShowPreviousMessagingSessions')||{}).checked;
-  const pinnedSessionsLimit=parseInt(($('settingsPinnedSessionsLimit')||{}).value,10)||3;
+  const pinnedSessionsLimit=_normalizePinnedSessionsLimit(($('settingsPinnedSessionsLimit')||{}).value,window._pinnedSessionsLimit);
   const pw=($('settingsPassword')||{}).value;
   const theme=($('settingsTheme')||{}).value||'dark';
   const skin=($('settingsSkin')||{}).value||'default';
