@@ -6,6 +6,8 @@ def test_webui_drains_only_matching_background_completion_events():
 
     assert "def _drain_webui_process_notifications(session_id: str)" in src
     assert "from tools.process_registry import process_registry" in src
+    assert "if evt_type == 'async_delegation':" in src
+    assert "requeueing after this bounded drain hands it to background_process" in src
     assert "proc = process_registry.get(evt_sid)" in src
     assert "getattr(proc, 'session_key', None) != session_id" in src
     assert "skipped_events.append(evt)" in src
@@ -43,5 +45,5 @@ def test_webui_age_gates_stale_background_completion_events():
     assert "age = time.time() - completed_at" in src
     assert "if age > stale_completion_max_age:" in src
     # Over-age events are consumed (marked), not requeued, so they vanish.
-    assert "_mark_process_completion_consumed(process_registry, evt_sid)" in src
+    assert "_mark_process_completion_consumed(process_registry, evt_key)" in src
 

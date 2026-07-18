@@ -21006,6 +21006,100 @@ def _agent_runtime_barrier_response(
     return None
 
 
+_PROCESS_WAKEUP_WORKER_START_TIMEOUT_SECONDS = 5.0
+
+
+def _rollback_unstarted_process_wakeup_stream(s, stream_id: str, wakeup_id: str) -> None:
+    """Remove only volatile/session launch state; keep durable work pending."""
+    with STREAMS_LOCK:
+        STREAMS.pop(stream_id, None)
+    STREAM_GOAL_RELATED.pop(stream_id, None)
+    unregister_stream_owner(stream_id)
+    try:
+        with _get_session_agent_lock(s.session_id):
+            if getattr(s, "active_stream_id", None) == stream_id:
+                s.active_stream_id = None
+                s.pending_user_message = None
+                s.pending_attachments = []
+                s.pending_started_at = None
+                s.pending_user_source = None
+                s.save(touch_updated_at=False)
+    except Exception:
+        logger.warning(
+            "Failed to clear unstarted process-wakeup stream %s for session %s",
+            stream_id,
+            getattr(s, "session_id", "?"),
+            exc_info=True,
+        )
+    try:
+        from api.process_wakeup_store import clear_pending_process_wakeup_stream
+
+        clear_pending_process_wakeup_stream(wakeup_id, stream_id)
+    except Exception:
+        logger.warning(
+            "Failed to clear pending stream reference for process wakeup %s",
+            wakeup_id,
+            exc_info=True,
+        )
+
+
+def resume_pending_process_wakeup(record) -> dict:
+    """Launch one persisted pending wakeup using its authoritative payload."""
+    from api.process_wakeup_store import get_process_wakeup
+
+    current = get_process_wakeup(getattr(record, "wakeup_id", ""))
+    if current is None:
+        return {"error": "pending process wakeup not found", "_status": 404}
+    if current.state in {"started", "completed"}:
+        return {
+            "stream_id": current.stream_id,
+            "session_id": current.session_id,
+            "already_accepted": True,
+            "process_wakeup_state": current.state,
+            "_status": 200,
+        }
+    payload = current.payload
+    try:
+        s = get_session(current.session_id)
+    except KeyError:
+        return {"error": "Session not found", "_status": 404}
+
+    # A pending record proves the old worker never began. After process restart
+    # its saved stream is necessarily stale; remove that launch shell before
+    # replaying the complete payload. If this helper is called while the old
+    # process-local stream is still present, fail closed rather than double-run.
+    if current.stream_id:
+        with STREAMS_LOCK:
+            if current.stream_id in STREAMS:
+                return {
+                    "error": "pending process wakeup still has a live launch",
+                    "_status": 409,
+                }
+        _rollback_unstarted_process_wakeup_stream(
+            s, current.stream_id, current.wakeup_id
+        )
+
+    return _start_chat_stream_for_session(
+        s,
+        msg=str(payload.get("message") or ""),
+        attachments=list(payload.get("attachments") or []),
+        workspace=str(payload.get("workspace") or getattr(s, "workspace", "")),
+        model=str(payload.get("model") or getattr(s, "model", "") or ""),
+        model_provider=payload.get("model_provider"),
+        normalized_model=bool(payload.get("normalized_model")),
+        goal_related=bool(payload.get("goal_related")),
+        source=str(payload.get("source") or "process_wakeup"),
+        moa_config=payload.get("moa_config"),
+        external_runtime_owned=bool(payload.get("backend_is_gateway")),
+        process_wakeup_id=current.wakeup_id,
+        process_wakeup_payload=(
+            payload.get("durable_event")
+            if isinstance(payload.get("durable_event"), dict)
+            else None
+        ),
+    )
+
+
 def _start_chat_stream_for_session(
     s,
     *,
@@ -21020,6 +21114,8 @@ def _start_chat_stream_for_session(
     source: str = "webui",
     moa_config=None,
     external_runtime_owned: bool | None = None,
+    process_wakeup_id: str = "",
+    process_wakeup_payload: dict | None = None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     if external_runtime_owned is None:
@@ -21032,6 +21128,42 @@ def _start_chat_stream_for_session(
         stale_response["_status"] = 409
         return stale_response
     attachments = attachments or []
+    wakeup_id = str(process_wakeup_id or "").strip()
+    full_wakeup_payload = None
+    if wakeup_id:
+        from api.process_wakeup_store import reserve_pending_process_wakeup
+
+        full_wakeup_payload = {
+            "wakeup_id": wakeup_id,
+            "session_id": s.session_id,
+            "message": msg,
+            "source": source,
+            "attachments": list(attachments),
+            "workspace": workspace,
+            "model": model,
+            "model_provider": model_provider,
+            "normalized_model": bool(normalized_model),
+            "goal_related": bool(goal_related),
+            "moa_config": moa_config,
+            "backend_is_gateway": backend_is_gateway,
+            "durable_event": (
+                dict(process_wakeup_payload)
+                if isinstance(process_wakeup_payload, dict)
+                else {}
+            ),
+        }
+        try:
+            existing_wakeup = reserve_pending_process_wakeup(full_wakeup_payload)
+        except (TypeError, ValueError) as exc:
+            return {"error": str(exc), "_status": 409}
+        if existing_wakeup.state in {"started", "completed"}:
+            return {
+                "stream_id": existing_wakeup.stream_id,
+                "session_id": existing_wakeup.session_id,
+                "already_accepted": True,
+                "process_wakeup_state": existing_wakeup.state,
+                "_status": 200,
+            }
     # Prevent duplicate runs in the same session while a stream is still active.
     # This commonly happens after page refresh/reconnect races and can produce
     # duplicated clarify cards for what appears to be a single user request.
@@ -21068,6 +21200,23 @@ def _start_chat_stream_for_session(
     diag.stage("session_lock_wait") if diag else None
     while True:
         with session_lock:
+            if wakeup_id:
+                from api.process_wakeup_store import reserve_pending_process_wakeup
+
+                try:
+                    existing_wakeup = reserve_pending_process_wakeup(
+                        full_wakeup_payload or {}
+                    )
+                except (TypeError, ValueError) as exc:
+                    return {"error": str(exc), "_status": 409}
+                if existing_wakeup.state in {"started", "completed"}:
+                    return {
+                        "stream_id": existing_wakeup.stream_id,
+                        "session_id": existing_wakeup.session_id,
+                        "already_accepted": True,
+                        "process_wakeup_state": existing_wakeup.state,
+                        "_status": 200,
+                    }
             locked_stream_id = getattr(s, "active_stream_id", None)
             if locked_stream_id:
                 if _active_stream_blocks_chat_start(s, locked_stream_id):
@@ -21089,6 +21238,14 @@ def _start_chat_stream_for_session(
                     }
                 needs_stale_cleanup = False
                 stream_id = uuid.uuid4().hex
+                if wakeup_id:
+                    from api.process_wakeup_store import set_pending_process_wakeup_stream
+
+                    if not set_pending_process_wakeup_stream(wakeup_id, stream_id):
+                        return {
+                            "error": "failed to persist pending process-wakeup stream",
+                            "_status": 503,
+                        }
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
                 _prepare_chat_start_session_for_stream(
@@ -21153,13 +21310,77 @@ def _start_chat_stream_for_session(
     worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
     if moa_config and not backend_is_gateway:
         worker_kwargs["moa_config"] = moa_config
+    worker_started = None
+    worker_start_errors: list[BaseException] = []
+    if wakeup_id:
+        worker_started = threading.Event()
+        underlying_worker_target = worker_target
+
+        def _run_durable_process_wakeup_worker(*worker_args, **kwargs):
+            from api.process_wakeup_store import (
+                mark_process_wakeup_completed,
+                mark_process_wakeup_started,
+            )
+
+            try:
+                if not mark_process_wakeup_started(wakeup_id, stream_id):
+                    raise RuntimeError(
+                        "pending process wakeup could not transition to started"
+                    )
+            except BaseException as exc:
+                worker_start_errors.append(exc)
+                worker_started.set()
+                logger.warning(
+                    "Process-wakeup worker failed before acceptance for %s",
+                    wakeup_id,
+                    exc_info=True,
+                )
+                return
+            worker_started.set()
+            try:
+                underlying_worker_target(*worker_args, **kwargs)
+            finally:
+                try:
+                    mark_process_wakeup_completed(wakeup_id, stream_id)
+                except Exception:
+                    logger.warning(
+                        "Failed to mark process wakeup %s completed",
+                        wakeup_id,
+                        exc_info=True,
+                    )
+
+        worker_target = _run_durable_process_wakeup_worker
     thr = threading.Thread(
         target=worker_target,
         args=(s.session_id, msg, model, workspace, stream_id, attachments),
         kwargs=worker_kwargs,
         daemon=True,
     )
-    thr.start()
+    try:
+        thr.start()
+    except Exception as exc:
+        if wakeup_id:
+            _rollback_unstarted_process_wakeup_stream(s, stream_id, wakeup_id)
+            return {
+                "error": f"process-wakeup worker did not start: {exc}",
+                "_status": 503,
+            }
+        raise
+    if worker_started is not None:
+        if not worker_started.wait(_PROCESS_WAKEUP_WORKER_START_TIMEOUT_SECONDS):
+            # Do not clear the launch shell: the thread may merely be delayed and
+            # can still transition the durable record. A retry will observe
+            # ``pending`` until then, and startup recovery handles a real crash.
+            return {
+                "error": "process-wakeup worker start was not confirmed",
+                "_status": 503,
+            }
+        if worker_start_errors:
+            _rollback_unstarted_process_wakeup_stream(s, stream_id, wakeup_id)
+            return {
+                "error": f"process-wakeup worker failed before start: {worker_start_errors[0]}",
+                "_status": 503,
+            }
     response = {
         "stream_id": stream_id,
         "session_id": s.session_id,
@@ -21167,6 +21388,8 @@ def _start_chat_stream_for_session(
         "turn_id": journal_event.get("turn_id"),
         "title": s.title,
     }
+    if wakeup_id:
+        response["process_wakeup_state"] = "started"
     if normalized_model:
         response["effective_model"] = model
     if model_provider:
@@ -21239,6 +21462,8 @@ def _start_run(
     route: str,
     diag=None,
     moa_config=None,
+    process_wakeup_id: str = "",
+    process_wakeup_payload: dict | None = None,
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -21265,6 +21490,29 @@ def _start_run(
         runtime_adapter_enabled,
         runtime_adapter_runner_enabled,
     )
+
+    # Durable wakeups always use WebUI's local pending→started boundary. Legacy
+    # unkeyed wakeups may still use the local legacy-journal adapter, but never
+    # runner-local: that would split acceptance across a runner journal.
+    if process_wakeup_id or (
+        str(source or "").strip() == "process_wakeup"
+        and runtime_adapter_runner_enabled()
+    ):
+        return _start_chat_stream_for_session(
+            s,
+            msg=msg,
+            attachments=attachments,
+            workspace=workspace,
+            model=model,
+            model_provider=model_provider,
+            normalized_model=normalized_model,
+            diag=diag,
+            source=source,
+            moa_config=moa_config,
+            external_runtime_owned=webui_gateway_chat_enabled(get_config()),
+            process_wakeup_id=process_wakeup_id,
+            process_wakeup_payload=process_wakeup_payload,
+        )
 
     if runtime_adapter_enabled() or runtime_adapter_runner_enabled():
         def _legacy_start_run(request: StartRunRequest) -> dict:
@@ -21379,6 +21627,8 @@ def start_session_turn(
     message: str,
     *,
     source: str = "process_wakeup",
+    process_wakeup_id: str = "",
+    process_wakeup_payload: dict | None = None,
 ):
     """Start a server-side agent turn for ``session_id`` with ``message``.
 
@@ -21422,6 +21672,33 @@ def start_session_turn(
         s = get_session(session_id)
     except KeyError:
         return {"error": "Session not found", "_status": 404}
+    wakeup_id = str(process_wakeup_id or "").strip()
+    if wakeup_id:
+        from api.process_wakeup_store import validate_process_wakeup_replay
+
+        try:
+            existing_wakeup = validate_process_wakeup_replay(
+                wakeup_id,
+                session_id=s.session_id,
+                message=msg,
+                source=turn_source,
+                durable_event=process_wakeup_payload,
+            )
+        except ValueError as exc:
+            return {"error": str(exc), "_status": 409}
+        if existing_wakeup and existing_wakeup.state in {"started", "completed"}:
+            return {
+                "stream_id": existing_wakeup.stream_id,
+                "session_id": existing_wakeup.session_id,
+                "already_accepted": True,
+                "process_wakeup_state": existing_wakeup.state,
+                "_status": 200,
+            }
+        if existing_wakeup and existing_wakeup.state == "pending":
+            # The first persisted payload is authoritative. In particular, do
+            # not rebuild a failed pre-start launch from session settings that
+            # may have changed while the Agent row was waiting to retry.
+            return resume_pending_process_wakeup(existing_wakeup)
 
     try:
         workspace = _resolve_chat_workspace_with_recovery(s, None)
@@ -21568,6 +21845,8 @@ def start_session_turn(
         normalized_model=normalized_model,
         source=turn_source,
         route="start_session_turn",
+        process_wakeup_id=process_wakeup_id,
+        process_wakeup_payload=process_wakeup_payload,
     )
 
     # ── Defect B: live-view of server-initiated turns ──────────────────────

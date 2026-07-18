@@ -118,7 +118,26 @@ and 5; it does not mark every run-state boundary implemented.
 7. **Observation has a degraded path.** Long-running or many-session observation
    should expose enough heartbeat/degraded status that the UI does not appear
    silent and ordinary APIs do not stall behind active streams.
-8. **Every mutation names its layer.** A PR touching streaming, recovery,
+8. **Durable async wakeups cross one acceptance boundary.** The next-turn
+   streaming drain never injects or acknowledges async-delegation events; it
+   hands them back to the background durable-delivery path. WebUI startup scans
+   every available profile home (deduplicating root aliases and event ids), so a
+   pending named-profile row is restored from its owning Agent database. The
+   delivery path positively resolves the owning WebUI session, uses that
+   session's profile home for Agent state transitions, and acknowledges only
+   after WebUI has durably moved the local wakeup from `pending` to `started`.
+   WebUI persists the complete wakeup payload and id before worker creation,
+   marks it started from inside the running worker, and marks it completed when
+   that worker returns. Startup resumes pending records; started/completed replay
+   acknowledges without relaunching. A paused credential response is not
+   acceptance: its row stays pending under a slow bounded retry. Foreign or
+   ownerless events remain unclaimed for their rightful consumer and are not
+   timer-requeued through WebUI's drain. Process wakeups use this WebUI-local
+   path even when runner-local mode is configured, so acceptance does not depend
+   on a separate runner journal. Claim refusal, partial Agent APIs, failed
+   dispatch, and failed acknowledgement retain or schedule the only copy and
+   retry without a server restart.
+9. **Every mutation names its layer.** A PR touching streaming, recovery,
    context reconstruction, compression, replay, or sidebar metadata should state
    which layer it changes and what regression proves the invariant still holds.
 

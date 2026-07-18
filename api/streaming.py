@@ -1767,6 +1767,11 @@ def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, se
         'HERMES_SESSION_KEY': session_id,
         'HERMES_SESSION_ID': session_id,
         'HERMES_SESSION_PLATFORM': 'webui',
+        # Async delegation ownership is fail-closed on every shared-queue
+        # consumer. Stamp the commissioning WebUI session explicitly so a
+        # restored CLI/gateway event cannot be adopted through an id collision.
+        'HERMES_SESSION_SOURCE': 'webui',
+        'HERMES_UI_SESSION_ID': str(session_id),
         # process_complete agent-wakeup wiring (ours-original, Option B): the
         # terminal_tool watcher routing gate (terminal_tool.py:~1940) reads
         # HERMES_SESSION_CHAT_ID to populate pending_watchers for WebUI
@@ -1972,20 +1977,25 @@ def _drain_webui_process_notifications(session_id: str) -> list[str]:
         evt_sid = str(evt.get('session_id') or '') if isinstance(evt, dict) else ''
         evt_delegation_id = str(evt.get('delegation_id') or '') if isinstance(evt, dict) else ''
         evt_key = evt_delegation_id if evt_type == 'async_delegation' else evt_sid
+        if evt_type == 'async_delegation':
+            # Durable delegation completion belongs to the server-side wakeup
+            # path, whose chat-start acceptance is persisted before Agent ack.
+            # Never inject/ack it into this turn's local prompt: a crash after
+            # this function returned but before run_conversation accepted the
+            # prompt would otherwise lose the only result. Holding it aside and
+            # requeueing after this bounded drain hands it to background_process.
+            skipped_events.append(evt)
+            continue
         if not evt_key:
             skipped_events.append(evt)
             continue
         try:
             if process_registry.is_completion_consumed(evt_key):
                 continue
-            proc = None if evt_type == 'async_delegation' else process_registry.get(evt_sid)
+            proc = process_registry.get(evt_sid)
         except Exception:
             proc = None
-        if evt_type == 'async_delegation':
-            if str(evt.get('session_key') or '') != session_id:
-                skipped_events.append(evt)
-                continue
-        elif getattr(proc, 'session_key', None) != session_id:
+        if getattr(proc, 'session_key', None) != session_id:
             skipped_events.append(evt)
             continue
 

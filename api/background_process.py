@@ -42,6 +42,7 @@ this module routes them to the same listener so the frontend's single
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -52,6 +53,15 @@ logger = logging.getLogger(__name__)
 
 _DRAIN_THREAD: Optional[threading.Thread] = None
 _DRAIN_STOP = threading.Event()
+
+# Failed WebUI-owned durable deliveries are retried after a delay. Foreign rows
+# are left unclaimed in their profile DB instead of being put back through this
+# process's sole WebUI queue (which would only consume them again).
+_DURABLE_RETRY_DELAY_SECS = 0.1
+_DURABLE_CLAIM_RETRY_DELAY_SECS = 5.0
+_DURABLE_PAUSED_RETRY_DELAY_SECS = 30.0
+_DURABLE_RETRY_LOCK = threading.Lock()
+_DURABLE_RETRY_PENDING: set[str] = set()
 
 _REAPER_THREAD: Optional[threading.Thread] = None
 _REAPER_STOP = threading.Event()
@@ -884,6 +894,189 @@ def _resolve_wakeup_target(
     return owner
 
 
+def _claim_durable_delegation(evt: dict, session_id: str):
+    """Compatibility wrapper around the shared durable-delivery boundary."""
+    if str((evt or {}).get("type") or "") != "async_delegation":
+        return None
+    from api.durable_delegation import claim_webui_delivery
+
+    return claim_webui_delivery(evt, expected_session_id=session_id)
+
+
+def _complete_durable_delegation(claim) -> bool:
+    from api.durable_delegation import complete_webui_delivery
+
+    return complete_webui_delivery(claim)
+
+
+def _release_durable_delegation(claim) -> bool:
+    from api.durable_delegation import release_webui_delivery
+
+    return release_webui_delivery(claim)
+
+
+def _durable_retry_delay_seconds(
+    *,
+    claim_denied: bool = False,
+    delay_seconds: float | None = None,
+) -> float:
+    """Return a bounded, runtime-configurable durable-delivery retry delay."""
+    if delay_seconds is not None:
+        try:
+            return min(3600.0, max(0.01, float(delay_seconds)))
+        except (TypeError, ValueError):
+            return _DURABLE_RETRY_DELAY_SECS
+    env_name = (
+        "HERMES_WEBUI_DURABLE_CLAIM_RETRY_DELAY_SECS"
+        if claim_denied
+        else "HERMES_WEBUI_DURABLE_RETRY_DELAY_SECS"
+    )
+    default = (
+        _DURABLE_CLAIM_RETRY_DELAY_SECS if claim_denied else _DURABLE_RETRY_DELAY_SECS
+    )
+    try:
+        return min(3600.0, max(0.01, float(os.environ.get(env_name, default))))
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid %s value", env_name)
+        return default
+
+
+def _schedule_durable_retry(
+    evt: dict,
+    *,
+    dispatch_directly: bool = False,
+    claim_denied: bool = False,
+    deferred_session_id: str = "",
+    delay_seconds: float | None = None,
+) -> bool:
+    """Re-enqueue one failed async delivery without requiring process restart."""
+    if not isinstance(evt, dict):
+        return False
+    event_id = str(evt.get("delegation_id") or "")
+    if not event_id:
+        return False
+    with _DURABLE_RETRY_LOCK:
+        if event_id in _DURABLE_RETRY_PENDING:
+            return False
+        _DURABLE_RETRY_PENDING.add(event_id)
+
+    def _retry() -> None:
+        with _DURABLE_RETRY_LOCK:
+            _DURABLE_RETRY_PENDING.discard(event_id)
+        try:
+            if deferred_session_id:
+                drain_deferred_wakeups_for_session(deferred_session_id)
+            elif dispatch_directly:
+                _process_one(dict(evt))
+            else:
+                from tools.process_registry import process_registry
+
+                completion_queue = getattr(process_registry, "completion_queue", None)
+                if completion_queue is not None:
+                    completion_queue.put(dict(evt))
+        except Exception:
+            logger.warning(
+                "Failed to re-enqueue durable delegation %s", event_id, exc_info=True
+            )
+
+    timer = threading.Timer(
+        _durable_retry_delay_seconds(
+            claim_denied=claim_denied,
+            delay_seconds=delay_seconds,
+        ),
+        _retry,
+    )
+    timer.daemon = True
+    timer.start()
+    return True
+
+
+def _forget_wakeup_delivery_dedupe(session_id: str, event_id: str) -> None:
+    """Undo WebUI's in-memory acceptance markers after a failed delivery."""
+    if not event_id:
+        return
+    from api import config as _cfg
+
+    with _cfg.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
+        _cfg.BG_TASK_COMPLETE_EVENTS_SEEN.get(session_id, set()).discard(event_id)
+    try:
+        import importlib
+
+        _pr = importlib.import_module("tools.process_registry").process_registry
+    except (ImportError, AttributeError):
+        return
+    try:
+        with _pr._lock:
+            _pr._completion_consumed.discard(event_id)
+    except (AttributeError, TypeError):
+        logger.error(
+            "ProcessRegistry coupling contract VIOLATED while making wakeup %s retryable",
+            event_id,
+            exc_info=True,
+        )
+
+
+def _release_wakeup_delivery(
+    evt: dict,
+    claim,
+    *,
+    session_id: str,
+    event_id: str,
+    clear_dedupe: bool = True,
+    retry: bool = False,
+    retry_delay_seconds: float | None = None,
+) -> None:
+    if claim is not None and clear_dedupe:
+        _forget_wakeup_delivery_dedupe(session_id, event_id)
+    _release_durable_delegation(claim)
+    if retry and claim is not None:
+        _schedule_durable_retry(
+            evt,
+            dispatch_directly=True,
+            delay_seconds=retry_delay_seconds,
+        )
+
+
+def _ack_wakeup_delivery_or_retry(
+    evt: dict,
+    claim,
+    *,
+    session_id: str,
+    event_id: str,
+) -> bool:
+    """Acknowledge accepted delivery; retry only the acknowledgement on failure."""
+    if _complete_durable_delegation(claim):
+        if event_id and bool(getattr(claim, "durable", False)):
+            try:
+                from api.process_wakeup_store import (
+                    mark_process_wakeup_agent_acknowledged,
+                )
+
+                mark_process_wakeup_agent_acknowledged(event_id)
+            except Exception:
+                # Agent acknowledgement is authoritative. Failure to annotate
+                # local retention state must not redeliver an already-acked row;
+                # it merely retains this local record longer.
+                logger.warning(
+                    "Failed to mark local process wakeup %s Agent-acknowledged",
+                    event_id,
+                    exc_info=True,
+                )
+        return True
+    # Keep both in-memory consumed markers. The retry will claim the row, hit
+    # the consumed guard, and retry only the acknowledgement instead of
+    # starting a duplicate agent turn.
+    _release_wakeup_delivery(
+        evt,
+        claim,
+        session_id=session_id,
+        event_id=event_id,
+        clear_dedupe=False,
+        retry=True,
+    )
+    return False
+
+
 def _process_one(evt: dict) -> None:
     """Route a single completion_queue event to the matching WebUI session."""
     from api import config as _cfg
@@ -971,6 +1164,35 @@ def _process_one(evt: dict) -> None:
         session_key_resolved_sid=session_id,
         proc_session=_ps_xs,
     )
+    durable_claim = None
+    if is_async_delegation:
+        from api.durable_delegation import resolve_webui_delivery_owner
+
+        owner = resolve_webui_delivery_owner(evt, expected_session_id=session_id)
+        if owner is None:
+            # Do not put a foreign event back onto WebUI's sole queue: this same
+            # drain would immediately consume it again and create an unbounded
+            # timer/thread loop.  We never claimed the durable row, so it stays
+            # pending in its owning profile DB for the rightful CLI/gateway
+            # consumer to restore or claim.
+            logger.debug(
+                "Leaving foreign durable delegation %s pending for its owner",
+                delegation_id,
+            )
+            return
+        session_id = owner.session_id
+        durable_claim = _claim_durable_delegation(evt, session_id)
+        if durable_claim is None:
+            # The shared queue copy has already been removed. Claim contention
+            # (including a crashed consumer's not-yet-stale claim) and a partial
+            # Agent API are both temporary refusal states, not discard states.
+            # Keep a scheduled direct copy until claim takeover/API recovery.
+            _schedule_durable_retry(
+                evt,
+                dispatch_directly=True,
+                claim_denied=True,
+            )
+            return
     # ── Idempotency vs the REAL merged upstream #2279 (shared dedupe key) ──
     # The real merged #2279 next-turn drain
     # (api/streaming._drain_webui_process_notifications) dedupes ONLY via
@@ -985,6 +1207,12 @@ def _process_one(evt: dict) -> None:
     if event_id:
         try:
             if _process_registry is not None and _process_registry.is_completion_consumed(event_id):
+                _ack_wakeup_delivery_or_retry(
+                    evt,
+                    durable_claim,
+                    session_id=session_id,
+                    event_id=event_id,
+                )
                 return
         except Exception:
             logger.debug(
@@ -999,6 +1227,12 @@ def _process_one(evt: dict) -> None:
     with _cfg.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
         seen = _cfg.BG_TASK_COMPLETE_EVENTS_SEEN.setdefault(session_id, set())
         if event_id and event_id in seen:
+            _ack_wakeup_delivery_or_retry(
+                evt,
+                durable_claim,
+                session_id=session_id,
+                event_id=event_id,
+            )
             return
         if event_id:
             seen.add(event_id)
@@ -1058,7 +1292,24 @@ def _process_one(evt: dict) -> None:
                 # _completion_consumed marker (set above), so persisting it
                 # here cannot cause a double-fire — the atomic claim in
                 # ``claim_deferred_wakeups`` guarantees exactly one delivery.
-                record_deferred_wakeup(session_id, event_id, wakeup_prompt)
+                if record_deferred_wakeup(
+                    session_id,
+                    event_id,
+                    wakeup_prompt,
+                    durable_event=evt if durable_claim is not None else None,
+                ):
+                    # The deferred queue is process-local. Keep the Agent row
+                    # pending and release the claim; actual teardown delivery
+                    # will re-claim it. A crash can then restore the row.
+                    _release_durable_delegation(durable_claim)
+                else:
+                    _release_wakeup_delivery(
+                        evt,
+                        durable_claim,
+                        session_id=session_id,
+                        event_id=event_id,
+                        retry=True,
+                    )
                 logger.debug(
                     "server-side wakeup deferred: turn active for session %s "
                     "(persisted for turn-teardown idle-hook redelivery)",
@@ -1067,17 +1318,43 @@ def _process_one(evt: dict) -> None:
             else:
                 # Idle-path sibling of the F1 (409/teardown) fix: pass the
                 # event id so terminal processes and async delegations share
-                # one deferred-wakeup dedupe key.
+                # one deferred-wakeup dedupe key. The durable claim is only
+                # acknowledged after start_session_turn accepts the wakeup.
                 _start_server_side_wakeup_turn(
-                    session_id, wakeup_prompt, process_id=event_id
+                    session_id,
+                    wakeup_prompt,
+                    process_id=event_id,
+                    durable_event=evt,
+                    durable_claim=durable_claim,
                 )
+        else:
+            _release_wakeup_delivery(
+                evt,
+                durable_claim,
+                session_id=session_id,
+                event_id=event_id,
+                retry=True,
+            )
     except Exception:
+        _release_wakeup_delivery(
+            evt,
+            durable_claim,
+            session_id=session_id,
+            event_id=event_id,
+            retry=True,
+        )
         logger.warning(
             "server-side wakeup dispatch failed for session %s", session_id, exc_info=True
         )
 
 
-def record_deferred_wakeup(session_id: str, process_id: str, wakeup_prompt: str) -> None:
+def record_deferred_wakeup(
+    session_id: str,
+    process_id: str,
+    wakeup_prompt: str,
+    *,
+    durable_event: dict | None = None,
+) -> bool:
     """Persist a deferred process-completion wakeup for later redelivery.
 
     Called from ``_process_one`` when a completion arrives while a turn is
@@ -1092,7 +1369,7 @@ def record_deferred_wakeup(session_id: str, process_id: str, wakeup_prompt: str)
     twice. Best-effort — never raises into the drain loop.
     """
     if not session_id or not wakeup_prompt:
-        return
+        return False
     from api import config as _cfg
 
     try:
@@ -1101,14 +1378,20 @@ def record_deferred_wakeup(session_id: str, process_id: str, wakeup_prompt: str)
             if process_id and any(
                 e.get("process_id") == process_id for e in entries
             ):
-                return
-            entries.append(
-                {"process_id": process_id, "wakeup_prompt": wakeup_prompt}
-            )
+                return True
+            entry: dict[str, Any] = {
+                "process_id": process_id,
+                "wakeup_prompt": wakeup_prompt,
+            }
+            if isinstance(durable_event, dict):
+                entry["durable_event"] = dict(durable_event)
+            entries.append(entry)
+        return True
     except Exception:
         logger.debug(
             "record_deferred_wakeup failed for session %s", session_id, exc_info=True
         )
+        return False
 
 
 def claim_deferred_wakeups(session_id: str) -> list[dict]:
@@ -1204,11 +1487,46 @@ def drain_deferred_wakeups_for_session(session_id: str) -> int:
                     session_id,
                     str((entry or {}).get("process_id") or ""),
                     str((entry or {}).get("wakeup_prompt") or "").strip(),
+                    durable_event=(entry or {}).get("durable_event"),
                 )
+            first_event = (first or {}).get("durable_event")
+            first_claim = None
+            if isinstance(first_event, dict):
+                first_claim = _claim_durable_delegation(first_event, session_id)
+                if first_claim is None:
+                    # Another consumer currently owns the row. Put this
+                    # volatile entry back and schedule another idle drain; no
+                    # prompt has been accepted yet. A teardown event is not
+                    # guaranteed to happen after stale-claim takeover/API repair.
+                    preserved = record_deferred_wakeup(
+                        session_id,
+                        str((first or {}).get("process_id") or ""),
+                        str((first or {}).get("wakeup_prompt") or "").strip(),
+                        durable_event=first_event,
+                    )
+                    if preserved:
+                        _schedule_durable_retry(
+                            first_event,
+                            claim_denied=True,
+                            deferred_session_id=session_id,
+                        )
+                    else:
+                        # No deferred copy survived. Clear the pre-defer volatile
+                        # consumed markers before retrying through _process_one.
+                        event_id = str((first or {}).get("process_id") or "")
+                        _forget_wakeup_delivery_dedupe(session_id, event_id)
+                        _schedule_durable_retry(
+                            first_event,
+                            dispatch_directly=True,
+                            claim_denied=True,
+                        )
+                    return 0
             _start_server_side_wakeup_turn(
                 session_id,
                 str((first or {}).get("wakeup_prompt") or "").strip(),
                 process_id=str((first or {}).get("process_id") or ""),
+                durable_event=first_event,
+                durable_claim=first_claim,
             )
             started = 1
         if started:
@@ -1256,7 +1574,12 @@ def _session_has_active_turn(session_id: str) -> bool:
 
 
 def _start_server_side_wakeup_turn(
-    session_id: str, wakeup_prompt: str, *, process_id: str = ""
+    session_id: str,
+    wakeup_prompt: str,
+    *,
+    process_id: str = "",
+    durable_event: dict | None = None,
+    durable_claim=None,
 ) -> None:
     """Start an agent turn server-side for a process_complete wakeup (Option Z).
 
@@ -1291,11 +1614,50 @@ def _start_server_side_wakeup_turn(
         try:
             from api.routes import start_session_turn
 
-            resp = start_session_turn(
-                session_id, wakeup_prompt, source="process_wakeup"
-            )
+            try:
+                resp = start_session_turn(
+                    session_id,
+                    wakeup_prompt,
+                    source="process_wakeup",
+                    process_wakeup_id=(
+                        process_id
+                        if bool(getattr(durable_claim, "durable", False))
+                        else ""
+                    ),
+                    process_wakeup_payload=(
+                        dict(durable_event)
+                        if bool(getattr(durable_claim, "durable", False))
+                        and isinstance(durable_event, dict)
+                        else None
+                    ),
+                )
+            except TypeError as exc:
+                # Compatibility for older embedded route adapters and focused
+                # test doubles that predate the idempotency-key parameter.
+                if (
+                    "process_wakeup_id" not in str(exc)
+                    and "process_wakeup_payload" not in str(exc)
+                ):
+                    raise
+                resp = start_session_turn(
+                    session_id,
+                    wakeup_prompt,
+                    source="process_wakeup",
+                )
             status = int((resp or {}).get("_status", 200) or 200)
             if status == 409 and (resp or {}).get("error") == "process_wakeup_paused":
+                # Paused credential state is not runtime acceptance. Keep the
+                # Agent row pending and retry slowly; acknowledging here loses
+                # the only durable copy, while the ordinary 100ms failure delay
+                # would create needless wakeup churn for a long-lived pause.
+                _release_wakeup_delivery(
+                    durable_event or {},
+                    durable_claim,
+                    session_id=session_id,
+                    event_id=process_id,
+                    retry=True,
+                    retry_delay_seconds=_DURABLE_PAUSED_RETRY_DELAY_SECS,
+                )
                 logger.info(
                     "server-side wakeup suppressed for session %s: provider credential state is paused",
                     session_id,
@@ -1308,14 +1670,37 @@ def _start_server_side_wakeup_turn(
                 # ``claim_deferred_wakeups`` still guarantees exactly-once
                 # delivery, and BG_TASK_COMPLETE_EVENTS_SEEN already deduped
                 # this process_id, so re-recording cannot double-fire.
-                if wakeup_prompt:
-                    record_deferred_wakeup(session_id, process_id, wakeup_prompt)
+                if wakeup_prompt and record_deferred_wakeup(
+                    session_id,
+                    process_id,
+                    wakeup_prompt,
+                    durable_event=durable_event,
+                ):
+                    # A 409 did not durably accept this prompt. The in-memory
+                    # deferred copy is only an optimization; release the Agent
+                    # row so crash recovery remains authoritative.
+                    _release_durable_delegation(durable_claim)
+                else:
+                    _release_wakeup_delivery(
+                        durable_event or {},
+                        durable_claim,
+                        session_id=session_id,
+                        event_id=process_id,
+                        retry=True,
+                    )
                 logger.debug(
                     "server-side wakeup raced an active turn for session %s; "
                     "re-deferred for redelivery on next teardown/turn",
                     session_id,
                 )
             elif status >= 400:
+                _release_wakeup_delivery(
+                    durable_event or {},
+                    durable_claim,
+                    session_id=session_id,
+                    event_id=process_id,
+                    retry=True,
+                )
                 logger.warning(
                     "server-side wakeup failed for session %s: status=%s err=%r",
                     session_id,
@@ -1323,23 +1708,46 @@ def _start_server_side_wakeup_turn(
                     (resp or {}).get("error"),
                 )
             else:
+                _ack_wakeup_delivery_or_retry(
+                    durable_event or {},
+                    durable_claim,
+                    session_id=session_id,
+                    event_id=process_id,
+                )
                 logger.info(
                     "server-side wakeup turn started for session %s (stream_id=%s)",
                     session_id,
                     (resp or {}).get("stream_id"),
                 )
         except Exception:
+            _release_wakeup_delivery(
+                durable_event or {},
+                durable_claim,
+                session_id=session_id,
+                event_id=process_id,
+                retry=True,
+            )
             logger.warning(
                 "server-side wakeup turn raised for session %s",
                 session_id,
                 exc_info=True,
             )
 
-    threading.Thread(
-        target=_runner,
-        name=f"hermes-webui-process-wakeup-{str(session_id)[:8]}",
-        daemon=True,
-    ).start()
+    try:
+        threading.Thread(
+            target=_runner,
+            name=f"hermes-webui-process-wakeup-{str(session_id)[:8]}",
+            daemon=True,
+        ).start()
+    except Exception:
+        _release_wakeup_delivery(
+            durable_event or {},
+            durable_claim,
+            session_id=session_id,
+            event_id=process_id,
+            retry=True,
+        )
+        raise
 
 
 def _drain_loop() -> None:
@@ -1428,6 +1836,19 @@ def start_drain_thread() -> bool:
     with _THREAD_LIFECYCLE_LOCK:
         if _DRAIN_THREAD is not None and _DRAIN_THREAD.is_alive():
             return False
+        # Resume WebUI-local pending work first. Its state was persisted before
+        # worker creation; once its replacement worker reaches ``started``, the
+        # Agent-row restore below can safely replay and acknowledge acceptance.
+        from api.durable_delegation import (
+            recover_pending_webui_process_wakeups,
+            restore_all_profile_durable_delegations,
+        )
+
+        recover_pending_webui_process_wakeups()
+        # Agent's singleton only restores the startup HERMES_HOME. WebUI serves
+        # every named profile from one process, so enumerate and restore all
+        # profile DBs before the only consumer thread can begin draining.
+        restore_all_profile_durable_delegations()
         _DRAIN_STOP.clear()
         _DRAIN_THREAD = threading.Thread(
             target=_drain_loop,
