@@ -10,7 +10,9 @@ import logging
 import mimetypes
 import os
 import queue
+import random
 import re
+import sqlite3
 import shlex
 import sys
 import subprocess
@@ -42,6 +44,7 @@ from api.config import (
     parse_reasoning_effort,
     coerce_reasoning_effort_for_model,
     _main_model_request_overrides,
+    PROCESS_SESSION_INDEX, PROCESS_SESSION_INDEX_LOCK,
 )
 from api.helpers import redact_session_data, _redact_text
 from api.compression_anchor import is_context_compression_marker, visible_messages_for_anchor
@@ -61,6 +64,14 @@ from api.models import (
     reconciled_state_db_messages_for_session,
 )
 from api.session_ops import mark_session_title_generated, session_has_manual_title
+from api.process_event_utils import (
+    claim_async_delegation_delivery,
+    complete_async_delegation_delivery,
+    completion_delivery_id,
+    release_async_delegation_delivery,
+    requeue_async_delegation_event,
+    schedule_async_delegation_claim_retry,
+)
 
 
 def _session_payload_with_full_messages(session, *, tool_calls=None):
@@ -538,6 +549,48 @@ def _is_fallback_lifecycle_message(kind: str, message: str) -> bool:
             or 'fallback activated' in m
             or 'trying fallback' in m
         )
+    )
+
+
+def _is_agent_compression_start_status(kind: str, message: str) -> bool:
+    """Return True only for real Hermes context-compression start notices.
+
+    WebUI bridges matching lifecycle statuses into an SSE ``compressing`` event
+    and paints the live "Compressing context" worklog divider. The previous
+    matcher used broad substrings such as ``'compressing' in message`` and
+    ``'preflight compression' in message``, which can false-positive on skip /
+    cooldown / unrelated notices and make brand-new low-token turns look like
+    auto-compression.
+
+    Positive markers below match the agent emitters in hermes-agent
+    (``turn_context`` preflight, ``conversation_loop`` pre-API / 413 / too-large,
+    ``conversation_compression`` compaction status). Explicitly reject skip /
+    defer notices so "Skipping preflight compression…" never surfaces as a
+    running compress divider.
+    """
+    k = str(kind or '').strip().lower()
+    m = str(message or '').strip().lower()
+    if k != 'lifecycle' or not m:
+        return False
+    # Skip / cooldown / defer logs must never look like a live compression start.
+    if (
+        'skipping' in m
+        or 'defer' in m
+        or 'cooldown' in m
+        or 'will not start' in m
+    ):
+        return False
+    # Post-compress retry chatter is not a start event.
+    if 'compressed' in m and 'compressing' not in m and 'compression attempt' not in m:
+        return False
+    return (
+        'preflight compression:' in m
+        or 'pre-api compression:' in m
+        or 'compacting context' in m
+        or 'context too large' in m
+        or '— compressing (' in m
+        or '- compressing (' in m
+        or 'compression attempt' in m
     )
 
 
@@ -1845,24 +1898,23 @@ def _set_turn_session_identity(session_id: str):
     """Bind THIS turn's session identity to the current (task/thread-local)
     context and return an opaque token for _reset_turn_session_identity.
 
-    Binds two context-locals so every session-key consumer is covered without
-    a race:
+    Binds three context-locals so every session-key / UI-owner consumer is
+    covered without a race:
       * ``tools.approval._approval_session_key`` — checked FIRST by
         ``get_current_session_key`` (the exact call terminal_tool.py makes for
         a notify_on_complete background spawn: the bug path).
       * ``gateway.session_context._SESSION_KEY`` — read by direct
-        ``get_session_env("HERMES_SESSION_KEY")`` consumers (e.g. the sudo
-        password cache scope, terminal_tool.py:272).
+        ``get_session_env("HERMES_SESSION_KEY")`` consumers.
+      * ``gateway.session_context._SESSION_UI_SESSION_ID`` — exact browser-tab
+        return address stamped onto ProcessSession.origin_ui_session_id and
+        completion events by modern hermes-agent builds. Authoritative for
+        wakeup routing when present (see ``_resolve_completion_target``).
 
     It deliberately does NOT call ``gateway.session_context.set_session_vars``:
     that blanket setter also zeroes the platform/chat_id/user contextvars,
     flipping ``HERMES_SESSION_PLATFORM`` from its env fallback (``'webui'``,
     still written to os.environ at turn-start) to an explicit ``""`` — which
-    would break the ``notify_on_complete`` watcher registration gate in
-    terminal_tool.py:~1966. Only the session-key identity is bound; every
-    other session var keeps its existing os.environ fallback (CLI/cron compat
-    preserved — when these contextvars are _UNSET, get_session_env still falls
-    back to os.environ).
+    would break the ``notify_on_complete`` watcher registration gate.
     """
     sid = str(session_id or "")
     tokens: dict = {}
@@ -1876,6 +1928,11 @@ def _set_turn_session_identity(session_id: str):
         tokens["session_key"] = _SK.set(sid)
     except Exception:
         logger.debug("per-turn _SESSION_KEY bind failed", exc_info=True)
+    try:
+        from gateway.session_context import _SESSION_UI_SESSION_ID as _UI_SID
+        tokens["ui_session_id"] = _UI_SID.set(sid)
+    except Exception:
+        logger.debug("per-turn _SESSION_UI_SESSION_ID bind failed", exc_info=True)
     return tokens
 
 
@@ -1890,6 +1947,13 @@ def _reset_turn_session_identity(tokens) -> None:
     """
     if not tokens:
         return
+    tok = tokens.get("ui_session_id")
+    if tok is not None:
+        try:
+            from gateway.session_context import _SESSION_UI_SESSION_ID as _UI_SID
+            _UI_SID.reset(tok)
+        except Exception:
+            logger.debug("per-turn _SESSION_UI_SESSION_ID reset failed", exc_info=True)
     tok = tokens.get("session_key")
     if tok is not None:
         try:
@@ -1984,7 +2048,31 @@ def _mark_process_completion_consumed(process_registry, process_id: str) -> None
         logger.debug("Failed to mark process completion consumed", exc_info=True)
 
 
-def _drain_webui_process_notifications(session_id: str) -> list[str]:
+def _completion_event_targets_webui_session(evt_session_key: str, session_id: str) -> bool:
+    """Return whether a completion event belongs to this WebUI session.
+
+    WebUI normally registers ``PROCESS_SESSION_INDEX[session_id] = session_id``.
+    Gateway/agent session keys can differ, so match the direct WebUI case first
+    and otherwise resolve through the same session-key index used by the
+    background wakeup path.
+    """
+    if not evt_session_key or not session_id:
+        return False
+    if evt_session_key == session_id:
+        return True
+    try:
+        with PROCESS_SESSION_INDEX_LOCK:
+            return PROCESS_SESSION_INDEX.get(evt_session_key) == session_id
+    except Exception:
+        logger.debug("Failed to resolve completion event session key", exc_info=True)
+        return False
+
+
+def _drain_webui_process_notifications(
+    session_id: str,
+    *,
+    pending_async_acceptances: list | None = None,
+) -> list[str]:
     """Return completion notifications that belong to this WebUI session.
 
     The agent registry completion queue is process-wide and events do not carry
@@ -2000,6 +2088,7 @@ def _drain_webui_process_notifications(session_id: str) -> list[str]:
 
     notifications: list[str] = []
     skipped_events: list[dict] = []
+    async_retry_events: list[tuple[dict, bool]] = []
     completion_queue = getattr(process_registry, 'completion_queue', None)
     if completion_queue is None:
         return []
@@ -2017,56 +2106,167 @@ def _drain_webui_process_notifications(session_id: str) -> list[str]:
             logger.debug("Failed to drain process completion queue", exc_info=True)
             break
 
-        evt_type = str(evt.get('type') or 'completion') if isinstance(evt, dict) else ''
-        evt_sid = str(evt.get('session_id') or '') if isinstance(evt, dict) else ''
-        evt_delegation_id = str(evt.get('delegation_id') or '') if isinstance(evt, dict) else ''
-        evt_key = evt_delegation_id if evt_type == 'async_delegation' else evt_sid
-        if evt_type == 'async_delegation':
-            # Durable delegation completion belongs to the server-side wakeup
-            # path, whose chat-start acceptance is persisted before Agent ack.
-            # Never inject/ack it into this turn's local prompt: a crash after
-            # this function returned but before run_conversation accepted the
-            # prompt would otherwise lose the only result. Holding it aside and
-            # requeueing after this bounded drain hands it to background_process.
+        evt_sid = completion_delivery_id(evt) if isinstance(evt, dict) else ''
+        if not evt_sid:
             skipped_events.append(evt)
             continue
-        if not evt_key:
-            skipped_events.append(evt)
-            continue
-        try:
-            if process_registry.is_completion_consumed(evt_key):
-                continue
-            proc = process_registry.get(evt_sid)
-        except Exception:
-            proc = None
-        if getattr(proc, 'session_key', None) != session_id:
-            skipped_events.append(evt)
-            continue
+        is_async_delegation = (
+            isinstance(evt, dict) and evt.get('type') == 'async_delegation'
+        )
+        if is_async_delegation:
+            durable_lookup_failed = False
+            try:
+                from tools.async_delegation import get_durable_delegation
 
+                durable_row = get_durable_delegation(evt_sid)
+            except (ImportError, AttributeError):
+                durable_row = None
+            except Exception:
+                durable_lookup_failed = True
+                logger.debug(
+                    "Failed to inspect async delegation %s before WebUI drain",
+                    evt_sid,
+                    exc_info=True,
+                )
+                durable_row = None
+            if (
+                not durable_lookup_failed
+                and (
+                    not isinstance(durable_row, dict)
+                    or durable_row.get("delivery_state") != "pending"
+                )
+            ):
+                skipped_events.append(evt)
+                continue
+        try:
+            if (
+                not is_async_delegation
+                and process_registry.is_completion_consumed(evt_sid)
+            ):
+                continue
+            evt_session_key = str(evt.get('session_key') or '') if isinstance(evt, dict) else ''
+            evt_origin_ui_session_id = (
+                str(evt.get('origin_ui_session_id') or '') if isinstance(evt, dict) else ''
+            )
+            if not evt_session_key or not evt_origin_ui_session_id:
+                proc = process_registry.get(evt_sid)
+                if not evt_session_key:
+                    evt_session_key = str(getattr(proc, 'session_key', '') or '')
+                if not evt_origin_ui_session_id:
+                    evt_origin_ui_session_id = (
+                        str(getattr(proc, 'origin_ui_session_id', '') or '')
+                        or str(getattr(proc, 'spawn_session_id', '') or '')
+                    )
+        except Exception:
+            evt_session_key = ''
+            evt_origin_ui_session_id = ''
+
+        # origin_ui_session_id is the exact, immutable return address and is
+        # authoritative over the mutable session-key index (mirrors the
+        # background _process_one path via _resolve_completion_target). When it
+        # is present, this drain claims/ACKs the event ONLY for the origin
+        # session — otherwise the next-turn drain could win the shared-queue
+        # race and deliver+ACK a completion to the wrong (session-key-index)
+        # session, leaving the true origin empty. Fall back to the session-key
+        # target check only for legacy events that carry no origin address.
+        if evt_origin_ui_session_id:
+            if evt_origin_ui_session_id != session_id:
+                skipped_events.append(evt)
+                continue
+        elif not _completion_event_targets_webui_session(evt_session_key, session_id):
+            skipped_events.append(evt)
+            continue
         # Age-gate stale completions: a completion that fires long after the
         # user moved on must not be prepended to an unrelated later turn
         # (nesquena/hermes-webui#4029). Drop (consume, do not requeue) any
         # completion whose enqueue time is older than the configured cap.
         # Events without a 'completed_at' (older agent builds) are never
         # dropped here, preserving backward-compatible behavior.
+        is_stale = False
+        stale_age = 0.0
         if stale_completion_max_age > 0 and isinstance(evt, dict):
             completed_at = evt.get('completed_at')
             if isinstance(completed_at, (int, float)) and completed_at > 0:
-                age = time.time() - completed_at
-                if age > stale_completion_max_age:
-                    logger.info(
-                        "Dropping stale background-process completion for "
-                        "session %s (age %.0fs > cap %.0fs)",
-                        evt_sid, age, stale_completion_max_age,
+                stale_age = time.time() - completed_at
+                is_stale = stale_age > stale_completion_max_age
+
+        if is_async_delegation:
+            try:
+                claim = claim_async_delegation_delivery(evt, "webui-next-turn")
+            except Exception:
+                skipped_events.append(evt)
+                continue
+            if claim is None:
+                schedule_async_delegation_claim_retry(evt, completion_queue)
+                continue
+            notification_added = False
+            try:
+                if is_stale:
+                    notification = ''
+                else:
+                    notification = _format_process_notification(evt)
+                    if not notification:
+                        raise ValueError(
+                            "async delegation formatter returned an empty notification"
+                        )
+                if notification:
+                    notifications.append(notification)
+                    notification_added = True
+                if is_stale:
+                    # Stale async events are an explicit terminal disposition.
+                    complete_async_delegation_delivery(evt, claim)
+                elif pending_async_acceptances is not None:
+                    pending_async_acceptances.append(
+                        (evt, claim, notification, completion_queue)
                     )
-                    _mark_process_completion_consumed(process_registry, evt_key)
-                    continue
+                else:
+                    # Direct callers without a live agent turn retain the
+                    # historical synchronous acceptance behavior used by
+                    # CLI-style drains.
+                    complete_async_delegation_delivery(evt, claim)
+            except Exception:
+                if notification_added:
+                    notifications.pop()
+                release_async_delegation_delivery(evt, claim)
+                async_retry_events.append(
+                    (evt, bool(getattr(claim, "durable", False)))
+                )
+                logger.warning(
+                    "Failed to accept async delegation completion for session %s",
+                    session_id,
+                    exc_info=True,
+                )
+                continue
+            if is_stale:
+                logger.info(
+                    "Dropping stale async-delegation completion for session %s "
+                    "(age %.0fs > cap %.0fs)",
+                    evt_sid, stale_age, stale_completion_max_age,
+                )
+            continue
+
+        if is_stale:
+            logger.info(
+                "Dropping stale background-process completion for "
+                "session %s (age %.0fs > cap %.0fs)",
+                evt_sid, stale_age, stale_completion_max_age,
+            )
+            _mark_process_completion_consumed(process_registry, evt_sid)
+            continue
 
         notification = _format_process_notification(evt)
         if notification:
             notifications.append(notification)
-            _mark_process_completion_consumed(process_registry, evt_key)
+        # Matched but unformattable process completions are consumed rather than
+        # replayed forever on later turns.
+        _mark_process_completion_consumed(process_registry, evt_sid)
 
+    for evt, durable in async_retry_events:
+        requeue_async_delegation_event(
+            evt,
+            completion_queue,
+            durable=durable,
+        )
     for evt in skipped_events:
         try:
             completion_queue.put(evt)
@@ -2074,6 +2274,32 @@ def _drain_webui_process_notifications(session_id: str) -> list[str]:
             logger.debug("Failed to requeue process completion event", exc_info=True)
             break
     return notifications
+
+
+def _accept_pending_async_delegations(
+    pending_async_acceptances: list,
+    *,
+    session_id: str,
+) -> list[str]:
+    """ACK turn-bound delegation claims and return rejected notifications."""
+    rejected_notifications: list[str] = []
+    for evt, claim, notification, completion_queue in pending_async_acceptances:
+        try:
+            complete_async_delegation_delivery(evt, claim)
+        except Exception:
+            release_async_delegation_delivery(evt, claim)
+            requeue_async_delegation_event(
+                evt,
+                completion_queue,
+                durable=bool(getattr(claim, "durable", False)),
+            )
+            rejected_notifications.append(notification)
+            logger.warning(
+                "Async delegation was not accepted into session %s; retrying later",
+                session_id,
+                exc_info=True,
+            )
+    return rejected_notifications
 
 
 def _attachment_name(att) -> str:
@@ -6315,14 +6541,6 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
     pending_text = str(getattr(session, 'pending_user_message', None) or '')
     if not pending_text:
         return False
-    normalized_pending = " ".join(pending_text.split())
-    if normalized_pending:
-        for existing in reversed(list(getattr(session, 'messages', None) or [])[-8:]):
-            if not isinstance(existing, dict) or existing.get('role') != 'user':
-                continue
-            existing_text = " ".join(str(existing.get('content') or '').split())
-            if existing_text == normalized_pending:
-                return False
     recovered_ts = int(time.time())
     pending_started_at = getattr(session, 'pending_started_at', None)
     if isinstance(pending_started_at, (int, float)) and pending_started_at > 0:
@@ -6469,6 +6687,15 @@ def _snapshot_and_append_partial_on_error(session, stream_id) -> dict | None:
             if _live_tools is not live_tool_calls:
                 _snap_tool_calls = list(_live_tools.get(stream_id, []) or [])
 
+    # Seal projected live tool rows so the durable scene cannot disagree with
+    # the settled terminal state (#6309). Any tool call that was still running
+    # at error time is marked as completed with the terminal-error metadata.
+    if _snap_tool_calls:
+        for _tc in _snap_tool_calls:
+            if isinstance(_tc, dict) and not _tc.get('done'):
+                _tc['done'] = True
+                _tc['_sealed_by_terminal_error'] = True
+
     _partial_msg = _build_partial_message(_snap_partial_text, _snap_reasoning, _snap_tool_calls)
     if _partial_msg is None:
         return None
@@ -6578,7 +6805,25 @@ def _build_session_db_for_stream(state_db_path):
     """
     try:
         from hermes_state import SessionDB
-        return SessionDB(db_path=state_db_path)
+        _attempts = 3
+        _last_error = None
+        for _attempt in range(_attempts):
+            try:
+                return SessionDB(db_path=state_db_path)
+            except sqlite3.OperationalError as _db_err:
+                _db_err_text = str(_db_err).lower()
+                if not (
+                    "locked" in _db_err_text or "busy" in _db_err_text
+                ):
+                    raise
+                _last_error = _db_err
+                if _attempt < _attempts - 1:
+                    print(
+                        f"[webui] WARNING: SessionDB init attempt {_attempt + 1}/{_attempts} failed, retrying: {_db_err}",
+                        flush=True,
+                    )
+                    time.sleep(0.05 * (2 ** _attempt) + random.uniform(0, 0.05))
+        raise _last_error or RuntimeError("SessionDB construction exhausted all attempts")
     except Exception as _db_err:
         print(f"[webui] WARNING: SessionDB init failed - session_search will be unavailable: {_db_err}", flush=True)
         return None
@@ -7378,16 +7623,7 @@ def _run_agent_streaming(
             and 'http' in _lower
         ):
             _captured_terminal_error[0] = _message
-        _is_compression_start = (
-            _kind == 'lifecycle'
-            and (
-                'preflight compression' in _lower
-                or 'compressing' in _lower
-                or 'compacting context' in _lower
-                or 'context too large' in _lower
-            )
-        )
-        if _is_compression_start:
+        if _is_agent_compression_start_status(_kind, _message):
             put('compressing', {
                 'session_id': session_id,
                 'message': 'Compressing context',
@@ -8839,7 +9075,11 @@ def _run_agent_streaming(
             )
             _ckpt_thread.start()
 
-            _process_notifications = _drain_webui_process_notifications(session_id)
+            _pending_async_acceptances = []
+            _process_notifications = _drain_webui_process_notifications(
+                session_id,
+                pending_async_acceptances=_pending_async_acceptances,
+            )
             _agent_msg_text = msg_text
             if _process_notifications:
                 _agent_msg_text = "\n\n".join([*_process_notifications, msg_text]).strip()
@@ -8863,6 +9103,34 @@ def _run_agent_streaming(
             # run_conversation() predates the moa_config kwarg.
             if moa_config is not None:
                 _run_conversation_kwargs["moa_config"] = moa_config
+
+            # Finalize durable delegation claims at the current-turn acceptance
+            # boundary: immediately before invoking the agent with the message
+            # that contains their notifications. A failed ACK is removed from
+            # this turn and requeued so retry cannot create a duplicate prompt.
+            _rejected_async_notifications = _accept_pending_async_delegations(
+                _pending_async_acceptances,
+                session_id=session_id,
+            )
+            if _rejected_async_notifications:
+                for _notification in _rejected_async_notifications:
+                    try:
+                        _process_notifications.remove(_notification)
+                    except ValueError:
+                        pass
+                _agent_msg_text = msg_text
+                if _process_notifications:
+                    _agent_msg_text = "\n\n".join(
+                        [*_process_notifications, msg_text]
+                    ).strip()
+                user_message = _build_native_multimodal_message(
+                    workspace_ctx,
+                    _agent_msg_text,
+                    attachments,
+                    workspace,
+                    cfg=_cfg,
+                )
+                _run_conversation_kwargs["user_message"] = user_message
             result = agent.run_conversation(**_run_conversation_kwargs)
             # #4729: the run is done — flush any reasoning tail still in the coalescing
             # buffer (the agent never calls reasoning_callback(None), and a turn can end on
@@ -9430,6 +9698,14 @@ def _run_agent_streaming(
                                     + 'send a message, switch the model/provider, or fix the credentials.'
                                 )
                                 _error_payload['hint'] = _err_hint
+                        # Freeze turn duration before terminal cleanup clears pending_started_at (#6309)
+                        _turn_duration_seconds = 0.0
+                        try:
+                            _pending_ts = getattr(s, 'pending_started_at', None)
+                            if _pending_ts:
+                                _turn_duration_seconds = max(0.0, time.time() - float(_pending_ts))
+                        except Exception:
+                            pass
                         _materialize_pending_user_turn_before_error(s)
                         s.active_stream_id = None
                         s.pending_user_message = None
@@ -9449,6 +9725,7 @@ def _run_agent_streaming(
                             'content': _error_content,
                             'timestamp': int(time.time()),
                             '_error': True,
+                            '_turnDuration': round(_turn_duration_seconds, 3),
                         }
                         if _err_type == 'compression_exhausted':
                             _recovery = stamp_compression_exhausted_recovery(
@@ -10656,6 +10933,14 @@ def _run_agent_streaming(
                             + 'send a message, switch the model/provider, or fix the credentials.'
                         )
                         _error_payload['hint'] = _exc_hint
+                # Freeze turn duration before terminal cleanup clears pending_started_at (#6309)
+                _turn_duration_seconds = 0.0
+                try:
+                    _pending_ts = getattr(s, 'pending_started_at', None)
+                    if _pending_ts:
+                        _turn_duration_seconds = max(0.0, time.time() - float(_pending_ts))
+                except Exception:
+                    pass
                 _materialize_pending_user_turn_before_error(s)
                 s.active_stream_id = None
                 s.pending_user_message = None
@@ -10671,6 +10956,7 @@ def _run_agent_streaming(
                     'content': f'**{_exc_label}:** {_error_payload.get("message") or err_str}' + (f'\n\n*{_exc_hint}*' if _exc_hint else ''),
                     'timestamp': int(time.time()),
                     '_error': True,
+                    '_turnDuration': round(_turn_duration_seconds, 3),
                 }
                 if _exc_type == 'compression_exhausted':
                     _recovery = stamp_compression_exhausted_recovery(

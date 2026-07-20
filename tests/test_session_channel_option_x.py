@@ -739,7 +739,8 @@ def test_async_delegation_completion_wakes_idle_webui_session(monkeypatch):
         assert "[ASYNC DELEGATION COMPLETE" in call["message"]
         assert deleg_id in call["message"]
         assert "DELEGATE_REENTRY_SMOKE_OK" in call["message"]
-        assert deleg_id in cfg.BG_TASK_COMPLETE_EVENTS_SEEN.get(sid, set())
+        assert len(holder["calls"]) == 1
+        assert deleg_id not in cfg.BG_TASK_COMPLETE_EVENTS_SEEN.get(sid, set())
     finally:
         bp.unregister_process_session(sid)
         cfg.PENDING_BG_TASK_COMPLETIONS.discard(sid)

@@ -1489,7 +1489,9 @@
   .agent-activity-thinking[data-live-thinking="1"],
   .agent-activity-thinking[data-live-thinking="1"] *,
   .live-worklog[data-live-worklog-shell="1"],
-  .live-worklog[data-live-worklog-shell="1"] *{transition-property:none!important;transition-duration:0s!important;transition-delay:0s!important;}
+  .live-worklog[data-live-worklog-shell="1"] *,
+  .msg-row,
+  .msg-row *{transition-property:none!important;transition-duration:0s!important;transition-delay:0s!important;}
   :root{--app-titlebar-safe-top:0px;}
   .pwa-standalone{overscroll-behavior:none;}
   .pwa-standalone body{-webkit-tap-highlight-color:transparent;}
@@ -5456,6 +5458,7 @@ main.main > #mainPlugin{display:none;}
 .extension-sidecar-row-head{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0;}
 .extension-sidecar-title{font-size:13px;font-weight:600;color:var(--text);overflow-wrap:anywhere;min-width:0;}
 .extension-sidecar-meta{margin-top:2px;font-size:11px;color:var(--muted);overflow-wrap:anywhere;}
+.extension-sidecar-warning{margin-top:8px;padding:7px 9px;border:1px solid var(--warning,#d29922);border-radius:6px;background:var(--warning-bg,rgba(210,153,34,0.12));color:var(--warning,#d29922);font-size:11px;line-height:1.4;overflow-wrap:anywhere;}
 .extension-sidecar-fields{display:grid;grid-template-columns:1fr;gap:5px;margin-top:8px;}
 .extension-sidecar-fields>div{display:flex;align-items:flex-start;gap:8px;min-width:0;font-size:12px;color:var(--muted);}
 .extension-sidecar-fields span{flex:0 0 82px;}
@@ -6435,7 +6438,8 @@ main.main > .main-view:not([id="mainChat"]):not([id="mainSettings"]) .main-view-
 .workspace-artifact-empty{padding:16px 8px;color:var(--muted);font-size:12px;line-height:1.5;text-align:center;}
 .workspace-artifact-item{display:block;width:100%;text-align:left;background:var(--surface-subtle);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:6px;cursor:pointer;}
 .workspace-artifact-item:hover{border-color:var(--accent);}
-.workspace-artifact-path{font-family:'SF Mono',ui-monospace,monospace;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.workspace-artifact-name{font-family:'SF Mono',ui-monospace,monospace;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text);}
+.workspace-artifact-dir{font-family:'SF Mono',ui-monospace,monospace;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--muted);margin-top:1px;}
 .workspace-artifact-meta{margin-top:3px;color:var(--muted);font-size:11px;}
 .workspace-artifacts-count{opacity:.65;font-size:11px;}
 .rightpanel[data-active-tab="artifacts"] .breadcrumb-bar,.rightpanel[data-active-tab="artifacts"] .file-tree,.rightpanel[data-active-tab="artifacts"] #wsEmptyState{display:none!important;}
@@ -7027,6 +7031,7 @@ main.main.showing-insights > #mainInsights{display:flex;overflow-y:auto;}
   .kanban-modal-overlay{padding:12px;}
   .kanban-modal{padding:16px 16px 14px;border-radius:14px;}
   .kanban-modal-row-inline{flex-direction:column;gap:0;}
+  .kanban-column-body{overscroll-behavior:auto;}
 }
 
 /* ── Logs panel (#1455) ───────────────────────────────────────────────────── */

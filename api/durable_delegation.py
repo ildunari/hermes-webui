@@ -221,7 +221,9 @@ def resolve_webui_delivery_owner(
         )
         session = None
 
-    if session is None and not process_registration_proves_owner:
+    if session is None and not process_registration_proves_owner and not (
+        origin_ui_session_id and origin_ui_session_id == session_id
+    ):
         return None
     # Durable Agent rows must always be scoped from the persisted owning
     # session. A live registration alone is sufficient for legacy/non-durable
@@ -340,7 +342,7 @@ def claim_webui_delivery(
             # claim token whose acknowledgement can never update a row.
             if api.get is not None and durable_row is None:
                 return DurableDeliveryClaim(dict(evt), owner)
-            claim_id = api.claim(evt, f"webui:{owner.session_id}")
+            claim_id = api.claim(evt, "webui-background")
     except Exception:
         logger.warning(
             "Durable async-delegation claim failed for %s in profile %s",
