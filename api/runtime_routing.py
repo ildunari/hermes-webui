@@ -2,16 +2,48 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
 _RUNTIME_ROUTING_STATES = frozenset(
     {"started", "fallback_activated", "primary_restored", "finished"}
 )
+_RUNTIME_ROUTING_REASONS = frozenset(
+    {
+        "rate_limit",
+        "billing",
+        "authentication",
+        "provider_unavailable",
+        "timeout",
+        "upstream_error",
+        "context_limit",
+        "non_retryable_error",
+        "unknown",
+    }
+)
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_URL_RE = re.compile(r"(?i)\b(?:https?|wss?)://[^\s<>'\"]+")
+_BEARER_RE = re.compile(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|password|secret)"
+    r"\s*[:=]\s*[^\s,;]+"
+)
+_SECRET_TOKEN_RE = re.compile(
+    r"\b(?:sk|pk|rk|ghp|github_pat|xox[baprs])-[_A-Za-z0-9]{12,}\b",
+    re.IGNORECASE,
+)
 
 
 def _clean_text(value: Any, limit: int = 240) -> str:
-    return str(value or "").strip()[:limit]
+    text = str(value or "")
+    text = _CONTROL_CHARS_RE.sub("", text)
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = _URL_RE.sub("[redacted-url]", text)
+    text = _BEARER_RE.sub("[redacted-secret]", text)
+    text = _SECRET_ASSIGNMENT_RE.sub("[redacted-secret]", text)
+    text = _SECRET_TOKEN_RE.sub("[redacted-secret]", text)
+    return " ".join(text.split()).strip()[:limit]
 
 
 def _route_lane(value: Any) -> dict[str, str]:
@@ -37,6 +69,9 @@ def normalize_runtime_routing_payload(payload: Any) -> dict[str, Any] | None:
     runtime = _route_lane(payload.get("runtime"))
     raw_fallback = payload.get("fallback")
     fallback_source: dict[str, Any] = raw_fallback if isinstance(raw_fallback, dict) else {}
+    reason = _clean_text(fallback_source.get("reason"), 40).lower()
+    if reason not in _RUNTIME_ROUTING_REASONS:
+        reason = "unknown"
     try:
         chain_index = int(fallback_source.get("chain_index") or 0)
     except (TypeError, ValueError):
@@ -48,7 +83,7 @@ def normalize_runtime_routing_payload(payload: Any) -> dict[str, Any] | None:
         "runtime": runtime,
         "fallback": {
             "active": bool(fallback_source.get("active")),
-            "reason": _clean_text(fallback_source.get("reason"), 500),
+            "reason": reason,
             "chain_index": max(0, chain_index),
         },
     }

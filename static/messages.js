@@ -1679,6 +1679,12 @@ async function send(){
         upsertActiveSessionForLocalTurn({title:displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now()});
       }
     });
+    // A live route belongs to the previous stream only. Starting a replacement
+    // must reveal the durable Last used summary until this stream emits its own
+    // route event; it must never inherit a stale Running label.
+    if(typeof _clearRuntimeRoutingForStream==='function'){
+      _clearRuntimeRoutingForStream(activeSid,null,{force:true});
+    }
     optimisticMessages=[...S.messages];
     INFLIGHT[activeSid]={messages:optimisticMessages,uploaded:uploadedNames,toolCalls:[]};
     if(typeof saveInflightState==='function'){
@@ -1726,6 +1732,9 @@ async function send(){
     // backend never receives the turn.
     const message=preStartError&&preStartError.message?preStartError.message:String(preStartError||'unknown error');
     try{console.warn('[webui] pre-start optimistic UI failed; continuing to /api/chat/start', message);}catch(_){ }
+    if(typeof _clearRuntimeRoutingForStream==='function'){
+      _clearRuntimeRoutingForStream(activeSid,null,{force:true});
+    }
     if(!S.messages.includes(userMsg)) S.messages.push(userMsg);
     optimisticMessages=[...S.messages];
     INFLIGHT[activeSid]={messages:optimisticMessages,uploaded:uploadedNames,toolCalls:[]};
@@ -2040,6 +2049,58 @@ function closeOtherLiveStreams(activeSid){
   }
 }
 
+function _applyRuntimeRoutingForStream(activeSid,streamId,payload){
+  if(!activeSid||!streamId||!payload) return false;
+  const presentation=typeof _runtimeRoutingPresentation==='function'?_runtimeRoutingPresentation(payload):null;
+  if(!presentation) return false;
+  const inflight=INFLIGHT[activeSid]||(INFLIGHT[activeSid]={messages:[...S.messages],uploaded:[],toolCalls:[],streamId});
+  if(inflight.streamId&&String(inflight.streamId)!==String(streamId)) return false;
+  if(S.session&&S.session.session_id===activeSid&&S.activeStreamId&&String(S.activeStreamId)!==String(streamId)) return false;
+  inflight.streamId=streamId;
+  inflight.runtimeRouting=payload;
+  if(S.session&&S.session.session_id===activeSid){
+    S.session.runtime_routing_live=payload;
+    S.session.runtime_routing_live_stream_id=streamId;
+  }
+  return true;
+}
+
+function _clearRuntimeRoutingForStream(activeSid,streamId,options={}){
+  if(!activeSid) return false;
+  const force=!!options.force;
+  let changed=false;
+  const inflight=INFLIGHT[activeSid];
+  if(inflight&&inflight.runtimeRouting&&(force||String(inflight.streamId||'')===String(streamId||''))){
+    delete inflight.runtimeRouting;
+    changed=true;
+  }
+  const session=S.session&&S.session.session_id===activeSid?S.session:null;
+  if(session&&session.runtime_routing_live&&(force||String(session.runtime_routing_live_stream_id||'')===String(streamId||''))){
+    delete session.runtime_routing_live;
+    delete session.runtime_routing_live_stream_id;
+    changed=true;
+  }
+  if(changed&&typeof syncModelChip==='function') syncModelChip();
+  return changed;
+}
+
+function _handleRuntimeRoutingEvent(activeSid,streamId,event,persist){
+  let payload;
+  try{payload=JSON.parse(event&&event.data||'{}');}catch(_){return false;}
+  if(!_applyRuntimeRoutingForStream(activeSid,streamId,payload)) return false;
+  if(typeof persist==='function') persist();
+  if(typeof syncModelChip==='function') syncModelChip();
+  const dropdown=typeof $==='function'?$('composerModelDropdown'):null;
+  if(dropdown&&dropdown.classList.contains('open')&&typeof renderModelDropdown==='function') renderModelDropdown();
+  return true;
+}
+
+if(typeof window!=='undefined'){
+  window._applyRuntimeRoutingForStream=_applyRuntimeRoutingForStream;
+  window._clearRuntimeRoutingForStream=_clearRuntimeRoutingForStream;
+  window._handleRuntimeRoutingEvent=_handleRuntimeRoutingEvent;
+}
+
 function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(!activeSid||!streamId) return;
   const reconnecting=!!options.reconnecting;
@@ -2065,6 +2126,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(uploaded.length) INFLIGHT[activeSid].uploaded=[...uploaded];
     if(!Array.isArray(INFLIGHT[activeSid].toolCalls)) INFLIGHT[activeSid].toolCalls=[];
   }
+  if(!INFLIGHT[activeSid].streamId) INFLIGHT[activeSid].streamId=streamId;
+  // Track per-run Activity burst ordering.
   if(!Array.isArray(INFLIGHT[activeSid].activityBurstAnchors)) INFLIGHT[activeSid].activityBurstAnchors=[];
   if(INFLIGHT[activeSid].currentActivityBurstId===undefined) INFLIGHT[activeSid].currentActivityBurstId=0;
   if(INFLIGHT[activeSid].currentLiveSegmentSeq===undefined) INFLIGHT[activeSid].currentLiveSegmentSeq=0;
@@ -2174,9 +2237,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   function _bailOutOfTerminalEventsFromStaleStream(source){
     if(_ownsActiveStreamOrBackground()) return false;
-    // This stale stream no longer owns the session — schedule cleanup of ITS own
-    // anchor registry (identity-guarded, so it can't clobber the newer stream's
-    // registry for the same session) before closing. (Codex leak catch.)
+    // This stale stream no longer owns the session — release only its route and
+    // anchor state. Identity guards prevent clobbering a newer replacement.
+    _clearRuntimeRoutingForStream(activeSid,streamId);
     _scheduleAnchorRegistryCleanup(120000);
     _closeSource(source);
     return true;
@@ -2203,7 +2266,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     hideClarifyCard(true, reason||'terminal');
   }
   function _clearOwnerInflightState(){
+    _clearRuntimeRoutingForStream(activeSid,streamId);
     if(_isActiveSession() && S.activeStreamId!==streamId) return;
+    const inflight=INFLIGHT[activeSid];
+    if(inflight&&inflight.streamId&&String(inflight.streamId)!==String(streamId)) return;
     delete INFLIGHT[activeSid];
     clearInflightState(activeSid);
     _clearActivePaneInflightIfOwner();
@@ -5633,17 +5699,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('runtime_routing',e=>{
       if(_terminalStateReached||_streamFinalized) return;
-      let d;
-      try{d=JSON.parse(e.data||'{}');}catch(_){return;}
-      const presentation=typeof _runtimeRoutingPresentation==='function'?_runtimeRoutingPresentation(d):null;
-      if(!presentation) return;
-      const inflight=INFLIGHT[activeSid]||(INFLIGHT[activeSid]={messages:[...S.messages],uploaded:[...uploaded],toolCalls:[]});
-      inflight.runtimeRouting=d;
-      if(S.session&&S.session.session_id===activeSid) S.session.runtime_routing_live=d;
-      persistInflightState();
-      if(typeof syncModelChip==='function') syncModelChip();
-      const dropdown=$('composerModelDropdown');
-      if(dropdown&&dropdown.classList.contains('open')&&typeof renderModelDropdown==='function') renderModelDropdown();
+      _handleRuntimeRoutingEvent(activeSid,streamId,e,persistInflightState);
     });
 
     function _resolveGoalMessage(d){

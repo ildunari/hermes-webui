@@ -1773,16 +1773,20 @@ def _build_runtime_routing_event_callback(put_event, latest_payload):
 
 def _event_callback_for_cached_agent(existing, current):
     """Refresh our stale closure while preserving an independent callback."""
-    if not callable(existing) or getattr(existing, '_webui_runtime_routing_callback', False):
+    if not callable(existing):
+        return current
+    base = getattr(existing, '_webui_runtime_routing_base_callback', existing)
+    if not callable(base):
         return current
 
     def combined(*args, **kwargs):
         try:
-            existing(*args, **kwargs)
+            base(*args, **kwargs)
         finally:
             current(*args, **kwargs)
 
     combined._webui_runtime_routing_callback = True  # type: ignore[attr-defined]
+    combined._webui_runtime_routing_base_callback = base  # type: ignore[attr-defined]
     return combined
 
 

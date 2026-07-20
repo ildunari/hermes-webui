@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 
-from api.runtime_routing import attach_runtime_routing_summary, normalize_runtime_routing_payload
-from api import gateway_chat
+from api import gateway_chat, models, streaming
+from api.config import STREAMS, create_stream_channel
 from api.gateway_chat import _gateway_runtime_routing_event
+from api.runtime_routing import attach_runtime_routing_summary, normalize_runtime_routing_payload
 from api.streaming import (
     _build_runtime_routing_event_callback,
     _event_callback_for_cached_agent,
@@ -23,8 +25,74 @@ ROUTE_EVENT = {
     "state": "fallback_activated",
     "selected": {"model": "primary-model", "provider": "primary"},
     "runtime": {"model": "backup-model", "provider": "backup"},
-    "fallback": {"active": True, "reason": "primary quota exhausted", "chain_index": 1},
+    "fallback": {"active": True, "reason": "rate_limit", "chain_index": 1},
 }
+
+
+def _js_function_source(path: Path, name: str) -> str:
+    """Extract a named vanilla-JS function, including its balanced body."""
+    source = path.read_text(encoding="utf-8")
+    start = source.index(f"function {name}(")
+    paren = source.index("(", start)
+    paren_depth = 0
+    body_start = None
+    for idx in range(paren, len(source)):
+        if source[idx] == "(":
+            paren_depth += 1
+        elif source[idx] == ")":
+            paren_depth -= 1
+            if paren_depth == 0:
+                body_start = source.index("{", idx)
+                break
+    assert body_start is not None
+    depth = 0
+    quote = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    idx = body_start
+    while idx < len(source):
+        char = source[idx]
+        nxt = source[idx + 1] if idx + 1 < len(source) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            idx += 1
+            continue
+        if block_comment:
+            if char == "*" and nxt == "/":
+                block_comment = False
+                idx += 2
+                continue
+            idx += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            idx += 1
+            continue
+        if char == "/" and nxt == "/":
+            line_comment = True
+            idx += 2
+            continue
+        if char == "/" and nxt == "*":
+            block_comment = True
+            idx += 2
+            continue
+        if char in ("'", '"', "`"):
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : idx + 1]
+        idx += 1
+    raise AssertionError(f"unterminated JS function {name}")
 
 
 def test_runtime_routing_contract_normalizes_without_mutating_selected_model():
@@ -36,9 +104,42 @@ def test_runtime_routing_contract_normalizes_without_mutating_selected_model():
     assert "ignored_secret" not in normalized
 
 
-def test_runtime_routing_contract_rejects_unknown_schema_and_state():
+def test_runtime_routing_contract_rejects_unknown_schema_and_state_and_enforces_reason_enum():
     assert normalize_runtime_routing_payload({**ROUTE_EVENT, "schema_version": 2}) is None
     assert normalize_runtime_routing_payload({**ROUTE_EVENT, "state": "mystery"}) is None
+    normalized = normalize_runtime_routing_payload(
+        {**ROUTE_EVENT, "fallback": {"active": True, "reason": "primary quota exhausted", "chain_index": 1}}
+    )
+    assert normalized is not None
+    assert normalized["fallback"]["reason"] == "unknown"
+
+
+def test_runtime_routing_contract_scrubs_hostile_allowed_text_before_persistence():
+    hostile = {
+        **ROUTE_EVENT,
+        "selected": {
+            "model": "primary\nAuthorization: Bearer abcdefghijklmnopqrstuvwxyz",
+            "provider": "https://user:pass@example.invalid/path?api_key=secret",
+        },
+        "runtime": {
+            "model": "sk-abcdefghijklmnopqrstuvwxyz",
+            "provider": "backup\x00\x1bprovider password=hunter2",
+        },
+        "fallback": {
+            "active": True,
+            "reason": "Bearer abcdefghijklmnopqrstuvwxyz arbitrary prose",
+            "chain_index": 1,
+        },
+    }
+
+    normalized = normalize_runtime_routing_payload(hostile)
+    assert normalized is not None
+    serialized = json.dumps(normalized).lower()
+
+    assert normalized["fallback"]["reason"] == "unknown"
+    for leaked in ("abcdefghijklmnopqrstuvwxyz", "hunter2", "user:pass", "api_key=secret", "\x1b"):
+        assert leaked not in serialized
+    assert "[redacted" in serialized
 
 
 def test_settled_runtime_summary_attaches_to_session_and_completed_assistant():
@@ -48,7 +149,7 @@ def test_settled_runtime_summary_attaches_to_session_and_completed_assistant():
         messages=[
             {"role": "user", "content": "work"},
             {"role": "assistant", "content": "done"},
-        ]
+        ],
     )
     finished = {**ROUTE_EVENT, "state": "finished"}
 
@@ -59,16 +160,24 @@ def test_settled_runtime_summary_attaches_to_session_and_completed_assistant():
     assert (session.model, session.model_provider) == ("primary-model", "primary")
 
 
-def test_gateway_runtime_routing_translates_direct_and_nested_runs_payloads():
+def test_gateway_runtime_routing_translates_exact_upstream_and_compat_envelopes():
+    producer = {
+        "event": "runtime.routing",
+        "run_id": "gateway-run-1",
+        "timestamp": 0,
+        "routing": ROUTE_EVENT,
+    }
+    assert _gateway_runtime_routing_event(producer) == ROUTE_EVENT
     assert _gateway_runtime_routing_event(ROUTE_EVENT) == ROUTE_EVENT
     assert _gateway_runtime_routing_event({"event": "runtime.routing", "payload": ROUTE_EVENT}) == ROUTE_EVENT
+    assert _gateway_runtime_routing_event({"event": "run.completed", "runtime_routing": ROUTE_EVENT}) == ROUTE_EVENT
 
 
-def test_gateway_runs_stream_relays_runtime_routing_as_local_event(monkeypatch):
+def _runs_stream(monkeypatch, lines):
     class Response:
-        def __init__(self, body=b"", lines=()):
+        def __init__(self, body=b"", stream_lines=()):
             self.body = body
-            self.lines = list(lines)
+            self.lines = list(stream_lines)
 
         def __enter__(self):
             return self
@@ -85,20 +194,11 @@ def test_gateway_runs_stream_relays_runtime_routing_as_local_event(monkeypatch):
     responses = iter(
         [
             Response(json.dumps({"run_id": "gateway-run-1"}).encode()),
-            Response(
-                lines=[
-                    b"event: runtime.routing\n",
-                    f"data: {json.dumps(ROUTE_EVENT)}\n".encode(),
-                    b"event: run.completed\n",
-                    b'data: {"output":"done"}\n',
-                    b"data: [DONE]\n",
-                ]
-            ),
+            Response(stream_lines=lines),
         ]
     )
     monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", lambda *_args, **_kwargs: next(responses))
     emitted = []
-
     text, _usage = gateway_chat._run_gateway_runs_api_streaming(
         "session-1",
         "work",
@@ -113,48 +213,207 @@ def test_gateway_runs_stream_relays_runtime_routing_as_local_event(monkeypatch):
         cancel_event=threading.Event(),
         session=SimpleNamespace(context_messages=[]),
     )
+    return text, emitted
 
+
+def test_gateway_runs_stream_relays_exact_producer_envelope(monkeypatch):
+    producer = {
+        "event": "runtime.routing",
+        "run_id": "gateway-run-1",
+        "timestamp": 0,
+        "routing": ROUTE_EVENT,
+    }
+    text, emitted = _runs_stream(
+        monkeypatch,
+        [
+            b"event: runtime.routing\n",
+            f"data: {json.dumps(producer)}\n".encode(),
+            b"event: run.completed\n",
+            b'data: {"event":"run.completed","output":"done"}\n',
+            b"data: [DONE]\n",
+        ],
+    )
     assert text == "done"
-    assert ("runtime_routing", ROUTE_EVENT) in emitted
+    assert emitted.count(("runtime_routing", ROUTE_EVENT)) == 1
 
 
-def test_direct_streaming_event_callback_emits_route_and_preserves_independent_callback():
-    emitted = []
-    prior = []
-    latest = [None]
-    current = _build_runtime_routing_event_callback(
-        lambda event, payload: emitted.append((event, payload)), latest
+def test_gateway_runs_stream_consumes_completed_route_when_live_event_is_absent(monkeypatch):
+    completed = {"event": "run.completed", "output": "done", "runtime_routing": ROUTE_EVENT}
+    text, emitted = _runs_stream(
+        monkeypatch,
+        [
+            b"event: run.completed\n",
+            f"data: {json.dumps(completed)}\n".encode(),
+            b"data: [DONE]\n",
+        ],
     )
-    combined = _event_callback_for_cached_agent(
-        lambda name, payload: prior.append((name, payload)), current
-    )
-
-    combined("unrelated:event", {"value": 1})
-    combined("runtime:route", ROUTE_EVENT)
-
-    assert prior == [("unrelated:event", {"value": 1}), ("runtime:route", ROUTE_EVENT)]
+    assert text == "done"
     assert emitted == [("runtime_routing", ROUTE_EVENT)]
-    assert latest[0] == ROUTE_EVENT
 
 
-def test_browser_runtime_presentation_distinguishes_running_and_last_used():
-    ui_js = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
-    start = ui_js.index("function _runtimeRoutingPresentation(")
-    end = ui_js.index("\nfunction ", start + 10)
-    function_source = ui_js[start:end]
+def test_legacy_gateway_stream_consumes_completed_route_when_live_event_is_absent(tmp_path, monkeypatch):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+            completed = {"event": "run.completed", "runtime_routing": ROUTE_EVENT}
+            yield f"data: {json.dumps(completed)}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.invalid")
+    monkeypatch.setattr(streaming, "_load_webui_prefill_context", lambda _cfg: {"status": "not_configured"})
+    monkeypatch.setattr(streaming, "_prefill_messages_with_webui_context", lambda _ctx, _cfg: [])
+    monkeypatch.setattr(gateway_chat, "gateway_approval_unavailable_reason", lambda *_args: None)
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+
+    session = models.new_session()
+    stream_id = "legacy-runtime-route"
+    session.active_stream_id = stream_id
+    session.pending_user_message = "work"
+    session.pending_attachments = []
+    session.pending_started_at = 1
+    session.save()
+    channel = create_stream_channel()
+    subscriber = channel.subscribe()
+    STREAMS[stream_id] = channel
+
+    gateway_chat._run_gateway_chat_streaming(
+        session.session_id, "work", "primary-model", str(tmp_path), stream_id, []
+    )
+
+    events = []
+    while not subscriber.empty():
+        item = subscriber.get_nowait()
+        events.append((item[0], item[1]))
+    assert ("runtime_routing", ROUTE_EVENT) in events
+    saved = models.get_session(session.session_id)
+    assert saved.runtime_routing == ROUTE_EVENT
+    assert saved.messages[-1]["_runtimeRouting"] == ROUTE_EVENT
+
+
+def test_cached_agent_callback_preserves_base_callback_across_four_reuses_without_nesting():
+    prior = []
+    callback = lambda name, payload: prior.append((name, payload))
+    per_turn = []
+
+    for turn in range(4):
+        emitted = []
+        current = _build_runtime_routing_event_callback(
+            lambda event, payload, emitted=emitted: emitted.append((event, payload)), [None]
+        )
+        callback = _event_callback_for_cached_agent(callback, current)
+        callback("unrelated:event", {"turn": turn})
+        callback("runtime:route", ROUTE_EVENT)
+        per_turn.append(emitted)
+
+    assert prior == [item for turn in range(4) for item in (
+        ("unrelated:event", {"turn": turn}),
+        ("runtime:route", ROUTE_EVENT),
+    )]
+    assert per_turn == [[("runtime_routing", ROUTE_EVENT)] for _ in range(4)]
+
+
+def test_browser_event_lifecycle_replay_replacement_cleanup_and_selected_control_are_observable():
+    ui_path = REPO / "static" / "ui.js"
+    messages_path = REPO / "static" / "messages.js"
+    functions = "\n".join(
+        _js_function_source(path, name)
+        for path, name in (
+            (ui_path, "_runtimeRoutingPresentation"),
+            (ui_path, "_latestRuntimeRoutingForSession"),
+            (ui_path, "syncModelChip"),
+            (messages_path, "_applyRuntimeRoutingForStream"),
+            (messages_path, "_clearRuntimeRoutingForStream"),
+            (messages_path, "_handleRuntimeRoutingEvent"),
+        )
+    )
     script = f"""
-const getModelLabel=(id)=>String(id||'');
+const route={json.dumps(ROUTE_EVENT)};
+const finished={{...route,state:'finished'}};
+const labels={{
+  runtime_route_running:'Running',runtime_route_last_used:'Last used',runtime_route_via:'{{0}} via {{1}}',
+  runtime_route_fallback:'Fallback',runtime_route_fallback_index:'Fallback {{0}}',
+  runtime_route_primary_restored:'Primary restored',runtime_route_title:'Selected {{0}}; {{1}} {{2}}{{3}}'
+}};
+function t(key,...args){{let out=String(labels[key]||key);args.forEach((v,i)=>{{out=out.split('{{'+i+'}}').join(v??'');}});return out;}}
+const classList={{contains:()=>false,toggle:()=>{{}}}};
+const elements={{
+ modelSelect:{{value:'primary-model'}},composerModelChip:{{title:'',classList}},
+ composerModelLabel:{{textContent:''}},composerMobileModelLabel:{{textContent:''}},
+ composerMobileModelAction:{{classList}},composerModelRuntime:{{textContent:''}},composerModelDropdown:{{classList}}
+}};
+function $(id){{return elements[id]||null;}}
+const INFLIGHT={{}};
+const S={{session:{{session_id:'sid',runtime_routing:finished,messages:[]}},messages:[],activeStreamId:'stream-1',_bootReady:true}};
+const window={{}};
+const getModelLabel=id=>id==='primary-model'?'Primary selected':id;
 const _compactComposerModelChipLabel=(id,label)=>String(label||id||'');
-{function_source}
-const fallback={json.dumps(ROUTE_EVENT)};
-const finished={{...fallback,state:'finished'}};
-console.log(JSON.stringify([
-  _runtimeRoutingPresentation(fallback),
-  _runtimeRoutingPresentation(finished),
-]));
+const _selectedModelOption=()=>({{textContent:'Primary selected'}});
+const _latestGatewayRoutingForSession=()=>({{used_model:'backup-model',used_provider:'backup'}});
+const _gatewayRoutingLabel=()=>'(backup)';
+let chipSyncs=0,persists=0;
+{functions}
+const realSync=syncModelChip;
+syncModelChip=()=>{{chipSyncs++;realSync();}};
+const event={{data:JSON.stringify(route)}};
+const first=_handleRuntimeRoutingEvent('sid','stream-1',event,()=>persists++);
+const replay=_handleRuntimeRoutingEvent('sid','stream-1',event,()=>persists++);
+const selectedAfterReplay=elements.modelSelect.value;
+const mainLabel=elements.composerModelLabel.textContent;
+const runtimeLabel=elements.composerModelRuntime.textContent;
+const staleClear=_clearRuntimeRoutingForStream('sid','older-stream');
+const stillRunning=_latestRuntimeRoutingForSession(S.session).state;
+const terminalClear=_clearRuntimeRoutingForStream('sid','stream-1');
+const settledAfterTerminal=_runtimeRoutingPresentation(_latestRuntimeRoutingForSession(S.session));
+INFLIGHT.sid={{streamId:'stream-2',messages:[],toolCalls:[]}};
+S.activeStreamId='stream-2';
+const replacementEvent={{data:JSON.stringify({{...route,runtime:{{model:'new-backup',provider:'backup'}}}})}};
+const replacementApplied=_handleRuntimeRoutingEvent('sid','stream-2',replacementEvent,()=>persists++);
+const staleOwnerCleanup=_clearRuntimeRoutingForStream('sid','stream-1');
+console.log(JSON.stringify({{first,replay,persists,selectedAfterReplay,mainLabel,runtimeLabel,staleClear,stillRunning,
+ terminalClear,settledAfterTerminal,replacementApplied,staleOwnerCleanup,replacementModel:INFLIGHT.sid.runtimeRouting.runtime.model,
+ liveOwner:S.session.runtime_routing_live_stream_id,chipSyncs}}));
 """
     result = subprocess.run(["node", "-e", script], cwd=REPO, text=True, capture_output=True, check=True)
-    running, settled = json.loads(result.stdout)
-    assert running["phase"] == "Running"
-    assert running["runtimeLabel"] == "backup-model via Backup"
-    assert settled["phase"] == "Last used"
+    observed = json.loads(result.stdout)
+
+    assert observed["first"] is True and observed["replay"] is True
+    assert observed["persists"] == 3
+    assert observed["selectedAfterReplay"] == "primary-model"
+    assert observed["mainLabel"] == "Primary selected"
+    assert observed["runtimeLabel"] == "Running backup-model via Backup"
+    assert observed["staleClear"] is False and observed["stillRunning"] == "fallback_activated"
+    assert observed["terminalClear"] is True
+    assert observed["settledAfterTerminal"]["phase"] == "Last used"
+    assert observed["replacementApplied"] is True and observed["staleOwnerCleanup"] is False
+    assert observed["replacementModel"] == "new-backup" and observed["liveOwner"] == "stream-2"
+
+
+def test_runtime_copy_uses_i18n_fallback_and_narrow_footer_hides_secondary_route():
+    ui = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
+    css = (REPO / "static" / "style.css").read_text(encoding="utf-8")
+    i18n = (REPO / "static" / "i18n.js").read_text(encoding="utf-8")
+
+    for key in (
+        "runtime_route_running",
+        "runtime_route_last_used",
+        "runtime_route_via",
+        "runtime_route_fallback",
+        "runtime_route_primary_restored",
+        "runtime_route_title",
+    ):
+        assert key in i18n and f"t('{key}'" in ui
+    assert ".composer-model-runtime" in css
+    phone_block = css[css.index("@media(max-width:640px)") :]
+    assert ".composer-model-runtime" in phone_block and "display:none" in phone_block

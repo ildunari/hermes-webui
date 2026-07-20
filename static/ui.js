@@ -3702,13 +3702,21 @@ function _runtimeRoutingPresentation(routing){
   const providerLabel=runtimeModel&&runtimeProvider
     ?runtimeProvider.replace(/^custom:/,'').replace(/[-_]/g,' ').replace(/\b\w/g,c=>c.toUpperCase())
     :'';
-  const runtimeLabel=providerLabel?`${modelLabel} via ${providerLabel}`:modelLabel;
+  const runtimeLabel=providerLabel?t('runtime_route_via',modelLabel,providerLabel):modelLabel;
   if(!runtimeLabel) return null;
-  const phase=state==='finished'?'Last used':'Running';
-  const reason=String(fallback.reason||'').trim();
+  const phase=state==='finished'?t('runtime_route_last_used'):t('runtime_route_running');
+  const reasonCode=String(fallback.reason||'').trim();
+  const reasonKeys={
+    rate_limit:'runtime_route_reason_rate_limit',billing:'runtime_route_reason_billing',
+    authentication:'runtime_route_reason_authentication',provider_unavailable:'runtime_route_reason_provider_unavailable',
+    timeout:'runtime_route_reason_timeout',upstream_error:'runtime_route_reason_upstream_error',
+    context_limit:'runtime_route_reason_context_limit',non_retryable_error:'runtime_route_reason_non_retryable_error',
+    unknown:'runtime_route_reason_unknown',
+  };
+  const reason=reasonKeys[reasonCode]?t(reasonKeys[reasonCode]):'';
   const detail=fallback.active
-    ?`Fallback${Number(fallback.chain_index)>0?' '+Number(fallback.chain_index):''}${reason?' · '+reason:''}`
-    :(state==='primary_restored'?'Primary restored':'');
+    ?`${Number(fallback.chain_index)>0?t('runtime_route_fallback_index',Number(fallback.chain_index)):t('runtime_route_fallback')}${reason?' · '+reason:''}`
+    :(state==='primary_restored'?t('runtime_route_primary_restored'):'');
   return {phase,runtimeLabel,runtimeModel,runtimeProvider,detail,state};
 }
 
@@ -3717,7 +3725,9 @@ function _latestRuntimeRoutingForSession(session){
   const sid=session.session_id;
   const inflight=(typeof INFLIGHT==='object'&&INFLIGHT&&sid)?INFLIGHT[sid]:null;
   if(inflight&&inflight.runtimeRouting) return inflight.runtimeRouting;
-  if(session.runtime_routing_live) return session.runtime_routing_live;
+  const liveStreamId=String(session.runtime_routing_live_stream_id||'');
+  const activeStreamId=String((inflight&&inflight.streamId)||S.activeStreamId||'');
+  if(session.runtime_routing_live&&liveStreamId&&liveStreamId===activeStreamId) return session.runtime_routing_live;
   if(session.runtime_routing) return session.runtime_routing;
   const messages=Array.isArray(session.messages)?session.messages:(Array.isArray(S.messages)?S.messages:[]);
   const assistant=[...messages].reverse().find(m=>m&&m.role==='assistant'&&m._runtimeRouting);
@@ -3745,13 +3755,15 @@ function syncModelChip(){
   const text=opt?opt.textContent:getModelLabel(sel.value||'');
   const compactText=_compactComposerModelChipLabel(sel.value||'', text);
   const gatewayRouting=_latestGatewayRoutingForSession(S.session);
-  const displayText=_formatGatewayModelLabel(sel.value||'',compactText,gatewayRouting)||compactText;
+  // The main chip is selected intent. Runtime/gateway substitution belongs only
+  // in the secondary route line and must never rewrite the selected control.
+  const displayText=compactText;
   const runtimePresentation=_runtimeRoutingPresentation(_latestRuntimeRoutingForSession(S.session));
   label.textContent=displayText;
   if(runtimeEl) runtimeEl.textContent=runtimePresentation?`${runtimePresentation.phase} ${runtimePresentation.runtimeLabel}`:'';
   if(mobileLabel) mobileLabel.textContent=runtimePresentation?`${displayText} · ${runtimePresentation.phase} ${runtimePresentation.runtimeLabel}`:displayText;
   const routeTitle=runtimePresentation
-    ?`Selected ${displayText}; ${runtimePresentation.phase.toLowerCase()} ${runtimePresentation.runtimeLabel}${runtimePresentation.detail?'; '+runtimePresentation.detail:''}`
+    ?t('runtime_route_title',displayText,runtimePresentation.phase,runtimePresentation.runtimeLabel,runtimePresentation.detail?'; '+runtimePresentation.detail:'')
     :'';
   chip.title=routeTitle||(gatewayRouting?`${sel.value||'Conversation model'} ${_gatewayRoutingLabel(gatewayRouting)}`:(sel.value||'Conversation model'));
   chip.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
@@ -4381,7 +4393,7 @@ function renderModelDropdown(){
       if(runtimePresentation){
         const runtimeNote=document.createElement('div');
         runtimeNote.className='model-runtime-note';
-        runtimeNote.innerHTML=`<span>Selected</span><strong>${esc(_compactComposerModelChipLabel(sel.value||'',getModelLabel(sel.value||'')))}</strong><span>${esc(runtimePresentation.phase)}</span><strong>${esc(runtimePresentation.runtimeLabel)}</strong>${runtimePresentation.detail?`<small>${esc(runtimePresentation.detail)}</small>`:''}`;
+        runtimeNote.innerHTML=`<span>${esc(t('model_badge_selected'))}</span><strong>${esc(_compactComposerModelChipLabel(sel.value||'',getModelLabel(sel.value||'')))}</strong><span>${esc(runtimePresentation.phase)}</span><strong>${esc(runtimePresentation.runtimeLabel)}</strong>${runtimePresentation.detail?`<small>${esc(runtimePresentation.detail)}</small>`:''}`;
         dd.appendChild(runtimeNote);
       }
     }

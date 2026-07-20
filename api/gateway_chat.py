@@ -39,11 +39,12 @@ logger = logging.getLogger(__name__)
 
 def _gateway_runtime_routing_event(payload: Any) -> dict | None:
     """Translate Gateway ``runtime.routing`` into the local route payload."""
-    source = (
-        payload.get("payload")
-        if isinstance(payload, dict) and isinstance(payload.get("payload"), dict)
-        else payload
-    )
+    source = payload
+    if isinstance(payload, dict):
+        for key in ("routing", "payload", "runtime_routing"):
+            if isinstance(payload.get(key), dict):
+                source = payload[key]
+                break
     return normalize_runtime_routing_payload(source)
 
 # Maps stream_id -> gateway run_id for approval response relay.
@@ -533,6 +534,9 @@ def _run_gateway_runs_api_streaming(
                 sse_event = "message"
                 continue
             if payload_event == "run.completed":
+                routing_data = _gateway_runtime_routing_event(payload.get("runtime_routing"))
+                if routing_data:
+                    put_gateway_event("runtime_routing", routing_data)
                 if payload.get("error"):
                     raise RuntimeError(str(payload["error"]))
                 output = str(payload.get("output") or "")
@@ -911,6 +915,10 @@ def _run_gateway_chat_streaming(
                     except json.JSONDecodeError:
                         continue
                     _payload_event = str(payload.get("event") or payload.get("type") or sse_event).strip()
+                    if _payload_event == "run.completed" and isinstance(payload.get("runtime_routing"), dict):
+                        routing_data = _gateway_runtime_routing_event(payload.get("runtime_routing"))
+                        if routing_data:
+                            put_gateway_event("runtime_routing", routing_data)
                     if _payload_event == "runtime.routing":
                         routing_data = _gateway_runtime_routing_event(payload)
                         if routing_data:
