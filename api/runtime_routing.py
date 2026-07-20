@@ -22,6 +22,9 @@ _RUNTIME_ROUTING_REASONS = frozenset(
         "unknown",
     }
 )
+# Keep Desktop's strict integer contract while bounding hostile telemetry. A
+# maximum of 100 is deliberately generous for any practical fallback chain.
+_MAX_RUNTIME_ROUTING_CHAIN_INDEX = 100
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _URL_RE = re.compile(r"(?i)\b(?:https?|wss?)://[^\s<>'\"]+")
 _BEARER_RE = re.compile(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
@@ -46,45 +49,73 @@ def _clean_text(value: Any, limit: int = 240) -> str:
     return " ".join(text.split()).strip()[:limit]
 
 
-def _route_lane(value: Any) -> dict[str, str]:
-    source = value if isinstance(value, dict) else {}
-    return {
-        "model": _clean_text(source.get("model")),
-        "provider": _clean_text(source.get("provider"), 120),
-    }
+def _route_lane(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    model = value.get("model")
+    provider = value.get("provider")
+    if not isinstance(model, str) or not model.strip():
+        return None
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    cleaned_model = _clean_text(model)
+    cleaned_provider = _clean_text(provider, 120)
+    if not cleaned_model or not cleaned_provider:
+        return None
+    return {"model": cleaned_model, "provider": cleaned_provider}
 
 
 def normalize_runtime_routing_payload(payload: Any) -> dict[str, Any] | None:
-    """Return the committed schema-v1 presentation payload, or ``None``.
+    """Return a strict, display-safe schema-v1 payload, or ``None``.
 
     The allowlist deliberately drops unknown fields so callback or Gateway data
     cannot leak credentials/provider internals into the journal or browser.
+    Malformed required fields are rejected rather than coerced.
     """
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+    if (
+        not isinstance(payload, dict)
+        or isinstance(payload.get("schema_version"), bool)
+        or payload.get("schema_version") != 1
+    ):
         return None
-    state = _clean_text(payload.get("state"), 40).lower()
+    raw_state = payload.get("state")
+    if not isinstance(raw_state, str) or not raw_state.strip():
+        return None
+    state = _clean_text(raw_state, 40).lower()
     if state not in _RUNTIME_ROUTING_STATES:
         return None
     selected = _route_lane(payload.get("selected"))
     runtime = _route_lane(payload.get("runtime"))
-    raw_fallback = payload.get("fallback")
-    fallback_source: dict[str, Any] = raw_fallback if isinstance(raw_fallback, dict) else {}
-    reason = _clean_text(fallback_source.get("reason"), 40).lower()
+    if selected is None or runtime is None:
+        return None
+    fallback = payload.get("fallback")
+    if not isinstance(fallback, dict):
+        return None
+    active = fallback.get("active")
+    raw_reason = fallback.get("reason")
+    chain_index = fallback.get("chain_index")
+    if not isinstance(active, bool):
+        return None
+    if not isinstance(raw_reason, str) or not raw_reason.strip():
+        return None
+    reason = _clean_text(raw_reason, 40).lower()
     if reason not in _RUNTIME_ROUTING_REASONS:
-        reason = "unknown"
-    try:
-        chain_index = int(fallback_source.get("chain_index") or 0)
-    except (TypeError, ValueError):
-        chain_index = 0
+        return None
+    if (
+        isinstance(chain_index, bool)
+        or not isinstance(chain_index, int)
+        or not 0 <= chain_index <= _MAX_RUNTIME_ROUTING_CHAIN_INDEX
+    ):
+        return None
     return {
         "schema_version": 1,
         "state": state,
         "selected": selected,
         "runtime": runtime,
         "fallback": {
-            "active": bool(fallback_source.get("active")),
+            "active": active,
             "reason": reason,
-            "chain_index": max(0, chain_index),
+            "chain_index": chain_index,
         },
     }
 

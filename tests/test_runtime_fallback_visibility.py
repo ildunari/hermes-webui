@@ -20,6 +20,7 @@ from api.streaming import (
     _build_runtime_routing_event_callback,
     _event_callback_for_cached_agent,
 )
+from tests.test_zh_hant_locale import locale_block, value_map
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -109,14 +110,52 @@ def test_runtime_routing_contract_normalizes_without_mutating_selected_model():
     assert "ignored_secret" not in normalized
 
 
-def test_runtime_routing_contract_rejects_unknown_schema_and_state_and_enforces_reason_enum():
+def test_runtime_routing_contract_rejects_unknown_schema_state_and_reason_enum():
     assert normalize_runtime_routing_payload({**ROUTE_EVENT, "schema_version": 2}) is None
+    assert normalize_runtime_routing_payload({**ROUTE_EVENT, "schema_version": True}) is None
     assert normalize_runtime_routing_payload({**ROUTE_EVENT, "state": "mystery"}) is None
-    normalized = normalize_runtime_routing_payload(
+    assert normalize_runtime_routing_payload(
         {**ROUTE_EVENT, "fallback": {"active": True, "reason": "primary quota exhausted", "chain_index": 1}}
-    )
-    assert normalized is not None
-    assert normalized["fallback"]["reason"] == "unknown"
+    ) is None
+
+
+def test_runtime_routing_contract_rejects_missing_or_malformed_required_fields():
+    malformed = [
+        {key: value for key, value in ROUTE_EVENT.items() if key != "selected"},
+        {key: value for key, value in ROUTE_EVENT.items() if key != "runtime"},
+        {key: value for key, value in ROUTE_EVENT.items() if key != "fallback"},
+        {**ROUTE_EVENT, "selected": None},
+        {**ROUTE_EVENT, "runtime": []},
+        {**ROUTE_EVENT, "fallback": None},
+        {**ROUTE_EVENT, "selected": {"model": "primary-model"}},
+        {**ROUTE_EVENT, "selected": {"provider": "primary"}},
+        {**ROUTE_EVENT, "runtime": {"model": "backup-model"}},
+        {**ROUTE_EVENT, "runtime": {"provider": "backup"}},
+        {**ROUTE_EVENT, "selected": {"model": "", "provider": "primary"}},
+        {**ROUTE_EVENT, "runtime": {"model": "backup-model", "provider": "  "}},
+        {**ROUTE_EVENT, "selected": {"model": "\x00\x1b", "provider": "primary"}},
+        {**ROUTE_EVENT, "fallback": {"reason": "rate_limit", "chain_index": 1}},
+        {**ROUTE_EVENT, "fallback": {"active": "false", "reason": "rate_limit", "chain_index": 1}},
+        {**ROUTE_EVENT, "fallback": {"active": True, "reason": "", "chain_index": 1}},
+        {**ROUTE_EVENT, "fallback": {"active": True, "reason": "rate_limit"}},
+    ]
+    for payload in malformed:
+        assert normalize_runtime_routing_payload(payload) is None
+
+
+def test_runtime_routing_contract_rejects_non_integer_or_out_of_bounds_chain_index():
+    for chain_index in (True, 1.5, "1", -1, 101, 10**100):
+        payload = {
+            **ROUTE_EVENT,
+            "fallback": {"active": True, "reason": "rate_limit", "chain_index": chain_index},
+        }
+        assert normalize_runtime_routing_payload(payload) is None
+
+    boundary = {
+        **ROUTE_EVENT,
+        "fallback": {"active": True, "reason": "rate_limit", "chain_index": 100},
+    }
+    assert normalize_runtime_routing_payload(boundary) == boundary
 
 
 def test_runtime_routing_contract_scrubs_hostile_allowed_text_before_persistence():
@@ -132,7 +171,7 @@ def test_runtime_routing_contract_scrubs_hostile_allowed_text_before_persistence
         },
         "fallback": {
             "active": True,
-            "reason": "Bearer abcdefghijklmnopqrstuvwxyz arbitrary prose",
+            "reason": "rate_limit",
             "chain_index": 1,
         },
     }
@@ -141,7 +180,7 @@ def test_runtime_routing_contract_scrubs_hostile_allowed_text_before_persistence
     assert normalized is not None
     serialized = json.dumps(normalized).lower()
 
-    assert normalized["fallback"]["reason"] == "unknown"
+    assert normalized["fallback"]["reason"] == "rate_limit"
     for leaked in ("abcdefghijklmnopqrstuvwxyz", "hunter2", "user:pass", "api_key=secret", "\x1b"):
         assert leaked not in serialized
     assert "[redacted" in serialized
@@ -494,3 +533,32 @@ def test_runtime_copy_uses_i18n_fallback_and_narrow_footer_hides_secondary_route
     assert ".composer-model-runtime" in css
     phone_block = css[css.index("@media(max-width:640px)") :]
     assert ".composer-model-runtime" in phone_block and "display:none" in phone_block
+
+
+def test_runtime_route_copy_is_translated_in_every_non_english_locale():
+    src = (REPO / "static" / "i18n.js").read_text(encoding="utf-8")
+    english = value_map(locale_block(src, "\n  en: {"))
+    runtime_keys = {key for key in english if key.startswith("runtime_route_")}
+    expected_running = {
+        "it": "'In esecuzione'",
+        "ja": "'実行中'",
+        "ru": "'Выполняется'",
+        "es": "'En ejecución'",
+        "de": "'Wird ausgeführt'",
+        "zh": "'运行中'",
+        "zh-Hant": "'執行中'",
+        "pt": "'Em execução'",
+        "ko": "'실행 중'",
+        "fr": "'En cours'",
+        "cs": "'Probíhá'",
+        "tr": "'Çalışıyor'",
+        "pl": "'W toku'",
+        "vi": "'Đang chạy'",
+    }
+
+    for locale, translated_running in expected_running.items():
+        marker = f"\n  '{locale}': {{" if "-" in locale else f"\n  {locale}: {{"
+        values = value_map(locale_block(src, marker))
+        assert runtime_keys <= values.keys(), f"{locale} is missing runtime route translations"
+        assert values["runtime_route_running"] == translated_running
+        assert values["runtime_route_running"] != english["runtime_route_running"]
