@@ -32,7 +32,7 @@ from api.config import (
 from api.helpers import _redact_text, redact_session_data
 from api.models import clear_process_wakeup_pause, get_session, merge_session_messages_append_only
 from api.run_journal import RunJournalWriter
-from api.runtime_routing import attach_runtime_routing_summary, normalize_runtime_routing_payload
+from api.runtime_routing import normalize_runtime_routing_payload, settle_runtime_routing_summary
 
 logger = logging.getLogger(__name__)
 
@@ -1110,8 +1110,7 @@ def _run_gateway_chat_streaming(
             s.workspace = str(workspace)
             s.model = model
             s.model_provider = model_provider
-            if latest_runtime_routing[0] is not None:
-                attach_runtime_routing_summary(s, latest_runtime_routing[0])
+            settle_runtime_routing_summary(s, latest_runtime_routing[0])
 
             def _restore_cancelled_success_writeback():
                 if pending_source == "process_wakeup":

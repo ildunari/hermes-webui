@@ -3693,6 +3693,7 @@ function _runtimeRoutingPresentation(routing){
   const state=String(routing.state||'');
   if(!states.has(state)) return null;
   const runtime=routing.runtime&&typeof routing.runtime==='object'?routing.runtime:{};
+  const selected=routing.selected&&typeof routing.selected==='object'?routing.selected:{};
   const fallback=routing.fallback&&typeof routing.fallback==='object'?routing.fallback:{};
   const runtimeModel=String(runtime.model||'').trim();
   const runtimeProvider=String(runtime.provider||'').trim();
@@ -3717,7 +3718,12 @@ function _runtimeRoutingPresentation(routing){
   const detail=fallback.active
     ?`${Number(fallback.chain_index)>0?t('runtime_route_fallback_index',Number(fallback.chain_index)):t('runtime_route_fallback')}${reason?' · '+reason:''}`
     :(state==='primary_restored'?t('runtime_route_primary_restored'):'');
-  return {phase,runtimeLabel,runtimeModel,runtimeProvider,detail,state};
+  const selectedProvider=String(selected.provider||'').trim();
+  const selectedProviderLabel=selectedProvider
+    ?selectedProvider.replace(/^custom:/,'').replace(/[-_]/g,' ').replace(/\b\w/g,c=>c.toUpperCase())
+    :'';
+  const selectedRouteLabel=selectedProviderLabel?t('runtime_route_selected_via',selectedProviderLabel):'';
+  return {phase,runtimeLabel,runtimeModel,runtimeProvider,selectedProvider,selectedRouteLabel,detail,state};
 }
 
 function _latestRuntimeRoutingForSession(session){
@@ -3730,8 +3736,8 @@ function _latestRuntimeRoutingForSession(session){
   if(session.runtime_routing_live&&liveStreamId&&liveStreamId===activeStreamId) return session.runtime_routing_live;
   if(session.runtime_routing) return session.runtime_routing;
   const messages=Array.isArray(session.messages)?session.messages:(Array.isArray(S.messages)?S.messages:[]);
-  const assistant=[...messages].reverse().find(m=>m&&m.role==='assistant'&&m._runtimeRouting);
-  return assistant?assistant._runtimeRouting:null;
+  const latest=messages.length?messages[messages.length-1]:null;
+  return latest&&latest.role==='assistant'&&latest._runtimeRouting?latest._runtimeRouting:null;
 }
 
 function syncModelChip(){
@@ -3760,8 +3766,9 @@ function syncModelChip(){
   const displayText=compactText;
   const runtimePresentation=_runtimeRoutingPresentation(_latestRuntimeRoutingForSession(S.session));
   label.textContent=displayText;
-  if(runtimeEl) runtimeEl.textContent=runtimePresentation?`${runtimePresentation.phase} ${runtimePresentation.runtimeLabel}`:'';
-  if(mobileLabel) mobileLabel.textContent=runtimePresentation?`${displayText} · ${runtimePresentation.phase} ${runtimePresentation.runtimeLabel}`:displayText;
+  const selectedRoute=runtimePresentation&&runtimePresentation.selectedRouteLabel?`${runtimePresentation.selectedRouteLabel} · `:'';
+  if(runtimeEl) runtimeEl.textContent=runtimePresentation?`${selectedRoute}${runtimePresentation.phase} ${runtimePresentation.runtimeLabel}`:'';
+  if(mobileLabel) mobileLabel.textContent=runtimePresentation?`${displayText} · ${selectedRoute}${runtimePresentation.phase} ${runtimePresentation.runtimeLabel}`:displayText;
   const routeTitle=runtimePresentation
     ?t('runtime_route_title',displayText,runtimePresentation.phase,runtimePresentation.runtimeLabel,runtimePresentation.detail?'; '+runtimePresentation.detail:'')
     :'';
@@ -4393,7 +4400,7 @@ function renderModelDropdown(){
       if(runtimePresentation){
         const runtimeNote=document.createElement('div');
         runtimeNote.className='model-runtime-note';
-        runtimeNote.innerHTML=`<span>${esc(t('model_badge_selected'))}</span><strong>${esc(_compactComposerModelChipLabel(sel.value||'',getModelLabel(sel.value||'')))}</strong><span>${esc(runtimePresentation.phase)}</span><strong>${esc(runtimePresentation.runtimeLabel)}</strong>${runtimePresentation.detail?`<small>${esc(runtimePresentation.detail)}</small>`:''}`;
+        runtimeNote.innerHTML=`<span>${esc(t('model_badge_selected'))}</span><strong>${esc(_compactComposerModelChipLabel(sel.value||'',getModelLabel(sel.value||'')))}</strong>${runtimePresentation.selectedRouteLabel?`<small>${esc(runtimePresentation.selectedRouteLabel)}</small>`:''}<span>${esc(runtimePresentation.phase)}</span><strong>${esc(runtimePresentation.runtimeLabel)}</strong>${runtimePresentation.detail?`<small>${esc(runtimePresentation.detail)}</small>`:''}`;
         dd.appendChild(runtimeNote);
       }
     }

@@ -14758,6 +14758,9 @@ def handle_post(handler, parsed) -> bool:
                     str(old_model or "") != str(getattr(s, "model", "") or "")
                     or str(old_provider or "") != str(getattr(s, "model_provider", "") or "")
                 ):
+                    # This summary describes the last response under the old
+                    # selection. Historical assistant-row metadata remains.
+                    s.runtime_routing = None
                     s.context_length = _resolve_context_length_for_session_model(
                         getattr(s, "model", None),
                         getattr(s, "model_provider", None),

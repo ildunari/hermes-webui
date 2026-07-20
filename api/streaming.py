@@ -48,7 +48,7 @@ from api.compression_anchor import is_context_compression_marker, visible_messag
 from api.compression_recovery import stamp_compression_exhausted_recovery
 from api.metering import meter
 from api.run_journal import RunJournalWriter
-from api.runtime_routing import attach_runtime_routing_summary, normalize_runtime_routing_payload
+from api.runtime_routing import normalize_runtime_routing_payload, settle_runtime_routing_summary
 from api.todo_state import attach_todo_state, emit_todo_state
 from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
@@ -1775,7 +1775,14 @@ def _event_callback_for_cached_agent(existing, current):
     """Refresh our stale closure while preserving an independent callback."""
     if not callable(existing):
         return current
-    base = getattr(existing, '_webui_runtime_routing_base_callback', existing)
+    # A callback installed by WebUI is request-owned. In particular, the first
+    # callback passed to AIAgent.__init__ has no independent base and must never
+    # become one merely because that agent was cached. Only a base explicitly
+    # carried by our wrapper survives into the next turn.
+    if getattr(existing, '_webui_runtime_routing_callback', False):
+        base = getattr(existing, '_webui_runtime_routing_base_callback', None)
+    else:
+        base = existing
     if not callable(base):
         return current
 
@@ -9713,8 +9720,7 @@ def _run_agent_streaming(
                             if _ttft_ms is not None:
                                 _dm['_firstTokenMs'] = _ttft_ms
                             break
-                if _latest_runtime_routing[0] is not None:
-                    attach_runtime_routing_summary(s, _latest_runtime_routing[0])
+                settle_runtime_routing_summary(s, _latest_runtime_routing[0])
                 # Persist context window data on the session so the context-ring
                 # indicator survives a page reload (#1318). Must run BEFORE
                 # s.save() for the same reason as the reasoning trace above.

@@ -4,13 +4,18 @@ from collections import OrderedDict
 import json
 import subprocess
 import threading
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
-from api import gateway_chat, models, streaming
+from api import gateway_chat, models, routes, streaming
 from api.config import STREAMS, create_stream_channel
 from api.gateway_chat import _gateway_runtime_routing_event
-from api.runtime_routing import attach_runtime_routing_summary, normalize_runtime_routing_payload
+from api.runtime_routing import (
+    attach_runtime_routing_summary,
+    normalize_runtime_routing_payload,
+    settle_runtime_routing_summary,
+)
 from api.streaming import (
     _build_runtime_routing_event_callback,
     _event_callback_for_cached_agent,
@@ -158,6 +163,19 @@ def test_settled_runtime_summary_attaches_to_session_and_completed_assistant():
     assert session.runtime_routing == finished
     assert session.messages[-1]["_runtimeRouting"] == finished
     assert (session.model, session.model_provider) == ("primary-model", "primary")
+
+
+def test_success_without_routing_clears_summary_but_preserves_historical_message_metadata():
+    old = {**ROUTE_EVENT, "state": "finished"}
+    session = SimpleNamespace(
+        runtime_routing=old,
+        messages=[{"role": "assistant", "content": "old", "_runtimeRouting": old}],
+    )
+
+    settle_runtime_routing_summary(session, None)
+
+    assert session.runtime_routing is None
+    assert session.messages[0]["_runtimeRouting"] == old
 
 
 def test_gateway_runtime_routing_translates_exact_upstream_and_compat_envelopes():
@@ -324,6 +342,54 @@ def test_cached_agent_callback_preserves_base_callback_across_four_reuses_withou
     assert per_turn == [[("runtime_routing", ROUTE_EVENT)] for _ in range(4)]
 
 
+def test_cached_agent_replaces_initial_webui_callback_and_old_turn_closures_receive_nothing():
+    per_turn = []
+    callback = None
+
+    for _turn in range(4):
+        emitted = []
+        current = _build_runtime_routing_event_callback(
+            lambda event, payload, emitted=emitted: emitted.append((event, payload)), [None]
+        )
+        callback = current if callback is None else _event_callback_for_cached_agent(callback, current)
+        callback("runtime:route", ROUTE_EVENT)
+        per_turn.append(emitted)
+
+    assert per_turn == [[("runtime_routing", ROUTE_EVENT)] for _ in range(4)]
+
+
+def test_session_model_or_provider_change_clears_summary_not_message_history(tmp_path, monkeypatch):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    session = models.new_session(model="same-model", model_provider="primary")
+    finished = {**ROUTE_EVENT, "state": "finished"}
+    session.runtime_routing = finished
+    session.messages = [{"role": "assistant", "content": "old", "_runtimeRouting": finished}]
+    session.save()
+
+    body = json.dumps({
+        "session_id": session.session_id,
+        "model": "same-model",
+        "model_provider": "backup",
+    }).encode()
+    captured = {}
+    monkeypatch.setattr(routes, "j", lambda _handler, payload, *args, **kwargs: captured.update(payload) or True)
+    monkeypatch.setattr(routes, "bad", lambda _handler, message, *args, **kwargs: (_ for _ in ()).throw(AssertionError(message)))
+    monkeypatch.setattr(routes, "_resolve_context_length_for_session_model", lambda *_args, **_kwargs: 123)
+    monkeypatch.setattr("api.config._evict_session_agent", lambda _sid: None)
+    handler = SimpleNamespace(headers={"Content-Length": str(len(body))}, rfile=BytesIO(body))
+
+    routes.handle_post(handler, SimpleNamespace(path="/api/session/update"))
+
+    updated = models.get_session(session.session_id)
+    assert updated.model_provider == "backup"
+    assert updated.runtime_routing is None
+    assert updated.messages[0]["_runtimeRouting"] == finished
+
+
 def test_browser_event_lifecycle_replay_replacement_cleanup_and_selected_control_are_observable():
     ui_path = REPO / "static" / "ui.js"
     messages_path = REPO / "static" / "messages.js"
@@ -342,7 +408,7 @@ def test_browser_event_lifecycle_replay_replacement_cleanup_and_selected_control
 const route={json.dumps(ROUTE_EVENT)};
 const finished={{...route,state:'finished'}};
 const labels={{
-  runtime_route_running:'Running',runtime_route_last_used:'Last used',runtime_route_via:'{{0}} via {{1}}',
+  runtime_route_running:'Running',runtime_route_last_used:'Last response',runtime_route_selected_via:'Selected via {{0}}',runtime_route_via:'{{0}} via {{1}}',
   runtime_route_fallback:'Fallback',runtime_route_fallback_index:'Fallback {{0}}',
   runtime_route_primary_restored:'Primary restored',runtime_route_title:'Selected {{0}}; {{1}} {{2}}{{3}}'
 }};
@@ -367,6 +433,7 @@ let chipSyncs=0,persists=0;
 const realSync=syncModelChip;
 syncModelChip=()=>{{chipSyncs++;realSync();}};
 const event={{data:JSON.stringify(route)}};
+const providerOnlyPresentation=_runtimeRoutingPresentation({{...route,runtime:{{model:'primary-model',provider:'backup'}}}});
 const first=_handleRuntimeRoutingEvent('sid','stream-1',event,()=>persists++);
 const replay=_handleRuntimeRoutingEvent('sid','stream-1',event,()=>persists++);
 const selectedAfterReplay=elements.modelSelect.value;
@@ -381,9 +448,15 @@ S.activeStreamId='stream-2';
 const replacementEvent={{data:JSON.stringify({{...route,runtime:{{model:'new-backup',provider:'backup'}}}})}};
 const replacementApplied=_handleRuntimeRoutingEvent('sid','stream-2',replacementEvent,()=>persists++);
 const staleOwnerCleanup=_clearRuntimeRoutingForStream('sid','stream-1');
+const replacementModel=INFLIGHT.sid.runtimeRouting.runtime.model;
+delete INFLIGHT.sid.runtimeRouting;
+delete S.session.runtime_routing;
+delete S.session.runtime_routing_live;
+S.session.messages=[{{role:'assistant',_runtimeRouting:finished}},{{role:'assistant',content:'new legacy response'}}];
+const ignoresOlderAssistant=_latestRuntimeRoutingForSession(S.session)===null;
 console.log(JSON.stringify({{first,replay,persists,selectedAfterReplay,mainLabel,runtimeLabel,staleClear,stillRunning,
- terminalClear,settledAfterTerminal,replacementApplied,staleOwnerCleanup,replacementModel:INFLIGHT.sid.runtimeRouting.runtime.model,
- liveOwner:S.session.runtime_routing_live_stream_id,chipSyncs}}));
+ terminalClear,settledAfterTerminal,replacementApplied,staleOwnerCleanup,replacementModel,
+ liveOwner:S.session.runtime_routing_live_stream_id,chipSyncs,ignoresOlderAssistant,providerOnlyPresentation}}));
 """
     result = subprocess.run(["node", "-e", script], cwd=REPO, text=True, capture_output=True, check=True)
     observed = json.loads(result.stdout)
@@ -392,12 +465,15 @@ console.log(JSON.stringify({{first,replay,persists,selectedAfterReplay,mainLabel
     assert observed["persists"] == 3
     assert observed["selectedAfterReplay"] == "primary-model"
     assert observed["mainLabel"] == "Primary selected"
-    assert observed["runtimeLabel"] == "Running backup-model via Backup"
+    assert observed["runtimeLabel"] == "Selected via Primary · Running backup-model via Backup"
     assert observed["staleClear"] is False and observed["stillRunning"] == "fallback_activated"
     assert observed["terminalClear"] is True
-    assert observed["settledAfterTerminal"]["phase"] == "Last used"
+    assert observed["settledAfterTerminal"]["phase"] == "Last response"
     assert observed["replacementApplied"] is True and observed["staleOwnerCleanup"] is False
     assert observed["replacementModel"] == "new-backup" and observed["liveOwner"] == "stream-2"
+    assert observed["ignoresOlderAssistant"] is True
+    assert observed["providerOnlyPresentation"]["selectedRouteLabel"] == "Selected via Primary"
+    assert observed["providerOnlyPresentation"]["runtimeLabel"] == "Primary selected via Backup"
 
 
 def test_runtime_copy_uses_i18n_fallback_and_narrow_footer_hides_secondary_route():
@@ -408,6 +484,7 @@ def test_runtime_copy_uses_i18n_fallback_and_narrow_footer_hides_secondary_route
     for key in (
         "runtime_route_running",
         "runtime_route_last_used",
+        "runtime_route_selected_via",
         "runtime_route_via",
         "runtime_route_fallback",
         "runtime_route_primary_restored",

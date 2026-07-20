@@ -1680,7 +1680,7 @@ async function send(){
       }
     });
     // A live route belongs to the previous stream only. Starting a replacement
-    // must reveal the durable Last used summary until this stream emits its own
+    // must reveal the durable Last response summary until this stream emits its own
     // route event; it must never inherit a stale Running label.
     if(typeof _clearRuntimeRoutingForStream==='function'){
       _clearRuntimeRoutingForStream(activeSid,null,{force:true});

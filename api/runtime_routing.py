@@ -100,3 +100,16 @@ def attach_runtime_routing_summary(session: Any, payload: Any) -> dict[str, Any]
             message["_runtimeRouting"] = normalized
             break
     return normalized
+
+
+def settle_runtime_routing_summary(session: Any, payload: Any) -> dict[str, Any] | None:
+    """Set the latest-response summary, clearing stale legacy-backend state.
+
+    Per-message routing metadata is historical evidence and is deliberately left
+    untouched when a successful response has no schema-v1 routing payload.
+    """
+    normalized = normalize_runtime_routing_payload(payload)
+    if normalized is None:
+        session.runtime_routing = None
+        return None
+    return attach_runtime_routing_summary(session, normalized)
