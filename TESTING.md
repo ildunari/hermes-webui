@@ -271,6 +271,19 @@ EXPECT:
   - The model dropdown remains usable without overlapping the send button or pushing controls out of view
 FAIL: Linear meter still shown, tooltip missing/incomplete, controls overlap, or footer wraps in a broken way.
 
+### T3.4: Runtime Fallback Keeps Selection Visible
+SETUP: Configure a primary model and a fallback route, then trigger a turn where the primary route fails over.
+STEPS:
+  1. Observe the model chip while the turn runs.
+  2. Open the model dropdown.
+  3. Reload after the turn completes.
+EXPECT:
+  - The selected model remains unchanged.
+  - The chip and dropdown quietly identify the model currently running during fallback.
+  - After completion and reload, the completed turn/session shows the last-used runtime route.
+  - At phone width, the extra runtime copy stays out of the crowded composer footer and remains available in the mobile model action/dropdown.
+FAIL: The selected model changes to the fallback, runtime state disappears on reload, or narrow composer controls overflow.
+
 ---
 
 ## Section 4: File Upload

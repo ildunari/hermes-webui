@@ -32,8 +32,19 @@ from api.config import (
 from api.helpers import _redact_text, redact_session_data
 from api.models import clear_process_wakeup_pause, get_session, merge_session_messages_append_only
 from api.run_journal import RunJournalWriter
+from api.runtime_routing import attach_runtime_routing_summary, normalize_runtime_routing_payload
 
 logger = logging.getLogger(__name__)
+
+
+def _gateway_runtime_routing_event(payload: Any) -> dict | None:
+    """Translate Gateway ``runtime.routing`` into the local route payload."""
+    source = (
+        payload.get("payload")
+        if isinstance(payload, dict) and isinstance(payload.get("payload"), dict)
+        else payload
+    )
+    return normalize_runtime_routing_payload(source)
 
 # Maps stream_id -> gateway run_id for approval response relay.
 _STREAM_RUN_IDS: dict[str, str] = {}
@@ -468,6 +479,12 @@ def _run_gateway_runs_api_streaming(
             except json.JSONDecodeError:
                 continue
             payload_event = str(payload.get("event") or payload.get("type") or sse_event).strip() or "message"
+            if payload_event == "runtime.routing":
+                routing_data = _gateway_runtime_routing_event(payload)
+                if routing_data:
+                    put_gateway_event("runtime_routing", routing_data)
+                sse_event = "message"
+                continue
             if payload_event == "approval.request":
                 approval_data = _gateway_runs_approval_event(payload)
                 if approval_data:
@@ -681,10 +698,17 @@ def _run_gateway_chat_streaming(
         STREAM_LIVE_TOOL_CALLS[stream_id] = []
 
     success_writeback_committed = False
+    latest_runtime_routing: list[dict | None] = [None]
 
     def put_gateway_event(event, data):
         if cancel_event.is_set() and not success_writeback_committed and event not in ("cancel", "error", "apperror"):
             return
+        if event == "runtime_routing":
+            normalized = normalize_runtime_routing_payload(data)
+            if normalized is None:
+                return
+            latest_runtime_routing[0] = normalized
+            data = normalized
         if event == "apperror" and isinstance(data, dict):
             data = data.copy()
             data.setdefault("session_id", session_id)
@@ -887,6 +911,12 @@ def _run_gateway_chat_streaming(
                     except json.JSONDecodeError:
                         continue
                     _payload_event = str(payload.get("event") or payload.get("type") or sse_event).strip()
+                    if _payload_event == "runtime.routing":
+                        routing_data = _gateway_runtime_routing_event(payload)
+                        if routing_data:
+                            put_gateway_event("runtime_routing", routing_data)
+                        sse_event = "message"
+                        continue
                     if _payload_event in {"hermes.approval.request", "approval.request"}:
                         approval_data = _gateway_runs_approval_event(payload)
                         if approval_data:
@@ -1072,6 +1102,8 @@ def _run_gateway_chat_streaming(
             s.workspace = str(workspace)
             s.model = model
             s.model_provider = model_provider
+            if latest_runtime_routing[0] is not None:
+                attach_runtime_routing_summary(s, latest_runtime_routing[0])
 
             def _restore_cancelled_success_writeback():
                 if pending_source == "process_wakeup":

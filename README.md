@@ -197,6 +197,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 ### Chat and agent
 - Streaming responses via SSE (tokens appear as they are generated)
 - Multi-provider model support -- any Hermes API provider (OpenAI, Anthropic, Google, DeepSeek, Nous Portal, OpenRouter, MiniMax, Xiaomi MiMo, Z.AI); dynamic model dropdown populated from configured keys
+- Live runtime-route visibility -- the composer model control keeps the selected model stable while quietly showing the model actually running after direct or Gateway-backed fallback, plus the last-used route after completion
 - Send a message while one is processing -- it queues automatically
 - Edit any past user message inline and regenerate from that point
 - Retry the last assistant response with one click

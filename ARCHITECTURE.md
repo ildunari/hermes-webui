@@ -259,6 +259,7 @@ SSE event types and their data shapes:
     token       {"text": "..."}                         LLM token delta
     tool        {"name": "...", "preview": "..."}       Tool invocation started
     approval    {"command": "...", "description": "...", "pattern_keys": [...]}
+    runtime_routing {schema_version, state, selected, runtime, fallback}
     done        {"session": {compact_fields + messages}} Agent finished successfully
     error       {"message": "...", "trace": "..."}       Agent threw exception
 
@@ -308,6 +309,13 @@ on_tool callback:
     if has_pending(session_id):
         with _lock: p = dict(_pending.get(session_id, {}))
         if p: put('approval', p)
+
+The direct agent's `event_callback` translates `runtime:route` lifecycle events
+to the local replayable `runtime_routing` SSE name. The Gateway Runs bridge
+translates `runtime.routing` to that same local event. Browser `INFLIGHT` state
+owns the transient per-run projection; the settled summary is attached to the
+completed assistant row and session payload. These presentation fields never
+rewrite the session's selected `model` / `model_provider` pair.
 
 The approval surface-on-tool logic means approvals appear immediately after the tool
 fires (within the same SSE stream), without waiting for the next poll cycle.

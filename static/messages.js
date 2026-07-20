@@ -2024,6 +2024,7 @@ function closeLiveStream(sessionId, streamId, source){
         currentActivityBurstId:INFLIGHT[sessionId].currentActivityBurstId||0,
         currentLiveSegmentSeq:INFLIGHT[sessionId].currentLiveSegmentSeq||0,
         activityBurstAnchors:Array.isArray(INFLIGHT[sessionId].activityBurstAnchors)?INFLIGHT[sessionId].activityBurstAnchors:[],
+        runtimeRouting:INFLIGHT[sessionId].runtimeRouting||null,
       });
     }
   }
@@ -2284,6 +2285,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       currentActivityBurstId:inflight.currentActivityBurstId||0,
       currentLiveSegmentSeq:inflight.currentLiveSegmentSeq||0,
       activityBurstAnchors:Array.isArray(inflight.activityBurstAnchors)?inflight.activityBurstAnchors:[],
+      runtimeRouting:inflight.runtimeRouting||null,
       todos:Array.isArray(inflight.todos)?inflight.todos:S.todos,
       todoStateMeta:inflight.todoStateMeta||S.todoStateMeta||null,
     });
@@ -5629,6 +5631,21 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
     });
 
+    source.addEventListener('runtime_routing',e=>{
+      if(_terminalStateReached||_streamFinalized) return;
+      let d;
+      try{d=JSON.parse(e.data||'{}');}catch(_){return;}
+      const presentation=typeof _runtimeRoutingPresentation==='function'?_runtimeRoutingPresentation(d):null;
+      if(!presentation) return;
+      const inflight=INFLIGHT[activeSid]||(INFLIGHT[activeSid]={messages:[...S.messages],uploaded:[...uploaded],toolCalls:[]});
+      inflight.runtimeRouting=d;
+      if(S.session&&S.session.session_id===activeSid) S.session.runtime_routing_live=d;
+      persistInflightState();
+      if(typeof syncModelChip==='function') syncModelChip();
+      const dropdown=$('composerModelDropdown');
+      if(dropdown&&dropdown.classList.contains('open')&&typeof renderModelDropdown==='function') renderModelDropdown();
+    });
+
     function _resolveGoalMessage(d){
       const key=String(d && d.message_key ? d.message_key : '').trim();
       const args=Array.isArray(d && d.message_args) ? d.message_args : [];
@@ -6461,7 +6478,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _setActivePaneIdleIfOwner();
     });
 
-    for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','todo_state','approval','clarify','state_saved','title','title_status','context_status','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
+    for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','todo_state','approval','clarify','state_saved','title','title_status','context_status','runtime_routing','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
       source.addEventListener(_runJournalEventName,_rememberRunJournalCursor);
     }
   }
@@ -6484,7 +6501,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     return `${m.role}|${ts}|${body.slice(0,160)}`;
   }
-  const _EPHEMERAL_TURN_FIELDS=['_turnUsage','_turnDuration','_turnTps','_gatewayRouting','_statusCard','_anchor_stream_id','_anchor_activity_scene'];
+  const _EPHEMERAL_TURN_FIELDS=['_turnUsage','_turnDuration','_turnTps','_gatewayRouting','_runtimeRouting','_statusCard','_anchor_stream_id','_anchor_activity_scene'];
   function _carryForwardEphemeralTurnFields(prevMessages, nextMessages){
     if(!Array.isArray(prevMessages)||!Array.isArray(nextMessages)) return nextMessages;
     if(!prevMessages.length||!nextMessages.length) return nextMessages;

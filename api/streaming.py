@@ -48,6 +48,7 @@ from api.compression_anchor import is_context_compression_marker, visible_messag
 from api.compression_recovery import stamp_compression_exhausted_recovery
 from api.metering import meter
 from api.run_journal import RunJournalWriter
+from api.runtime_routing import attach_runtime_routing_summary, normalize_runtime_routing_payload
 from api.todo_state import attach_todo_state, emit_todo_state
 from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
@@ -1751,6 +1752,38 @@ def _extract_gateway_routing_metadata(agent, result, requested_model=None, reque
         if normalized:
             return normalized
     return None
+
+
+def _build_runtime_routing_event_callback(put_event, latest_payload):
+    """Build the per-run Agent event callback for route visibility."""
+    def callback(name=None, payload=None, **kwargs):
+        event_name = str(name or kwargs.get('name') or '').strip()
+        event_payload = payload if payload is not None else kwargs.get('payload')
+        if event_name != 'runtime:route':
+            return
+        normalized = normalize_runtime_routing_payload(event_payload)
+        if normalized is None:
+            return
+        latest_payload[0] = normalized
+        put_event('runtime_routing', normalized)
+
+    callback._webui_runtime_routing_callback = True  # type: ignore[attr-defined]
+    return callback
+
+
+def _event_callback_for_cached_agent(existing, current):
+    """Refresh our stale closure while preserving an independent callback."""
+    if not callable(existing) or getattr(existing, '_webui_runtime_routing_callback', False):
+        return current
+
+    def combined(*args, **kwargs):
+        try:
+            existing(*args, **kwargs)
+        finally:
+            current(*args, **kwargs)
+
+    combined._webui_runtime_routing_callback = True  # type: ignore[attr-defined]
+    return combined
 
 
 def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, session_id: str, profile_home: str) -> dict:
@@ -7265,6 +7298,7 @@ def _run_agent_streaming(
     _metering_thread = threading.Thread(target=_metering_ticker, daemon=True)
 
     _success_writeback_committed = False
+    _latest_runtime_routing: list[dict | None] = [None]
 
     def put(event, data):
         # If cancelled, drop all further events except the cancel event itself
@@ -7294,6 +7328,10 @@ def _run_agent_streaming(
             q.put_nowait(queue_item)
         except Exception:
             logger.debug("Failed to put event to queue")
+
+    _runtime_event_callback = _build_runtime_routing_event_callback(
+        put, _latest_runtime_routing
+    )
 
     # #5940: capture a terminal (non-retryable) provider error the Agent emits via
     # its lifecycle status_callback. The Agent aborts a non-retryable API error
@@ -8452,6 +8490,8 @@ def _run_agent_streaming(
                 _agent_kwargs['tool_complete_callback'] = on_tool_complete
             if 'status_callback' in _agent_params:
                 _agent_kwargs['status_callback'] = _agent_status_callback
+            if 'event_callback' in _agent_params:
+                _agent_kwargs['event_callback'] = _runtime_event_callback
             if 'max_iterations' in _agent_params and _max_iterations_cfg is not None:
                 _agent_kwargs['max_iterations'] = _max_iterations_cfg
             if 'max_tokens' in _agent_params and _max_tokens_cfg is not None:
@@ -8578,6 +8618,11 @@ def _run_agent_streaming(
                         agent.reasoning_callback = _agent_kwargs.get('reasoning_callback')
                     if hasattr(agent, 'clarify_callback'):
                         agent.clarify_callback = _agent_kwargs.get('clarify_callback')
+                    if hasattr(agent, 'event_callback'):
+                        agent.event_callback = _event_callback_for_cached_agent(
+                            getattr(agent, 'event_callback', None),
+                            _runtime_event_callback,
+                        )
                     if 'prefill_messages' in _agent_kwargs and hasattr(agent, 'prefill_messages'):
                         agent.prefill_messages = list(_agent_kwargs.get('prefill_messages') or [])
                     if _session_db is not None:
@@ -9658,10 +9703,14 @@ def _run_agent_streaming(
                                 _dm['_turnTps'] = _turn_tps
                             if _gateway_routing:
                                 _dm['_gatewayRouting'] = _gateway_routing
+                            if _latest_runtime_routing[0] is not None:
+                                _dm['_runtimeRouting'] = _latest_runtime_routing[0]
                             _ttft_ms = meter().get_ttft_ms(stream_id)
                             if _ttft_ms is not None:
                                 _dm['_firstTokenMs'] = _ttft_ms
                             break
+                if _latest_runtime_routing[0] is not None:
+                    attach_runtime_routing_summary(s, _latest_runtime_routing[0])
                 # Persist context window data on the session so the context-ring
                 # indicator survives a page reload (#1318). Must run BEFORE
                 # s.save() for the same reason as the reasoning trace above.

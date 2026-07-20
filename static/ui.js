@@ -3687,17 +3687,56 @@ function _compactComposerModelChipLabel(modelId,labelText){
   return raw;
 }
 
+function _runtimeRoutingPresentation(routing){
+  if(!routing||routing.schema_version!==1) return null;
+  const states=new Set(['started','fallback_activated','primary_restored','finished']);
+  const state=String(routing.state||'');
+  if(!states.has(state)) return null;
+  const runtime=routing.runtime&&typeof routing.runtime==='object'?routing.runtime:{};
+  const fallback=routing.fallback&&typeof routing.fallback==='object'?routing.fallback:{};
+  const runtimeModel=String(runtime.model||'').trim();
+  const runtimeProvider=String(runtime.provider||'').trim();
+  const modelLabel=runtimeModel
+    ?_compactComposerModelChipLabel(runtimeModel,getModelLabel(runtimeModel))
+    :runtimeProvider;
+  const providerLabel=runtimeModel&&runtimeProvider
+    ?runtimeProvider.replace(/^custom:/,'').replace(/[-_]/g,' ').replace(/\b\w/g,c=>c.toUpperCase())
+    :'';
+  const runtimeLabel=providerLabel?`${modelLabel} via ${providerLabel}`:modelLabel;
+  if(!runtimeLabel) return null;
+  const phase=state==='finished'?'Last used':'Running';
+  const reason=String(fallback.reason||'').trim();
+  const detail=fallback.active
+    ?`Fallback${Number(fallback.chain_index)>0?' '+Number(fallback.chain_index):''}${reason?' · '+reason:''}`
+    :(state==='primary_restored'?'Primary restored':'');
+  return {phase,runtimeLabel,runtimeModel,runtimeProvider,detail,state};
+}
+
+function _latestRuntimeRoutingForSession(session){
+  if(!session) return null;
+  const sid=session.session_id;
+  const inflight=(typeof INFLIGHT==='object'&&INFLIGHT&&sid)?INFLIGHT[sid]:null;
+  if(inflight&&inflight.runtimeRouting) return inflight.runtimeRouting;
+  if(session.runtime_routing_live) return session.runtime_routing_live;
+  if(session.runtime_routing) return session.runtime_routing;
+  const messages=Array.isArray(session.messages)?session.messages:(Array.isArray(S.messages)?S.messages:[]);
+  const assistant=[...messages].reverse().find(m=>m&&m.role==='assistant'&&m._runtimeRouting);
+  return assistant?assistant._runtimeRouting:null;
+}
+
 function syncModelChip(){
   const sel=$('modelSelect');
   const chip=$('composerModelChip');
   const label=$('composerModelLabel');
   const mobileLabel=$('composerMobileModelLabel');
   const mobileAction=$('composerMobileModelAction');
+  const runtimeEl=$('composerModelRuntime');
   const dd=$('composerModelDropdown');
   if(!sel||!chip||!label) return;
   // Don't show a model label until boot has finished loading to prevent flash of wrong default
   if(!S._bootReady){
     label.textContent='';
+    if(runtimeEl) runtimeEl.textContent='';
     if(mobileLabel) mobileLabel.textContent='';
     chip.title='Conversation model';
     return;
@@ -3707,9 +3746,14 @@ function syncModelChip(){
   const compactText=_compactComposerModelChipLabel(sel.value||'', text);
   const gatewayRouting=_latestGatewayRoutingForSession(S.session);
   const displayText=_formatGatewayModelLabel(sel.value||'',compactText,gatewayRouting)||compactText;
+  const runtimePresentation=_runtimeRoutingPresentation(_latestRuntimeRoutingForSession(S.session));
   label.textContent=displayText;
-  if(mobileLabel) mobileLabel.textContent=displayText;
-  chip.title=gatewayRouting?`${sel.value||'Conversation model'} ${_gatewayRoutingLabel(gatewayRouting)}`:(sel.value||'Conversation model');
+  if(runtimeEl) runtimeEl.textContent=runtimePresentation?`${runtimePresentation.phase} ${runtimePresentation.runtimeLabel}`:'';
+  if(mobileLabel) mobileLabel.textContent=runtimePresentation?`${displayText} · ${runtimePresentation.phase} ${runtimePresentation.runtimeLabel}`:displayText;
+  const routeTitle=runtimePresentation
+    ?`Selected ${displayText}; ${runtimePresentation.phase.toLowerCase()} ${runtimePresentation.runtimeLabel}${runtimePresentation.detail?'; '+runtimePresentation.detail:''}`
+    :'';
+  chip.title=routeTitle||(gatewayRouting?`${sel.value||'Conversation model'} ${_gatewayRoutingLabel(gatewayRouting)}`:(sel.value||'Conversation model'));
   chip.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
   if(mobileAction) mobileAction.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
 }
@@ -4332,6 +4376,15 @@ function renderModelDropdown(){
     ).length;
     dd.innerHTML='';
     dd.appendChild(_scopeNote);
+    if((opts.selectId||'modelSelect')==='modelSelect'){
+      const runtimePresentation=_runtimeRoutingPresentation(_latestRuntimeRoutingForSession(S.session));
+      if(runtimePresentation){
+        const runtimeNote=document.createElement('div');
+        runtimeNote.className='model-runtime-note';
+        runtimeNote.innerHTML=`<span>Selected</span><strong>${esc(_compactComposerModelChipLabel(sel.value||'',getModelLabel(sel.value||'')))}</strong><span>${esc(runtimePresentation.phase)}</span><strong>${esc(runtimePresentation.runtimeLabel)}</strong>${runtimePresentation.detail?`<small>${esc(runtimePresentation.detail)}</small>`:''}`;
+        dd.appendChild(runtimeNote);
+      }
+    }
     dd.appendChild(_searchRow);
     dd.appendChild(_custSep);
     dd.appendChild(_custRow);
@@ -8818,6 +8871,7 @@ function _compactInflightState(state){
     currentActivityBurstId:state.currentActivityBurstId||0,
     currentLiveSegmentSeq:state.currentLiveSegmentSeq||0,
     activityBurstAnchors:Array.isArray(state.activityBurstAnchors)?state.activityBurstAnchors.slice(-50):[],
+    runtimeRouting:(state.runtimeRouting&&typeof state.runtimeRouting==='object')?state.runtimeRouting:null,
     todos,
     todoStateMeta,
   }, limits.stringChars);
