@@ -121,6 +121,35 @@ else:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_desktop_only_revision_change_does_not_stale_python_runtime(
+    monkeypatch, tmp_path: Path
+):
+    """Electron-only commits do not alter modules loaded by WebUI."""
+    from api import agent_runtime
+
+    agent_dir = tmp_path / "hermes-agent"
+    desktop_dir = agent_dir / "apps" / "desktop"
+    desktop_dir.mkdir(parents=True)
+    module_file = agent_dir / "run_agent.py"
+    module_file.write_text("class AIAgent: pass\n", encoding="utf-8")
+    desktop_file = desktop_dir / "shell.tsx"
+    desktop_file.write_text("export const version = 1;\n", encoding="utf-8")
+    _git(agent_dir, "init", "-q")
+    _git(agent_dir, "add", ".")
+    _git(agent_dir, "commit", "-qm", "initial")
+
+    loaded_revision = _git(agent_dir, "rev-parse", "HEAD")
+    desktop_file.write_text("export const version = 2;\n", encoding="utf-8")
+    _git(agent_dir, "add", ".")
+    _git(agent_dir, "commit", "-qm", "desktop only")
+
+    monkeypatch.setattr(agent_runtime, "_AGENT_SOURCE_DIR", agent_dir)
+    monkeypatch.setattr(agent_runtime, "_AGENT_MODULE_PATH", module_file)
+    monkeypatch.setattr(agent_runtime, "_AGENT_REVISION", loaded_revision)
+
+    agent_runtime.ensure_agent_runtime_current()
+
+
 def test_initial_non_git_source_preserves_supported_runtime(monkeypatch):
     """Non-Git installs cannot be compared, so they preserve existing behavior."""
     from api import agent_runtime

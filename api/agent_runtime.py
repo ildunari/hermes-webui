@@ -22,6 +22,11 @@ _RESTART_MESSAGE = (
     "Restart Hermes WebUI before retrying this action."
 )
 
+# The Electron client lives in the Agent monorepo but is not imported into the
+# long-lived WebUI Python process.  Desktop-only commits therefore cannot create
+# a mixed Python runtime and must not make every WebUI chat return HTTP 409.
+_RUNTIME_IRRELEVANT_PATHS = ("apps/desktop/**",)
+
 
 def _read_agent_revision(
     agent_dir: Path | None,
@@ -86,6 +91,44 @@ def _read_agent_revision(
     return revision if revision_result.returncode == 0 and revision else None
 
 
+def _agent_runtime_changed(
+    agent_dir: Path,
+    loaded_revision: str,
+    current_revision: str,
+) -> bool:
+    """Return whether runtime-relevant tracked source changed between commits.
+
+    The guard still fails closed for Git errors and for every change outside
+    the explicitly isolated Electron Desktop subtree.
+    """
+    if current_revision == loaded_revision:
+        return False
+    cmd = [
+        "git",
+        "-C",
+        str(agent_dir),
+        "diff",
+        "--quiet",
+        "--exit-code",
+        loaded_revision,
+        current_revision,
+        "--",
+        ".",
+    ]
+    cmd.extend(f":(exclude){path}" for path in _RUNTIME_IRRELEVANT_PATHS)
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return result.returncode != 0
+
+
 _AGENT_SOURCE_DIR: Path | None = None
 _AGENT_MODULE_PATH: Path | None = None
 _AGENT_REVISION: str | None = None
@@ -132,9 +175,14 @@ def ensure_agent_runtime_current() -> None:
     """Reject a known Git checkout change instead of mixing Python modules."""
     if _AGENT_REVISION is None:
         return
-    if (
-        _read_agent_revision(_AGENT_SOURCE_DIR, module_path=_AGENT_MODULE_PATH)
-        != _AGENT_REVISION
+    current_revision = _read_agent_revision(
+        _AGENT_SOURCE_DIR,
+        module_path=_AGENT_MODULE_PATH,
+    )
+    if current_revision is None or _agent_runtime_changed(
+        _AGENT_SOURCE_DIR,
+        _AGENT_REVISION,
+        current_revision,
     ):
         raise AgentRuntimeChangedError(_RESTART_MESSAGE)
 
