@@ -790,7 +790,10 @@ def test_all_profiles_query_includes_named_profile_cli_sessions():
             source="telegram",
             title="Named Profile Telegram Session",
         )
-        _post_json("/api/settings", {"show_cli_sessions": True})
+        _post_json(
+            "/api/settings",
+            {"show_cli_sessions": True, "show_messaging_sessions": True},
+        )
 
         scoped, scoped_status = _get_json("/api/sessions")
         assert scoped_status == 200

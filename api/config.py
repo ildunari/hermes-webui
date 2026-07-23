@@ -9636,6 +9636,7 @@ _SETTINGS_DEFAULTS = {
     "show_claude_code_sessions": True,  # allow filtering Claude Code rows without hiding other imported sources
     "show_cron_sessions": False,  # surface cron sessions in the sidebar (subordinate to show_cli_sessions)
     "show_webhook_sessions": False,  # surface webhook sessions in the sidebar (subordinate to show_cli_sessions)
+    "show_messaging_sessions": False,  # surface Telegram/Discord gateway sessions in the sidebar (subordinate to show_cli_sessions); default OFF preserves pre-existing behavior
     "show_previous_messaging_sessions": False,  # show older Telegram/Discord/etc. reset segments
     "sync_to_insights": False,  # mirror WebUI token usage to state.db for /insights
     "check_for_updates": True,  # check if webui/agent repos are behind upstream
@@ -9982,6 +9983,7 @@ _SETTINGS_BOOL_KEYS = {
     "show_claude_code_sessions",
     "show_cron_sessions",
     "show_webhook_sessions",
+    "show_messaging_sessions",
     "show_previous_messaging_sessions",
     "sync_to_insights",
     "check_for_updates",

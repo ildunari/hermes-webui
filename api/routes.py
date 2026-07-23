@@ -15941,6 +15941,7 @@ def handle_post(handler, parsed) -> bool:
                 "show_claude_code_sessions",
                 "show_cron_sessions",
                 "show_webhook_sessions",
+                "show_messaging_sessions",
                 "show_previous_messaging_sessions",
             )
         ):

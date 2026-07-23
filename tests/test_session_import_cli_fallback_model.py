@@ -331,7 +331,11 @@ def test_sessions_endpoint_suppresses_duplicate_webui_state_projection(monkeypat
     import api.routes as routes
 
     monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _sessions: False)
-    monkeypatch.setattr(routes, "load_settings", lambda: {"show_cli_sessions": True})
+    monkeypatch.setattr(
+        routes,
+        "load_settings",
+        lambda: {"show_cli_sessions": True, "show_messaging_sessions": True},
+    )
     monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
 
     webui_row = {

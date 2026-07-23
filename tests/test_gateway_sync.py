@@ -242,7 +242,7 @@ def test_gateway_sessions_appear_when_enabled():
         _insert_gateway_session(conn, session_id='gw_test_tg_001', source='telegram', title='TG Test Chat')
 
         # Enable the setting
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
 
         data, status = get('/api/sessions')
         assert status == 200
@@ -460,7 +460,7 @@ def test_compression_chain_collapses_to_latest_tip_in_sidebar():
             messages=2,
         )
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
         data, status = get('/api/sessions')
         assert status == 200
         ids = {s.get('session_id') for s in data.get('sessions', [])}
@@ -561,7 +561,7 @@ def test_compression_lineage_prefers_freshest_descendant_over_newer_direct_sibli
         )
         conn.commit()
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
         data, status = get('/api/sessions')
         assert status == 200
         ids = {s.get('session_id') for s in data.get('sessions', [])}
@@ -662,7 +662,7 @@ def test_compression_chain_with_empty_latest_tip_falls_back_to_latest_importable
             messages=0,
         )
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
         data, status = get('/api/sessions')
         assert status == 200
         ids = {s.get('session_id') for s in data.get('sessions', [])}
@@ -984,7 +984,7 @@ def test_gateway_session_has_correct_metadata():
     try:
         _insert_gateway_session(conn, session_id='gw_meta_001', source='telegram', title='Meta Test')
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
 
         data, status = get('/api/sessions')
         assert status == 200
@@ -1407,7 +1407,7 @@ def test_sessions_response_backfills_imported_messaging_source_metadata(cleanup_
         )
         s.is_cli_session = True
         s.save(touch_updated_at=False)
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
 
         data, status = get('/api/sessions')
         assert status == 200
@@ -1446,7 +1446,7 @@ def test_sessions_response_keeps_only_latest_messaging_session_per_source(cleanu
         )
         old.is_cli_session = True
         old.save(touch_updated_at=False)
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
 
         data, status = get('/api/sessions')
         assert status == 200
@@ -1486,7 +1486,7 @@ def test_sessions_response_keeps_distinct_messaging_sessions_for_distinct_users(
             started_at=time.time(),
         )
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
         data, status = get('/api/sessions')
         assert status == 200
         ids = {s['session_id'] for s in data.get('sessions', []) if s.get('session_id') in {sid_a, sid_b}}
@@ -1538,7 +1538,7 @@ def test_sessions_response_distinguishes_same_user_different_chat_identity_from_
         _insert_gateway_session(conn, session_id=sid_dm, source='telegram', title='DM Same User', user_id='1143399746', started_at=time.time() - 40)
         _insert_gateway_session(conn, session_id=sid_group, source='telegram', title='Group Same User', user_id='1143399746', started_at=time.time())
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
         data, status = get('/api/sessions')
         assert status == 200
         ids = {s['session_id'] for s in data.get('sessions', []) if s.get('session_id') in {sid_dm, sid_group}}
@@ -1875,7 +1875,7 @@ def test_sessions_response_distinguishes_same_platform_same_group_chat_different
             started_at=time.time(),
         )
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
         data, status = get('/api/sessions')
         assert status == 200
         ids = {s['session_id'] for s in data.get('sessions', []) if s.get('session_id') in {sid_u1, sid_u2}}
@@ -1921,7 +1921,7 @@ def test_sessions_response_distinguishes_same_user_different_thread_without_sess
             started_at=time.time(),
         )
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
         data, status = get('/api/sessions')
         assert status == 200
         ids = {s['session_id'] for s in data.get('sessions', []) if s.get('session_id') in {sid_t1, sid_t2}}
@@ -2064,7 +2064,7 @@ def test_cron_sessions_hidden_from_sidebar_by_default():
         _insert_gateway_session(conn, session_id='cron_job123_20260427', source='cron', title='Nightly Cleanup')
         _insert_gateway_session(conn, session_id='gw_noncron_001', source='telegram', title='Visible Chat')
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
 
         data, status = get('/api/sessions')
         assert status == 200
@@ -2116,7 +2116,7 @@ def test_gateway_session_has_message_count():
     try:
         _insert_gateway_session(conn, session_id='gw_msg_001', source='discord', title='Msg Count Test', message_count=5)
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
 
         data, status = get('/api/sessions')
         assert status == 200
@@ -2141,7 +2141,7 @@ def test_gateway_sessions_multiple_sources():
         _insert_gateway_session(conn, session_id='gw_multi_dc', source='discord', title='DC Chat')
         _insert_gateway_session(conn, session_id='gw_multi_sl', source='slack', title='SL Chat')
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
 
         data, status = get('/api/sessions')
         assert status == 200
@@ -2361,7 +2361,7 @@ def test_sessions_prefers_state_db_metadata_for_messaging_overlap(cleanup_test_s
         local.source_label = 'Weixin'
         local.save(touch_updated_at=False)
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
         data, status = get('/api/sessions')
         assert status == 200, data
         session = next((item for item in data.get('sessions', []) if item.get('session_id') == sid), None)
@@ -2469,7 +2469,7 @@ def test_importing_older_gateway_session_preserves_original_timestamps_and_order
             title='Older imported gateway session',
             started_at=older_started_at,
         )
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
 
         imported, imported_status = post('/api/session/import_cli', {'session_id': imported_sid})
         assert imported_status == 200, imported
@@ -2554,7 +2554,7 @@ def test_gateway_webui_sessions_not_duplicated():
         _insert_gateway_session(conn, session_id=webui_sid, source='telegram', title='Dup Test')
         conn.close()
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
 
         data, status = get('/api/sessions')
         assert status == 200
@@ -2593,7 +2593,7 @@ def test_cli_sessions_still_work():
         _insert_gateway_session(conn, session_id='cli_legacy_001', source='cli', title='CLI Legacy')
         _insert_gateway_session(conn, session_id='gw_new_001', source='telegram', title='GW New')
 
-        post('/api/settings', {'show_cli_sessions': True})
+        post('/api/settings', {'show_cli_sessions': True, 'show_messaging_sessions': True})
 
         data, status = get('/api/sessions')
         assert status == 200

@@ -8674,6 +8674,11 @@ function _preferencesPayloadFromUi(){
   if(showCronCb) payload.show_cron_sessions=!!(showCliCb&&showCliCb.checked&&showCronCb.checked);
   const showWebhookCb=$('settingsShowWebhookSessions');
   if(showWebhookCb) payload.show_webhook_sessions=!!(showCliCb&&showCliCb.checked&&showWebhookCb.checked);
+  const showMessagingCb=$('settingsShowMessagingSessions');
+  // Gate messaging sessions on CLI sessions (the server short-circuits otherwise),
+  // identically to show_cron_sessions/show_webhook_sessions, so neither save route
+  // can persist show_messaging_sessions=true while show_cli_sessions=false.
+  if(showMessagingCb) payload.show_messaging_sessions=!!(showCliCb&&showCliCb.checked&&showMessagingCb.checked);
   const showPreviousMessagingCb=$('settingsShowPreviousMessagingSessions');
   if(showPreviousMessagingCb) payload.show_previous_messaging_sessions=showPreviousMessagingCb.checked;
   const syncCb=$('settingsSyncInsights');
@@ -9300,6 +9305,7 @@ async function loadSettingsPanel(){
       const enabled=!!showCliCb.checked;
       if(showCronCb) showCronCb.disabled=!enabled;
       if(showClaudeCodeCb) showClaudeCodeCb.disabled=!enabled;
+      if(showMessagingCb) showMessagingCb.disabled=!enabled;
       _schedulePreferencesAutosave();
     },{once:false});}
     const showCronCb=$('settingsShowCronSessions');
@@ -9314,6 +9320,12 @@ async function loadSettingsPanel(){
       showWebhookCb.disabled=showCliCb?!showCliCb.checked:true;
       showWebhookCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
       if(showCliCb){showCliCb.addEventListener('change',function(){showWebhookCb.disabled=!showCliCb.checked;},{once:false});}
+    }
+    const showMessagingCb=$('settingsShowMessagingSessions');
+    if(showMessagingCb){
+      showMessagingCb.checked=!!settings.show_messaging_sessions;
+      showMessagingCb.disabled=showCliCb?!showCliCb.checked:true;
+      showMessagingCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
     }
     const showPreviousMessagingCb=$('settingsShowPreviousMessagingSessions');
     if(showPreviousMessagingCb){showPreviousMessagingCb.checked=!!settings.show_previous_messaging_sessions;showPreviousMessagingCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
@@ -12484,6 +12496,7 @@ async function saveSettings(andClose){
   const showClaudeCodeSessions=!!($('settingsShowClaudeCodeSessions')||{}).checked;
   const showCronSessions=!!($('settingsShowCronSessions')||{}).checked;
   const showWebhookSessions=!!($('settingsShowWebhookSessions')||{}).checked;
+  const showMessagingSessions=!!($('settingsShowMessagingSessions')||{}).checked;
   const showPreviousMessagingSessions=!!($('settingsShowPreviousMessagingSessions')||{}).checked;
   const pinnedSessionsLimit=_normalizePinnedSessionsLimit(($('settingsPinnedSessionsLimit')||{}).value,window._pinnedSessionsLimit);
   const pw=($('settingsPassword')||{}).value;
@@ -12540,6 +12553,7 @@ async function saveSettings(andClose){
   // mirror the autosave path so the explicit Save Settings button persists them too. (#3514)
   body.show_cron_sessions=showCliSessions&&showCronSessions;
   body.show_webhook_sessions=showCliSessions&&showWebhookSessions;
+  body.show_messaging_sessions=showCliSessions&&showMessagingSessions;
   body.show_previous_messaging_sessions=showPreviousMessagingSessions;
   body.pinned_sessions_limit=pinnedSessionsLimit;
   body.sync_to_insights=!!($('settingsSyncInsights')||{}).checked;
