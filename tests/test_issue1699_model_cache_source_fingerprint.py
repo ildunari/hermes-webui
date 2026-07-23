@@ -143,7 +143,22 @@ def test_disk_models_cache_still_loads_when_auth_and_config_sources_are_unchange
 
     # The disk-cache hit reconstructs `aliases` from current config (the save
     # path doesn't persist aliases); no config aliases here, so it's {}.
-    assert result == {**fresh_opencode, "aliases": {}}
+    # `configured_model_badges` is also recomputed (not replayed verbatim) —
+    # _configured_model_badges_from_static_catalog() alias-expands each
+    # configured id (bare, "provider/model", "@provider:model" forms), so it
+    # ends up richer than the single-key dict that was written to disk.
+    expected_groups = config._filter_model_picker_groups_by_policy(fresh_opencode["groups"], config.cfg)
+    expected_badges = config._configured_model_badges_from_static_catalog(
+        expected_groups,
+        active_provider=fresh_opencode["active_provider"],
+        default_model=fresh_opencode["default_model"],
+    )
+    assert result == {
+        **fresh_opencode,
+        "groups": expected_groups,
+        "configured_model_badges": expected_badges,
+        "aliases": {},
+    }
 
 
 def test_memory_models_cache_invalidates_when_static_catalog_changes(tmp_path, monkeypatch):

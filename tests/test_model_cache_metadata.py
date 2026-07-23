@@ -50,8 +50,27 @@ def test_save_models_cache_to_disk_preserves_response_metadata(tmp_path, monkeyp
     # which the loader reconstructs from current config because the save path
     # does not persist aliases on disk (keeps /model <alias> resolution working
     # on a disk-cache hit). No config aliases here, so it reconstructs to {}.
+    #
+    # `configured_model_badges` is NOT round-tripped verbatim either: the
+    # loader always recomputes it from the (policy-filtered) groups via
+    # _configured_model_badges_from_static_catalog(), alias-expanding each
+    # configured id (bare, "provider/model", and "@provider:model" forms) —
+    # it is never persisted-and-replayed from disk.
     loaded = config._load_models_cache_from_disk()
-    assert loaded == {**payload, "aliases": {}}
+    expected_groups = config._filter_model_picker_groups_by_policy(payload["groups"], config.cfg)
+    expected_badges = config._configured_model_badges_from_static_catalog(
+        expected_groups,
+        active_provider=payload["active_provider"],
+        default_model=payload["default_model"],
+    )
+    assert loaded["configured_model_badges"] == expected_badges
+    assert expected_badges, "expected the default model to earn a recomputed badge"
+    assert loaded == {
+        **payload,
+        "groups": expected_groups,
+        "configured_model_badges": expected_badges,
+        "aliases": {},
+    }
 
 
 def test_load_models_cache_from_disk_rejects_legacy_groups_only_cache(tmp_path, monkeypatch):

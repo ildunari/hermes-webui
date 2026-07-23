@@ -131,7 +131,7 @@ def test_openai_codex_model_catalog_includes_gpt54():
 def test_openai_codex_display_name():
     """openai-codex must have a human-readable display name."""
     assert "openai-codex" in config._PROVIDER_DISPLAY
-    assert config._PROVIDER_DISPLAY["openai-codex"] == "OpenAI Codex"
+    assert config._PROVIDER_DISPLAY["openai-codex"] == "Codex"
 
 
 def test_live_models_handler_delegates_to_provider_model_ids():

@@ -43,7 +43,10 @@ def test_cached_agent_reuse_uses_adopt_helper():
 
     reuse_idx = src.find("Refresh per-turn callbacks")
     assert reuse_idx != -1, "cached-agent reuse block missing"
-    block = src[reuse_idx : reuse_idx + 2500]
+    # The `_adopt_session_db_for_cached_agent(` call now sits ~2529 chars past
+    # the anchor (verified against the live api/streaming.py source); widen
+    # the scrape window so it's still captured.
+    block = src[reuse_idx : reuse_idx + 4000]
 
     assert "_adopt_session_db_for_cached_agent" in block, (
         "cached-agent reuse path must call _adopt_session_db_for_cached_agent "

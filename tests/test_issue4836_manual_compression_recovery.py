@@ -90,6 +90,22 @@ def _install_fake_compression_runtime(monkeypatch, agent_cls):
     )
 
 
+def _fake_model_metadata(monkeypatch):
+    """Stub agent.model_metadata so post-compression context estimation
+    (api.streaming._estimate_post_compression_context_tokens) doesn't fail on
+    the real module's `requests` import, which isn't installed in the WebUI
+    test venv (agent deps intentionally stay out of it). Mirrors
+    tests/test_issue4685_post_compression_context_metering.py.
+    """
+    import agent
+
+    module = types.ModuleType("agent.model_metadata")
+    module.estimate_request_tokens_rough = lambda messages, *, system_prompt, tools: 128
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", module)
+    monkeypatch.setattr(agent, "model_metadata", module, raising=False)
+    return module
+
+
 def _msg(role, content, ts):
     return {"role": role, "content": content, "timestamp": ts, "_ts": ts}
 
@@ -119,6 +135,7 @@ def test_manual_compress_persists_truncation_boundary(monkeypatch, cleanup_test_
     session.save(touch_updated_at=False)
 
     _install_fake_compression_runtime(monkeypatch, _FakeAgent)
+    _fake_model_metadata(monkeypatch)
     handler = _FakeHandler()
     _handle_session_compress(handler, {"session_id": sid})
 
@@ -127,7 +144,11 @@ def test_manual_compress_persists_truncation_boundary(monkeypatch, cleanup_test_
     assert loaded.compression_anchor_mode == "manual"
     assert loaded.truncation_watermark is not None
     assert loaded.truncation_boundary == loaded.truncation_watermark
-    assert loaded.last_prompt_tokens is not None
+    # #4685: the route no longer stamps last_prompt_tokens after a manual
+    # compress — the post-compression context indicator now reads
+    # post_compression_context_tokens_estimate instead (see
+    # test_issue4685_post_compression_context_metering.py).
+    assert loaded.post_compression_context_tokens_estimate is not None
     assert len(loaded.context_messages) == 2
     assert loaded.messages == original_messages
 

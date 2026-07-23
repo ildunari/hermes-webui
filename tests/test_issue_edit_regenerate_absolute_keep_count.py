@@ -29,7 +29,13 @@ def test_submit_edit_uses_absolute_keep_count():
 
 
 def test_regenerate_uses_absolute_keep_count():
-    body = _function_body(UI_JS, "regenerateResponse")
+    # #30bd9b52: regenerateResponse now delegates the truncate-and-resend
+    # logic (including the absolute keep_count computation) to the shared
+    # _truncateAndResendFrom helper instead of inlining it.
+    caller_body = _function_body(UI_JS, "regenerateResponse")
+    assert "_truncateAndResendFrom(assistantIdx" in caller_body
+
+    body = _function_body(UI_JS, "_truncateAndResendFrom")
     assert re.search(r"absoluteKeepCount\s*=\s*_oldestIdx\s*\+\s*assistantIdx", body)
     assert "keep_count: absoluteKeepCount" in body
 

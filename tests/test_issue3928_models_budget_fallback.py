@@ -290,6 +290,18 @@ def test_budget_exceeded_uses_shape_only_stale_cache_before_static_fallback(
     assert any(
         g["provider_id"] == "ollama-cloud" for g in result["groups"]
     )
+    # The stale-disk-cache fallback path recomputes `configured_model_badges`
+    # from the (policy-filtered) groups rather than replaying the persisted
+    # value verbatim — mirrors the disk-cache load contract pinned in
+    # test_model_cache_metadata.py / test_issue1699_model_cache_source_fingerprint.py.
+    expected_groups = cfg._filter_model_picker_groups_by_policy(expected_fallback["groups"], cfg.cfg)
+    expected_badges = cfg._configured_model_badges_from_static_catalog(
+        expected_groups,
+        active_provider=expected_fallback["active_provider"],
+        default_model=expected_fallback["default_model"],
+    )
+    expected_fallback["groups"] = expected_groups
+    expected_fallback["configured_model_badges"] = expected_badges
     assert result == expected_fallback
     assert "ollama-cloud" not in {
         g["provider_id"] for g in cfg._static_models_catalog_without_live_probes()["groups"]

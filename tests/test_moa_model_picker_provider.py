@@ -38,7 +38,7 @@ def test_moa_presets_render_as_virtual_provider_models(monkeypatch, tmp_path):
     payload = config.get_available_models(force_refresh=True)
     moa_group = next(g for g in payload["groups"] if g.get("provider_id") == "moa")
 
-    assert moa_group["provider"] == "Mixture of Agents"
+    assert moa_group["provider"] == "MoA"
     assert [m["id"] for m in moa_group["models"]] == ["@moa:default", "@moa:Frontier Tuned"]
 
 

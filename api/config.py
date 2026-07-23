@@ -5214,7 +5214,12 @@ def _filter_model_picker_groups_by_policy(groups: list[dict], config: dict | Non
                 provider_cfg = providers_cfg.get(policy_pid)
                 if isinstance(provider_cfg, dict):
                     display_name = str(provider_cfg.get("name") or "").strip() or policy_pid
-        if display_name:
+        # Only fill in the canonical display name when the group doesn't
+        # already carry one — some groups decorate their label with extra
+        # context (e.g. Nous Portal's "(15 of 397)" truncation-count suffix
+        # via _append_picker_group(decorate_overflow_label=True)), and
+        # unconditionally overwriting here would silently strip that.
+        if display_name and not next_group.get("provider"):
             next_group["provider"] = display_name
         if raw_pid != policy_pid:
             next_group["provider"] = display_name or policy_pid
@@ -5241,7 +5246,16 @@ def _filter_model_picker_groups_by_policy(groups: list[dict], config: dict | Non
                     next_group[bucket_name] = filtered
 
         if not next_group.get("models") and not next_group.get("extra_models"):
-            continue
+            # Plugin-only providers (e.g. 9router, yandex) are deliberately
+            # allowed to surface an empty group on the network-free static
+            # catalog path (_static_models_catalog_without_live_probes) when
+            # the plugin declares no fallback_models — an installed, keyed
+            # plugin provider must still be visible rather than silently
+            # dropped as if it were never detected (see the comments at that
+            # append site). Every other empty group (no models, no error, not
+            # a plugin) still gets filtered out here.
+            if not _is_plugin_model_provider(policy_pid):
+                continue
 
         existing = merged.get(policy_pid)
         if existing is None:

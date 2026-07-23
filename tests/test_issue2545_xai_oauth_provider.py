@@ -27,7 +27,7 @@ def test_xai_oauth_is_known_oauth_provider():
     from api.config import _PROVIDER_DISPLAY
 
     assert "xai-oauth" in _OAUTH_PROVIDERS
-    assert _PROVIDER_DISPLAY["xai-oauth"] == "xAI Grok OAuth"
+    assert _PROVIDER_DISPLAY["xai-oauth"] == "xAI"
 
 
 def test_xai_oauth_provider_card_uses_oauth_status_and_models(monkeypatch, tmp_path):
@@ -48,7 +48,7 @@ def test_xai_oauth_provider_card_uses_oauth_status_and_models(monkeypatch, tmp_p
 
         result = get_providers()
         grok = next(p for p in result["providers"] if p["id"] == "xai-oauth")
-        assert grok["display_name"] == "xAI Grok OAuth"
+        assert grok["display_name"] == "xAI"
         assert grok["is_oauth"] is True
         assert grok["configurable"] is False
         assert grok["key_source"] == "oauth"
@@ -71,8 +71,11 @@ def test_xai_oauth_model_picker_group_uses_live_catalog(monkeypatch, tmp_path):
     try:
         result = config.get_available_models()
         group = next(g for g in result["groups"] if g["provider_id"] == "xai-oauth")
-        assert group["provider"] == "xAI Grok OAuth"
-        assert group["models"] == [{"id": "grok-4.20", "label": "Grok 4.20"}]
+        assert group["provider"] == "xAI"
+        # config.get_available_models() applies the stable @provider: prefix
+        # to every group's model ids (_apply_provider_prefix); api.providers's
+        # get_providers() above does not, hence the differing expectation.
+        assert group["models"] == [{"id": "@xai-oauth:grok-4.20", "label": "Grok 4.20"}]
         assert result["active_provider"] == "xai-oauth"
     finally:
         restore()

@@ -16,13 +16,21 @@ from tests.test_sprint46 import (
 
 
 def _install_manual_summary(monkeypatch, summary_text):
+    # The route (local carry f594a4ca) no longer forwards the plugin's
+    # ``reference_message`` verbatim — it always synthesizes its own
+    # "[CONTEXT COMPACTION — REFERENCE ONLY] ..." string from
+    # summary["headline"]/["token_line"]/["note"] plus a fixed trailer. Only a
+    # non-blank ``headline`` actually survives into that synthesized string,
+    # so route this test's summary text through "headline" (when non-blank)
+    # to keep exercising the same normalization/length behavior the test was
+    # written to cover.
+    stripped = (summary_text or "").strip()
+    payload = {"headline": summary_text} if stripped else {}
     agent_module = types.ModuleType("agent")
     agent_module.__path__ = []
     feedback_module = types.ModuleType("agent.manual_compression_feedback")
     feedback_module.summarize_manual_compression = (
-        lambda original_messages, compressed_messages, before_count, after_count: {
-            "reference_message": summary_text,
-        }
+        lambda original_messages, compressed_messages, before_count, after_count: dict(payload)
     )
     monkeypatch.setitem(sys.modules, "agent", agent_module)
     monkeypatch.setitem(sys.modules, "agent.manual_compression_feedback", feedback_module)
@@ -52,9 +60,13 @@ def test_manual_and_streaming_compaction_preserve_long_summaries(
         monkeypatch, cleanup_test_sessions, long_summary
     )
 
-    assert route_summary == _compact_summary_text(long_summary)
-    assert route_summary == stored_session.compression_anchor_summary
     assert route_summary is not None
+    assert route_summary == stored_session.compression_anchor_summary
+    # The synthesized reference message embeds the (whitespace-collapsed)
+    # long headline verbatim rather than truncating it.
+    assert _compact_summary_text(long_summary) in route_summary
+    assert route_summary.startswith("[CONTEXT COMPACTION — REFERENCE ONLY]")
+    assert route_summary.endswith("Compression completed.")
     assert len(route_summary) > 320
 
 
@@ -67,6 +79,11 @@ def test_manual_and_streaming_compaction_normalize_blank_summaries(
         monkeypatch, cleanup_test_sessions, blank_summary
     )
 
-    assert route_summary is None
-    assert route_summary == _compact_summary_text(blank_summary)
-    assert stored_session.compression_anchor_summary is None
+    # A blank/whitespace-only plugin summary carries no usable headline, so
+    # the route falls back to its default "Context compressed" headline
+    # instead of surfacing an empty summary — the compaction card always
+    # shows the synthesized token-accounting text now, never None.
+    assert route_summary is not None
+    assert route_summary == stored_session.compression_anchor_summary
+    assert route_summary.startswith("[CONTEXT COMPACTION — REFERENCE ONLY] Context compressed")
+    assert route_summary.endswith("Compression completed.")

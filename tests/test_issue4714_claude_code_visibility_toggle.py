@@ -247,7 +247,7 @@ def test_cli_sessions_cache_key_varies_with_claude_code_toggle(monkeypatch):
 
     monkeypatch.setattr(models, "_resolve_cli_sessions_context", fake_resolve)
     monkeypatch.setattr(models, "_load_cli_sessions_uncached", fake_load)
-    monkeypatch.setattr(models, "_cli_sessions_cache_ttl_seconds", lambda: 60.0)
+    monkeypatch.setattr(models, "_cli_sessions_cache_ttl_seconds", lambda *a, **kw: 60.0)
     monkeypatch.setattr(models, "_cli_sessions_streaming_freeze_marker", lambda: None)
 
     visible = models.get_cli_sessions(include_claude_code=True)
@@ -298,7 +298,7 @@ def test_all_profiles_scans_claude_code_only_once(monkeypatch):
 
     monkeypatch.setattr(models, "_all_profiles_cli_contexts", fake_contexts)
     monkeypatch.setattr(models, "_load_cli_sessions_uncached", fake_load)
-    monkeypatch.setattr(models, "_cli_sessions_cache_ttl_seconds", lambda: 0.0)
+    monkeypatch.setattr(models, "_cli_sessions_cache_ttl_seconds", lambda *a, **kw: 0.0)
 
     rows = models.get_cli_sessions(all_profiles=True, include_claude_code=True)
 

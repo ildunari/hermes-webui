@@ -91,7 +91,10 @@ def test_neuralwatt_model_group_appears_with_models_in_config(monkeypatch, tmp_p
 
     groups = {group["provider_id"]: group for group in result["groups"]}
     assert "neuralwatt" in groups, f"neuralwatt missing from groups: {list(groups.keys())}"
+    # Not in the static _PROVIDER_DISPLAY table and no providers.neuralwatt.name
+    # override, so the label falls back to the title-cased provider id.
     assert groups["neuralwatt"]["provider"] == "Neuralwatt"
+    # Picker model ids carry the stable @provider: prefix (_apply_provider_prefix).
     model_ids = {model["id"] for model in groups["neuralwatt"]["models"]}
-    assert "glm-5.2" in model_ids
-    assert "glm-5.2-short" in model_ids
+    assert "@neuralwatt:glm-5.2" in model_ids
+    assert "@neuralwatt:glm-5.2-short" in model_ids

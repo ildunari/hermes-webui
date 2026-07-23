@@ -88,11 +88,16 @@ def test_named_custom_provider_models_endpoint_network_error_surfaces_empty_grou
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     with _ConfigState():
-        _configure_named_custom_provider(tmp_path, monkeypatch)
+        # _filter_model_picker_groups_by_policy() now drops a group entirely
+        # once it has neither `models` nor `extra_models`, even when it
+        # carries a models_endpoint_error — so a fallback `model:` (as the
+        # 401 test above already uses) is required to keep the group visible
+        # while still surfacing the endpoint error.
+        _configure_named_custom_provider(tmp_path, monkeypatch, model="broken/manual")
         data = config.get_available_models()
 
     group = _groups_by_provider(data)["custom:broken-proxy"]
-    assert group["models"] == []
+    assert "@custom:broken-proxy:broken/manual" in {m["id"] for m in group["models"]}
     assert group["models_endpoint_error"]["kind"] == "network"
     assert group["models_endpoint_error"]["code"] is None
     assert "verify base_url" in group["models_endpoint_error"]["message"]
@@ -136,11 +141,15 @@ def test_named_custom_provider_models_endpoint_network_error_uses_short_timeout(
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     with _ConfigState():
-        _configure_named_custom_provider(tmp_path, monkeypatch)
+        # See the note in test_named_custom_provider_models_endpoint_network_
+        # error_surfaces_empty_group above: an empty-models group is now
+        # dropped by _filter_model_picker_groups_by_policy(), so a fallback
+        # `model:` keeps the group (and its models_endpoint_error) visible.
+        _configure_named_custom_provider(tmp_path, monkeypatch, model="broken/manual")
         data = config.get_available_models()
 
     group = _groups_by_provider(data)["custom:broken-proxy"]
-    assert group["models"] == []
+    assert "@custom:broken-proxy:broken/manual" in {m["id"] for m in group["models"]}
     assert group["models_endpoint_error"]["kind"] == "network"
     assert observed_timeouts == [config.CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS]
     assert max(observed_timeouts) <= 5.0

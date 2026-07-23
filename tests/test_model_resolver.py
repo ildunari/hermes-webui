@@ -1207,10 +1207,11 @@ def test_default_model_lands_under_active_provider_group(monkeypatch):
         base_url='https://chatgpt.com/backend-api/codex',
     )
     groups = {g['provider']: [m['id'] for m in g['models']] for g in result['groups']}
-    assert 'OpenAI Codex' in groups, f"OpenAI Codex group missing: {list(groups)}"
+    # _PROVIDER_DISPLAY["openai-codex"] is "Codex" (not "OpenAI Codex").
+    assert 'Codex' in groups, f"Codex group missing: {list(groups)}"
     norm = lambda mid: mid.split('/', 1)[-1].split(':', 1)[-1]
-    assert 'gpt-5.4' in {norm(mid) for mid in groups['OpenAI Codex']}, (
-        f"gpt-5.4 not in OpenAI Codex group; contents: {groups['OpenAI Codex']}"
+    assert 'gpt-5.4' in {norm(mid) for mid in groups['Codex']}, (
+        f"gpt-5.4 not in Codex group; contents: {groups['Codex']}"
     )
     # And crucially, it must NOT have landed in the alphabetically-first
     # group (Anthropic) via the fallback path.

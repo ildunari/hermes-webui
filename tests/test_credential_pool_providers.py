@@ -800,6 +800,14 @@ def test_custom_provider_detected_by_get_available_models(monkeypatch, tmp_path)
             "api_key": "sk-bh...test",
             "base_url": "https://bothub.chat/v1",
             "display_name": "Bothub",
+            # An explicit models allowlist skips the live /v1/models probe
+            # (which fails offline in this sandbox). _filter_model_picker_
+            # groups_by_policy() now drops empty-model groups even when they
+            # carry a models_endpoint_error, so a group backed only by the
+            # (unreachable-here) live probe gets silently filtered out —
+            # configure the group like a real user with a working allowlist
+            # so the real detection/policy logic still exercises this path.
+            "models": ["bothub-mod-1"],
         },
     ]
     try:
@@ -820,8 +828,10 @@ def test_custom_provider_detected_by_get_available_models(monkeypatch, tmp_path)
     assert "bothub" in groups, (
         f"Bothub must appear as a group in get_available_models; got {list(groups)}"
     )
-    # Models may be empty since there's no real endpoint in test — the key is
-    # that the group appears at all (credential pool detection works).
+    # The configured models: allowlist keeps the group populated (and thus
+    # visible past the empty-group policy filter) without depending on a real
+    # /v1/models endpoint in this offline test.
+    assert groups["bothub"], "bothub group should carry its configured model(s)"
 
 
 # --- OAuth token order: runtime_api_key must be preferred over access_token ---

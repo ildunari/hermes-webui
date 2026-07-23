@@ -49,7 +49,9 @@ class TestProfileSwitchSpinner:
         """Chip label must be updated to new name before the API call."""
         fn = self._get_switch_fn()
         api_call_idx = fn.find("await api('/api/profile/switch'")
-        opt_name_idx = fn.find("_chipLabel.textContent = name")
+        # Label polish routes the optimistic update through profileDisplayName()
+        # instead of assigning the raw `name` literal directly.
+        opt_name_idx = fn.find("_chipLabel.textContent = profileDisplayName(name)")
         assert opt_name_idx != -1, "No optimistic name update found."
         assert opt_name_idx < api_call_idx, (
             "Optimistic name update must happen BEFORE the API call."

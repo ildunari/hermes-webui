@@ -158,6 +158,7 @@ def test_turn_identity_binder_restores_previous_value():
     registration that reads HERMES_SESSION_PLATFORM still works)."""
     streaming = importlib.import_module("api.streaming")
     pytest.importorskip("tools.approval", reason="hermes-agent not installed")
+    pytest.importorskip("gateway.session_context", reason="hermes-agent not installed")
     from tools.approval import get_current_session_key
     from gateway import session_context as sc
 
