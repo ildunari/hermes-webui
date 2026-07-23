@@ -22461,6 +22461,8 @@ def _webui_moa_command_prompt(message: str) -> tuple[bool, str]:
 
 
 _WEBUI_RESTART_COMMANDS = {
+    "/restart-webui": "webui",
+    "/restart_webui": "webui",
     "/restart-hermes": "hermes",
     "/restart_hermes": "hermes",
     "/restart-gateways": "gateways",
@@ -22495,7 +22497,8 @@ def _read_webui_restart_completion(stream_id: str) -> dict | None:
 def _start_webui_detached_restart_stream(s, *, msg: str, scope: str) -> dict:
     """Start a durable restart-helper stream for WebUI-origin slash commands.
 
-    The WebUI process is one of the restart targets for /restart-hermes, so the
+    The WebUI process is one of the restart targets for /restart-webui and
+    /restart-hermes, so the
     in-memory stream may die before completion. The detached helper writes a
     completion marker keyed by stream_id; the new WebUI process exposes it via
     /api/chat/stream/status so the browser can render the final assistant row
@@ -22515,7 +22518,11 @@ def _start_webui_detached_restart_stream(s, *, msg: str, scope: str) -> dict:
         s.pending_started_at = started_at
         s.pending_user_source = "webui"
         if _is_default_or_empty_session_title(getattr(s, "title", None)):
-            s.title = "/restart-hermes" if scope == "hermes" else "/restart-gateways"
+            s.title = {
+                "webui": "/restart-webui",
+                "gateways": "/restart-gateways",
+                "hermes": "/restart-hermes",
+            }[scope]
         if get_webui_session_save_mode() == "eager":
             _checkpoint_user_message_for_eager_session_save(
                 s,

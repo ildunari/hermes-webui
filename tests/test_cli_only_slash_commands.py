@@ -487,6 +487,8 @@ def test_send_intercepts_reload_mcp_agent_command_before_agent_round_trip():
 
 
 def test_restart_gateways_webui_intercept_aliases_are_defined_in_js_whitelist():
+    assert "'restart-webui'" in MESSAGES_JS
+    assert "'restart_webui'" in MESSAGES_JS
     assert "'restart-gateways'" in MESSAGES_JS
     assert "'restart_gateways'" in MESSAGES_JS
     assert "'restart-hermes'" in MESSAGES_JS
@@ -595,6 +597,27 @@ def test_restart_gateway_command_api_returns_status_id(monkeypatch, tmp_path):
     assert result["output"] == "queued restart"
     assert result["restart_status_id"]
     assert called["scope"] == "gateways"
+    assert called["kwargs"]["completion_marker"].endswith(f"{result['restart_status_id']}.json")
+
+
+def test_restart_webui_command_api_uses_webui_scope(monkeypatch, tmp_path):
+    import api.commands as commands
+
+    monkeypatch.setattr(commands, "_RESTART_STATUS_DIR", tmp_path)
+    called = {}
+
+    def fake_enqueue(scope, **kwargs):
+        called["scope"] = scope
+        called["kwargs"] = kwargs
+        return "queued restart"
+
+    monkeypatch.setattr("hermes_cli.restart_surfaces.enqueue_detached_restart", fake_enqueue)
+
+    result = execute_agent_command("/restart_webui")
+
+    assert result["output"] == "queued restart"
+    assert result["restart_status_id"]
+    assert called["scope"] == "webui"
     assert called["kwargs"]["completion_marker"].endswith(f"{result['restart_status_id']}.json")
 
 

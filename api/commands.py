@@ -30,6 +30,7 @@ _AGENT_COMMAND_ALIASES = {
     'reload_mcp': 'reload-mcp',
     'reload_skills': 'reload-skills',
     'codex_runtime': 'codex-runtime',
+    'restart_webui': 'restart-webui',
     'restart_gateways': 'restart-gateways',
     'restart_hermes': 'restart-hermes',
     'update_smart': 'update-smart',
@@ -39,6 +40,7 @@ _ALLOWED_AGENT_COMMANDS = frozenset({
     'reload-skills',
     'codex-runtime',
     'credits',
+    'restart-webui',
     'restart-gateways',
     'restart-hermes',
 })
@@ -256,7 +258,7 @@ def execute_agent_command(command: str) -> str | dict[str, Any]:
         return _run_codex_runtime_command(arg_string)
     if canonical == 'credits':
         return _run_credits_command()
-    if canonical in {'restart-gateways', 'restart-hermes'}:
+    if canonical in {'restart-webui', 'restart-gateways', 'restart-hermes'}:
         return _run_restart_surfaces_command(canonical, arg_string)
 
     raise KeyError(canonical)
@@ -314,7 +316,11 @@ def _run_restart_surfaces_command(canonical: str, arg_string: str) -> dict[str, 
         arg.lower() in {"--dry-run", "dry-run", "smoke", "test", "plan"}
         for arg in args
     )
-    scope = "gateways" if canonical == "restart-gateways" else "hermes"
+    scope = {
+        "restart-webui": "webui",
+        "restart-gateways": "gateways",
+        "restart-hermes": "hermes",
+    }[canonical]
     status_id = "" if dry_run else uuid4().hex
     marker = "" if dry_run else str(_restart_status_path(status_id))
     output = enqueue_detached_restart(

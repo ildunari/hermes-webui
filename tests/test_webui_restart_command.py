@@ -13,10 +13,13 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
 def test_webui_restart_command_is_exact_slash_only():
+    assert routes._webui_restart_command_scope('/restart-webui') == 'webui'
+    assert routes._webui_restart_command_scope('/restart_webui') == 'webui'
     assert routes._webui_restart_command_scope('/restart-hermes') == 'hermes'
     assert routes._webui_restart_command_scope('/restart_hermes') == 'hermes'
     assert routes._webui_restart_command_scope('/restart-gateways') == 'gateways'
     assert routes._webui_restart_command_scope('/restart-hermes now') is None
+    assert routes._webui_restart_command_scope('/restart-webui now') is None
     assert routes._webui_restart_command_scope('please /restart-hermes') is None
 
 

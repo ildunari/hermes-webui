@@ -1133,7 +1133,7 @@ const _sessionTitleProvisionalBySid = new Map();
 // their canonical command is registered on the backend (for example
 // /reload-mcp). Keep this intentionally narrow and include underscore variants
 // observed by users so typing either form still routes through executeAgentCommand.
-const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set(['reload-mcp', 'reload_mcp', 'reload-skills', 'reload_skills', 'codex-runtime', 'codex_runtime', 'credits', 'restart-gateways', 'restart_gateways', 'restart-hermes', 'restart_hermes']);
+const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set(['reload-mcp', 'reload_mcp', 'reload-skills', 'reload_skills', 'codex-runtime', 'codex_runtime', 'credits', 'restart-webui', 'restart_webui', 'restart-gateways', 'restart_gateways', 'restart-hermes', 'restart_hermes']);
 const _AGENT_COMMANDS_RESOLVE_AS_SKILL = new Set(['update-smart', 'update_smart']);
 
 function _clearStaleBusyStateBeforeSend({compressionRunning=false}={}){
