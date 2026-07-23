@@ -413,7 +413,11 @@ def test_single_line_growth_skips_the_height_round_trip():
     assert "let _composerLastResizeValue='';" in MESSAGES_JS
     assert "const _isAppendOnly=_nextValue.length>_composerLastResizeValue.length&&_nextValue.startsWith(_composerLastResizeValue);" in body
     assert "const _fitsCurrentHeight=el.scrollHeight<=el.offsetHeight;" in body
-    assert "const _minHeight=_isAppendOnly&&_fitsCurrentHeight?parseFloat(getComputedStyle(el).minHeight):NaN;" in body
+    assert "const _minHeightRaw=_isAppendOnly&&_fitsCurrentHeight?getComputedStyle(el).minHeight:'';" in body
+    assert "const _minHeight=/^(?:\\d+(?:\\.\\d+)?|\\.\\d+)px$/.test(_minHeightRaw)?parseFloat(_minHeightRaw):NaN;" in body
+    # The strict finite-pixel guard rejects a percentage/auto/calc min-height so a
+    # bogus parseFloat("50%")===50 can't wrongly enable the fast path (Codex #6349 re-gate).
+    assert "parseFloat(getComputedStyle(el).minHeight)" not in body  # old lax parse is gone
     assert "const _isAtMinimumHeight=Number.isFinite(_minHeight)&&el.offsetHeight<=Math.ceil(_minHeight)+1;" in body
     assert "if(_isAppendOnly&&_fitsCurrentHeight&&_isAtMinimumHeight){" in body
     assert "el.style.height='auto'" in body
@@ -576,3 +580,93 @@ def test_steady_state_keystroke_preserves_near_bottom_unpinned_reader():
     out = _run_autoresize({"unpinned": "true", "pinned": "false", "scrolltop": 7990, "composerH": 164})
     assert out["scrollTop"] == 7990, f"near-bottom unpinned reader must not move; got {out}"
     assert out["repinCalls"] == 0, "must not re-pin an unpinned reader"
+
+
+# ---------------------------------------------------------------------------
+# Strict min-height parse (#6349 Codex re-gate): the single-row fast path must
+# only fire when getComputedStyle(el).minHeight is a genuine "<number>px". A
+# percentage / auto / calc min-height must fail closed to the FULL resize —
+# otherwise a bogus parseFloat("50%")===50 would wrongly enable the fast path
+# and leave an oversized composer stuck tall.
+# ---------------------------------------------------------------------------
+
+def _run_fastpath_minheight(min_height_css, composer_h=50, content_h=44):
+    node = shutil.which("node")
+    if not node:  # pragma: no cover
+        pytest.skip("node not available")
+    body = _autoresize_body()
+    harness = textwrap.dedent(
+        """
+        // A composer at offsetHeight=%(composerH)s whose content fits %(contentH)s.
+        // An append-only keystroke arrives. The fast path (early return, NO resize)
+        // fires only when minHeight parses to a finite px AND offsetHeight is at
+        // that minimum. This scenario is chosen so a BUGGY lax parse of a
+        // percentage min-height ("50%%" -> parseFloat -> 50) would compute
+        // _isAtMinimumHeight = (50 <= ceil(50)+1) = true and WRONGLY skip, leaving
+        // the composer stuck at %(composerH)s. The strict /^<number>px$/ parse
+        // yields NaN for "50%%", forcing the full resize that shrinks it to %(contentH)s.
+        let _composerH = %(composerH)s;
+        let _styleHeightWrites = 0;
+        const msgEl = {
+          value: '',
+          get offsetHeight(){ return _composerH; },
+          scrollHeight: %(contentH)s,
+          style: {
+            set height(v){
+              _styleHeightWrites++;
+              if(v === 'auto'){ _composerH = %(contentH)s; }
+              else { _composerH = Math.min(parseInt(v,10) || _composerH, 200); }
+            },
+            get height(){ return _composerH + 'px'; },
+          },
+        };
+        const msgsEl = { scrollHeight: 1000, clientHeight: 500, scrollTop: 0 };
+        const $ = (id) => (id === 'msg' ? msgEl : id === 'messages' ? msgsEl : null);
+        function getComputedStyle(){ return { minHeight: %(minheight)r }; }
+        let _messageUserUnpinned = false, _scrollPinned = false;
+        let _composerAutoResizeRaf = 0;
+        let _composerLastResizeValue = '';
+        function updateSendBtn(){}
+        function _messageBottomDistance(){ return 0; }
+        function _setMessageScrollToBottom(){}
+        function _repinMessagesAfterComposerResize(){}
+
+        %(autoresize)s
+
+        msgEl.value = 'abc';   // append-only keystroke
+        autoResize();
+        console.log(JSON.stringify({ offsetHeight: _composerH, styleWrites: _styleHeightWrites }));
+        """
+    ) % {"minheight": min_height_css, "autoresize": body,
+         "composerH": composer_h, "contentH": content_h}
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, f"node harness failed: {proc.stderr}"
+    return json.loads(proc.stdout.strip())
+
+
+def test_percentage_minheight_never_enables_fast_path():
+    # THE #6349 Codex re-gate defect, red-before-green. A composer at 50px whose
+    # content fits 44px gets an append. With a "50%" min-height, a LAX
+    # parseFloat("50%")===50 would read _isAtMinimumHeight = (50 <= 51) = true and
+    # WRONGLY skip the resize, leaving the composer stuck at 50px. The strict
+    # /^<number>px$/ parse yields NaN, forcing the full resize down to 44px.
+    out = _run_fastpath_minheight("50%", composer_h=50, content_h=44)
+    assert out["styleWrites"] >= 1, f"percentage min-height must force the full resize; got {out}"
+    assert out["offsetHeight"] == 44, f"composer must shrink to its real content height; got {out}"
+
+
+def test_auto_and_calc_minheight_fail_closed_to_full_resize():
+    # auto / empty / calc min-height are equally unparseable as a fixed pixel min
+    # and must fail closed to the full resize path.
+    for css in ("auto", "", "calc(44px + 2%)"):
+        out = _run_fastpath_minheight(css, composer_h=50, content_h=44)
+        assert out["styleWrites"] >= 1, f"min-height={css!r} must force full resize; got {out}"
+        assert out["offsetHeight"] == 44, f"min-height={css!r}: composer must remeasure; got {out}"
+
+
+def test_valid_px_minheight_fast_path_still_skips_at_minimum():
+    # The optimization must still work: a composer already AT its 44px min-height
+    # with a valid "44px" min-height takes the fast path (no style.height write).
+    out = _run_fastpath_minheight("44px", composer_h=44, content_h=44)
+    assert out["styleWrites"] == 0, f"at-minimum append with valid px min-height must fast-path (no resize write); got {out}"
+    assert out["offsetHeight"] == 44
