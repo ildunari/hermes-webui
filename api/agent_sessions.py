@@ -1,10 +1,62 @@
 """Shared helpers for reading Hermes Agent sessions from state.db."""
 import logging
+import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _bounded_env_int(name: str, *, maximum: int) -> int:
+    """Return a bounded positive integer env value, or zero when disabled."""
+    try:
+        value = int(os.getenv(name, "0").strip() or "0")
+    except (TypeError, ValueError):
+        logger.warning("ignoring invalid %s value", name)
+        return 0
+    if value <= 0:
+        return 0
+    return min(value, maximum)
+
+
+def _state_db_query_only_enabled() -> bool:
+    return os.getenv("HERMES_WEBUI_STATEDB_QUERY_ONLY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _tune_state_db_read_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Apply opt-in read-side tuning without changing the database itself."""
+    pragmas: list[tuple[str, int | None]] = []
+    busy_ms = _bounded_env_int("HERMES_WEBUI_STATEDB_BUSY_MS", maximum=60_000)
+    mmap_mb = _bounded_env_int("HERMES_WEBUI_STATEDB_MMAP_MB", maximum=16_384)
+    cache_mb = _bounded_env_int("HERMES_WEBUI_STATEDB_CACHE_MB", maximum=1_024)
+    if busy_ms:
+        pragmas.append(("busy_timeout", busy_ms))
+    if mmap_mb:
+        pragmas.append(("mmap_size", mmap_mb * 1024 * 1024))
+    if cache_mb:
+        # Negative cache_size values are kibibytes rather than page counts.
+        pragmas.append(("cache_size", -(cache_mb * 1024)))
+    if _state_db_query_only_enabled():
+        pragmas.append(("query_only", None))
+
+    for pragma, value in pragmas:
+        try:
+            if value is None:
+                conn.execute(f"PRAGMA {pragma}=ON")
+            else:
+                conn.execute(f"PRAGMA {pragma}={value}")
+        except sqlite3.Error as exc:
+            # The tuning is an opt-in optimization. A filesystem/SQLite build
+            # that rejects one pragma should keep serving reads with the
+            # historical connection behavior rather than failing the sidebar.
+            logger.warning("state.db read tuning PRAGMA %s failed: %s", pragma, exc)
+    return conn
 
 
 def open_state_db_readonly(db_path: Path, log: logging.Logger | None = None) -> sqlite3.Connection:
@@ -29,14 +81,16 @@ def open_state_db_readonly(db_path: Path, log: logging.Logger | None = None) -> 
         raise FileNotFoundError(f"agent state.db not found: {db_path}")
     read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro"
     try:
-        return sqlite3.connect(read_only_uri, uri=True)
+        return _tune_state_db_read_connection(
+            sqlite3.connect(read_only_uri, uri=True)
+        )
     except sqlite3.Error as exc:
         log.warning(
             "agent state.db read-only open failed for %s; falling back to writable connection: %s",
             db_path,
             exc,
         )
-        return sqlite3.connect(str(db_path))
+        return _tune_state_db_read_connection(sqlite3.connect(str(db_path)))
 
 
 MESSAGING_SOURCES = {
