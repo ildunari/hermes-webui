@@ -15,6 +15,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -1772,6 +1773,18 @@ _SKILLS_STATS_CACHE_TTL = 300.0  # seconds — long because .clear() handles pro
 # its own meta-lock and is bounded by the (small) number of profiles.
 _SKILLS_STATS_LOCKS: dict[Path, threading.Lock] = {}
 _SKILLS_STATS_LOCKS_GUARD = threading.Lock()
+_SKILLS_STATS_REFRESHING: set[Path] = set()
+_SKILLS_STATS_REFRESHING_GUARD = threading.Lock()
+
+
+def _defer_skills_stats_enabled() -> bool:
+    """Return whether profile skill counts may refresh off the request path."""
+    return os.getenv("HERMES_WEBUI_DEFER_SKILL_STATS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _skills_stats_lock_for(profile_dir: Path) -> threading.Lock:
@@ -1797,6 +1810,16 @@ def _skill_tree_max_mtime_ns(skills_dir: Path, config_path: Path) -> int:
     except OSError:
         pass
     if not skills_dir.is_dir():
+        return max_ns
+    if _defer_skills_stats_enabled():
+        # In deferred mode this probe runs on every /api/profiles cache miss, so
+        # keep it to two stats. Directory mtime catches top-level skill
+        # create/delete; config mtime catches enable/disable. Nested edits may
+        # leave counts stale only until the existing five-minute TTL expires.
+        try:
+            max_ns = max(max_ns, skills_dir.stat().st_mtime_ns)
+        except OSError:
+            pass
         return max_ns
     try:
         from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
@@ -1894,6 +1917,66 @@ def _compute_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
     return (enabled_count, compatible_count)
 
 
+def _schedule_profile_skills_stats_refresh(
+    profile_dir: Path,
+    skills_dir: Path,
+    config_path: Path,
+) -> bool:
+    """Schedule one background stats refresh for a profile."""
+    with _SKILLS_STATS_REFRESHING_GUARD:
+        if profile_dir in _SKILLS_STATS_REFRESHING:
+            return False
+        _SKILLS_STATS_REFRESHING.add(profile_dir)
+
+    def _refresh() -> None:
+        try:
+            lock = _skills_stats_lock_for(profile_dir)
+            with lock:
+                before_mtime_ns = _skill_tree_max_mtime_ns(skills_dir, config_path)
+                result = _compute_profile_skills_stats(profile_dir)
+                after_mtime_ns = _skill_tree_max_mtime_ns(skills_dir, config_path)
+                if before_mtime_ns != after_mtime_ns:
+                    # A concurrent create/delete/config edit invalidated the
+                    # snapshot. Leave the old cache alone; the next request
+                    # schedules a clean refresh.
+                    return
+                _SKILLS_STATS_CACHE[profile_dir] = (
+                    result[0],
+                    result[1],
+                    after_mtime_ns,
+                    time.time() + _SKILLS_STATS_CACHE_TTL,
+                )
+            # Rows may currently contain the stale/zero placeholder returned
+            # while this worker ran. Make the fresh counts visible next poll.
+            _invalidate_list_profiles_cache()
+        except Exception:
+            logger.warning(
+                "background profile skill-count refresh failed for %s",
+                profile_dir,
+                exc_info=True,
+            )
+        finally:
+            with _SKILLS_STATS_REFRESHING_GUARD:
+                _SKILLS_STATS_REFRESHING.discard(profile_dir)
+
+    try:
+        threading.Thread(
+            target=_refresh,
+            daemon=True,
+            name=f"profile-skills-{profile_dir.name[:32]}",
+        ).start()
+    except Exception:
+        with _SKILLS_STATS_REFRESHING_GUARD:
+            _SKILLS_STATS_REFRESHING.discard(profile_dir)
+        logger.warning(
+            "failed to start profile skill-count refresh for %s",
+            profile_dir,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
 def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
     """Calculate (enabled_count, compatible_count) with two-tier mtime cache.
 
@@ -1903,7 +1986,6 @@ def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
     is only a safety-net upper bound that forces an occasional full recompute
     even when the mtime probe sees no change.
     """
-    import time
     profile_dir = Path(profile_dir).resolve()
     now = time.time()
     skills_dir = profile_dir / "skills"
@@ -1927,6 +2009,12 @@ def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
         # the probe can't see — e.g. a git checkout that restores the old mtime).
         if current_mtime_ns == cached_mtime_ns and now < expiry:
             return enabled, compat
+
+    if _defer_skills_stats_enabled():
+        _schedule_profile_skills_stats_refresh(profile_dir, skills_dir, config_path)
+        if cached is not None:
+            return cached[0], cached[1]
+        return (0, 0)
 
     # Cache miss, mtime changed, or TTL expired — serialize per-profile so a
     # burst of concurrent misses (cold startup) collapses to ONE compute instead
