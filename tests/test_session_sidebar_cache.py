@@ -1,4 +1,5 @@
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -134,6 +135,67 @@ def test_session_list_cache_singleflight_rebuild_once(monkeypatch):
     assert results[0] == _session_cache_payload("singleflight")
     assert results[1] == _session_cache_payload("singleflight")
     assert calls == 1
+
+
+def test_session_list_cache_opt_in_wait_collapses_slow_cold_rebuild(monkeypatch):
+    routes._session_list_cache_clear()
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+    monkeypatch.setattr(routes, "_SESSIONS_CACHE_WAIT_SECONDS", 0.05)
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_REBUILD_WAIT_MS", "1000")
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+    lock = threading.Lock()
+    results = []
+
+    def builder():
+        nonlocal calls
+        with lock:
+            calls += 1
+        started.set()
+        release.wait()
+        return _session_cache_payload("singleflight")
+
+    key = routes._session_list_cache_key(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=False,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+    )
+    owner = threading.Thread(
+        target=lambda: results.append(
+            routes._get_cached_session_list_payload(key=key, builder=builder)
+        ),
+        daemon=True,
+    )
+    follower = threading.Thread(
+        target=lambda: results.append(
+            routes._get_cached_session_list_payload(key=key, builder=builder)
+        ),
+        daemon=True,
+    )
+
+    owner.start()
+    assert started.wait(1.0)
+    follower.start()
+    time.sleep(0.15)
+
+    assert follower.is_alive()
+    assert calls == 1
+
+    release.set()
+    owner.join(2.0)
+    follower.join(2.0)
+
+    assert not owner.is_alive()
+    assert not follower.is_alive()
+    assert calls == 1
+    assert results == [
+        _session_cache_payload("singleflight"),
+        _session_cache_payload("singleflight"),
+    ]
 
 
 def test_session_list_cache_follower_wait_stage_when_rebuild_inflight(monkeypatch):

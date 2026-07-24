@@ -15,6 +15,9 @@ Desktop dashboard, and Hermex/iOS session/profile surfaces:
   requests return cached status immediately while one coalesced daemon thread
   performs the existing network/git refresh. A forced manual check still forces
   that background refresh.
+- `HERMES_WEBUI_SESSION_REBUILD_WAIT_MS` extends the short follower wait for
+  session-list and CLI-session rebuilds. This prevents concurrent cold polls
+  from timing out after 100–250ms and each starting the same expensive scan.
 
 All variables default off, preserving upstream behavior when unset. The
 existing `HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N` default/cap is unchanged.
@@ -28,7 +31,8 @@ HERMES_WEBUI_STATEDB_CACHE_MB=16
 HERMES_WEBUI_STATEDB_QUERY_ONLY=1
 HERMES_WEBUI_DEFER_SKILL_STATS=1
 HERMES_WEBUI_BACKGROUND_UPDATE_CHECKS=1
+HERMES_WEBUI_SESSION_REBUILD_WAIT_MS=2000
 ```
 
-Rollback is to remove those six environment variables and safely restart the
+Rollback is to remove those seven environment variables and safely restart the
 affected backend. No database cleanup or reversal is required.

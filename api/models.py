@@ -79,6 +79,19 @@ _CLI_SESSIONS_CACHE_WAIT_SECONDS = 0.25
 # Event waits that keep stale rows visible while a rebuild is in flight.
 _CLI_SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
 
+
+def _cli_sessions_rebuild_wait_seconds(default: float) -> float:
+    """Return the opt-in coalescing wait, never shorter than the default."""
+    try:
+        configured_ms = int(
+            os.getenv("HERMES_WEBUI_SESSION_REBUILD_WAIT_MS", "0").strip() or "0"
+        )
+    except (TypeError, ValueError):
+        configured_ms = 0
+    if configured_ms <= 0:
+        return default
+    return max(default, min(configured_ms, 10_000) / 1000.0)
+
 # Hermex is backed by this WebUI sidebar. Some desktop/ACP-style clients create
 # complete Hermes sessions with a framework title (or no title at all) but never
 # call Hermes' normal first-turn title hook. Repair only those explicitly-known
@@ -6874,9 +6887,11 @@ def _reload_cli_sessions_after_inflight(
         try:
             wait_finished = bool(
                 event.wait(
-                    _CLI_SESSIONS_CACHE_STALE_WAIT_SECONDS
-                    if stale_sessions is not None
-                    else _CLI_SESSIONS_CACHE_WAIT_SECONDS
+                    _cli_sessions_rebuild_wait_seconds(
+                        _CLI_SESSIONS_CACHE_STALE_WAIT_SECONDS
+                        if stale_sessions is not None
+                        else _CLI_SESSIONS_CACHE_WAIT_SECONDS
+                    )
                 )
             )
         except Exception:

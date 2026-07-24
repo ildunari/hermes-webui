@@ -2828,6 +2828,14 @@ def _get_cached_session_list_payload(
         timeout = _SESSIONS_CACHE_STALE_WAIT_SECONDS
     else:
         timeout = _SESSIONS_CACHE_WAIT_SECONDS
+    try:
+        configured_wait_ms = int(
+            os.getenv("HERMES_WEBUI_SESSION_REBUILD_WAIT_MS", "0").strip() or "0"
+        )
+    except (TypeError, ValueError):
+        configured_wait_ms = 0
+    if configured_wait_ms > 0:
+        timeout = max(timeout, min(configured_wait_ms, 10_000) / 1000.0)
     event.wait(timeout)
 
     latest, is_fresh = _session_list_cache_get(key, allow_stale=False)

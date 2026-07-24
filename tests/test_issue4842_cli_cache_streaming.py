@@ -208,6 +208,57 @@ def test_get_cli_sessions_cold_follower_times_out_to_independent_rebuild(monkeyp
     assert results.get("owner") == [{"session_id": "fresh", "title": "fresh-row"}]
 
 
+def test_get_cli_sessions_opt_in_wait_collapses_slow_cold_rebuild(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: str(hermes_home))
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    models.clear_cli_sessions_cache()
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 60.0, raising=False)
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_WAIT_SECONDS", 0.05, raising=False)
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_REBUILD_WAIT_MS", "1000")
+
+    owner_started = threading.Event()
+    owner_block = threading.Event()
+    load_count = {"value": 0}
+    results = {}
+
+    def _blocking_loader(*_args, **_kwargs):
+        load_count["value"] += 1
+        owner_started.set()
+        owner_block.wait()
+        return [{"session_id": "fresh", "title": "fresh-row"}]
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", _blocking_loader)
+
+    owner = threading.Thread(
+        target=lambda: results.setdefault("owner", models.get_cli_sessions()),
+        daemon=True,
+    )
+    follower = threading.Thread(
+        target=lambda: results.setdefault("follower", models.get_cli_sessions()),
+        daemon=True,
+    )
+
+    owner.start()
+    assert owner_started.wait(1.0), "owner did not start"
+    follower.start()
+    time.sleep(0.15)
+
+    assert follower.is_alive()
+    assert load_count["value"] == 1
+
+    owner_block.set()
+    owner.join(2.0)
+    follower.join(2.0)
+
+    assert not owner.is_alive()
+    assert not follower.is_alive()
+    assert load_count["value"] == 1
+    assert results.get("owner") == [{"session_id": "fresh", "title": "fresh-row"}]
+    assert results.get("follower") == [{"session_id": "fresh", "title": "fresh-row"}]
+
+
 def test_get_cli_sessions_clear_during_rebuild_does_not_restore_stale_rows(monkeypatch, tmp_path):
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
