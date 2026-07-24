@@ -199,6 +199,7 @@ def _run_pending_session_message_probe() -> dict:
             _function_body(UI_SRC, "function _pendingCurrentTailUserMessage"),
             _function_body(UI_SRC, "function _isContextCompactionText"),
             _function_body(UI_SRC, "function _isContextCompactionMessage"),
+            _function_body(UI_SRC, "function _pendingTurnAlreadyPersisted"),
             _function_body(UI_SRC, "function getPendingSessionMessage"),
         ]
     )
@@ -269,8 +270,22 @@ const repeatedCompletedPromptCount = repeatedCompletedMessages.filter(
   m=>m&&m.role==='user'&&_normalizeUserTranscriptText(m.content)===prompt
 ).length;
 const compactionCurrentTail = _pendingCurrentTailUserMessage([historical, historicalAnswer, currentTailForCompaction, compactionMarker]);
+// Switch-back staleness: the turn already persisted (answer _ts:2 postdates
+// pending_started_at:1) but pending_user_message was not cleared server-side
+// yet. Must NOT re-append below the finished answer.
+const staleCompletedResult = getPendingSessionMessage(
+  {{pending_user_message:prompt, pending_started_at:1}},
+  [historical, historicalAnswer]
+);
+// Same shape without timestamps on the answer row: still treat as persisted.
+const staleCompletedNoTsResult = getPendingSessionMessage(
+  {{pending_user_message:prompt, pending_started_at:1}},
+  [{{role:'user', content:prompt}}, {{role:'assistant', content:'done'}}]
+);
 
 process.stdout.write(JSON.stringify({{
+  staleCompletedSuppressed: staleCompletedResult===null,
+  staleCompletedNoTsSuppressed: staleCompletedNoTsResult===null,
   historicalSameTextSurvives: !!fromHistoricalSameText && fromHistoricalSameText.content===prompt && fromHistoricalSameText._pending===true,
   historicalWorkspaceSurvives: !!fromHistoricalWorkspace && fromHistoricalWorkspace.content===prompt && fromHistoricalWorkspace._pending===true,
   exactCurrentTailDedupe: exactCurrentResult===null,
@@ -498,6 +513,11 @@ def test_get_pending_session_message_keeps_deferred_repeat_prompt_by_behavior():
     assert result["repeatedCompletedPromptsRemainValid"] is True
     assert result["isContextCompactionText"] is True
     assert result["isContextCompactionMessage"] is True
+    # Completed-turn staleness (message re-appears below the finished answer
+    # on session switch-back): a pending prompt older than the persisted
+    # assistant reply must be suppressed, with or without row timestamps.
+    assert result["staleCompletedSuppressed"] is True
+    assert result["staleCompletedNoTsSuppressed"] is True
 
 
 def test_live_tool_matching_uses_the_same_aliases_as_live_card_dedup():

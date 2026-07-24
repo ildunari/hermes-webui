@@ -75,3 +75,40 @@ def test_pending_user_message_dedup_checks_current_message_array():
     assert "[...messages].reverse().find" not in helper, (
         "Pending-message dedup must not reverse-scan historical user rows"
     )
+
+
+def test_pending_user_message_not_reappended_after_turn_completes():
+    """Stale pending_user_message must not re-render below a finished answer.
+
+    Switch-back/visibility refetch can land in the window where the assistant
+    reply is already persisted in the transcript but pending_user_message has
+    not been cleared server-side yet. The tail-only dedup is blind there (the
+    tail is the assistant row), so the prompt used to re-append at the bottom,
+    out of order. getPendingSessionMessage must recognize a matching user turn
+    that is already followed by a completed assistant reply — while still
+    letting a genuinely re-sent identical prompt (pending_started_at newer
+    than that reply) render optimistically.
+    """
+    assert "function _pendingTurnAlreadyPersisted(messages,text,session)" in UI_JS
+
+    helper_start = UI_JS.find("function _pendingTurnAlreadyPersisted(messages,text,session)")
+    helper_end = UI_JS.find("function getPendingSessionMessage", helper_start)
+    assert helper_end != -1
+    helper = UI_JS[helper_start:helper_end]
+
+    compact = helper.replace(" ", "")
+    assert "role||'')!=='user'" in compact, "must locate the matching user row"
+    assert "!=='assistant'||later._live" in compact, (
+        "only a completed (non-live) assistant reply proves the turn persisted"
+    )
+    assert "pending_started_at" in helper, (
+        "re-send race guard: a pending prompt newer than the reply must not be suppressed"
+    )
+
+    gps_start = UI_JS.find("function getPendingSessionMessage(session, messagesOverride=null)")
+    gps_end = UI_JS.find("async function checkInflightOnBoot", gps_start)
+    gps = UI_JS[gps_start:gps_end]
+    assert "_pendingTurnAlreadyPersisted(messages,text,session)" in gps.replace("  ", " "), (
+        "getPendingSessionMessage must consult the persisted-turn guard before "
+        "emitting an optimistic pending row"
+    )

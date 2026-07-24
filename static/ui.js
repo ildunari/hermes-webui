@@ -10435,6 +10435,38 @@ function _isInternalWakeupPendingSession(session,text){
     value.startsWith('[ASYNC DELEGATION');
 }
 
+function _pendingTurnAlreadyPersisted(messages,text,session){
+  // The tail-only dedup above goes blind once the assistant's answer is
+  // persisted after the user turn: on session switch-back a stale
+  // pending_user_message (server clears it asynchronously) would re-append
+  // the prompt BELOW the answer. Scan for the most recent matching user row;
+  // if a completed assistant reply follows it, the turn already persisted.
+  const list=Array.isArray(messages)?messages:[];
+  const candidate={role:'user',content:String(text||'')};
+  for(let i=list.length-1;i>=0;i--){
+    const msg=list[i];
+    if(!msg||String(msg.role||'')!=='user') continue;
+    if(typeof _isContextCompactionMessage==='function'&&_isContextCompactionMessage(msg)) continue;
+    const same=typeof _sameTranscriptMessage==='function'
+      ? _sameTranscriptMessage(msg,candidate)
+      : String(msgContent(msg)||'').trim()===String(text||'').trim();
+    if(!same) continue;
+    for(let j=i+1;j<list.length;j++){
+      const later=list[j];
+      if(!later||String(later.role||'')!=='assistant'||later._live) continue;
+      // Guard the re-send race: if the user submitted the same text AGAIN
+      // after that answer landed, pending_started_at postdates the reply and
+      // the new turn must still render optimistically.
+      const laterTs=Number(later._ts||later.ts||0);
+      const pendingTs=Number(session?.pending_started_at||0);
+      if(laterTs&&pendingTs&&pendingTs>laterTs) return false;
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
 function getPendingSessionMessage(session, messagesOverride=null){
   const text=String(session?.pending_user_message||'').trim();
   if(!text) return null;
@@ -10453,6 +10485,7 @@ function getPendingSessionMessage(session, messagesOverride=null){
       return null;
     }
   }
+  if(_pendingTurnAlreadyPersisted(messages,text,session)) return null;
   return {
     role:'user',
     content:text,
