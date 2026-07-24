@@ -13502,6 +13502,21 @@ def handle_get(handler, parsed) -> bool:
             )
         from api.updates import cached_update_status
 
+        if _truthy_env("HERMES_WEBUI_BACKGROUND_UPDATE_CHECKS"):
+            from api.updates import refresh_update_status_async
+
+            channel = settings.get("update_channel")
+            refresh_started = refresh_update_status_async(
+                include_agent=include_agent_updates,
+                channel=channel,
+            )
+            payload = cached_update_status(
+                include_agent=include_agent_updates,
+                channel=channel,
+            )
+            payload["refresh_started"] = refresh_started
+            return j(handler, payload)
+
         return j(handler, cached_update_status(include_agent=include_agent_updates))
 
     if parsed.path == "/api/chat/stream/status":
@@ -14182,6 +14197,27 @@ def handle_post(handler, parsed) -> bool:
         channel = body.get("channel") if isinstance(body, dict) else None
         if channel not in ("stable", "experimental"):
             channel = settings.get("update_channel")
+        if _truthy_env("HERMES_WEBUI_BACKGROUND_UPDATE_CHECKS"):
+            from api.updates import cached_update_status, refresh_update_status_async
+
+            logger.info(
+                "scheduling background update check (force=%s, include_agent=%s, channel=%s)",
+                force,
+                include_agent_updates,
+                channel,
+            )
+            refresh_started = refresh_update_status_async(
+                force=force,
+                include_agent=include_agent_updates,
+                channel=channel,
+            )
+            payload = cached_update_status(
+                include_agent=include_agent_updates,
+                channel=channel,
+            )
+            payload["refresh_started"] = refresh_started
+            return j(handler, payload)
+
         from api.updates import check_for_updates
 
         logger.info("checking for updates (force=%s, include_agent=%s, channel=%s)", force, include_agent_updates, channel)

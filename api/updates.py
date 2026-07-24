@@ -42,6 +42,7 @@ _SUMMARY_CACHE_MAX = 16
 _summary_cache: OrderedDict = OrderedDict()
 _cache_lock = threading.Lock()
 _check_in_progress = False
+_background_check_in_progress = False
 _apply_lock = threading.Lock()   # prevents concurrent stash/pull/pop on same repo
 CACHE_TTL = 1800  # 30 minutes
 _AGENT_GATEWAY_RESTART_RETRY_DELAY_S = 1.0
@@ -1366,6 +1367,47 @@ def check_for_updates(force=False, *, include_agent=True, channel=None):
             return dict(_update_cache)
     finally:
         _check_in_progress = False
+
+
+def refresh_update_status_async(force=False, *, include_agent=True, channel=None) -> bool:
+    """Refresh update status in one coalesced daemon thread.
+
+    Returns True when this call started the refresh and False when a prior
+    background refresh is still running. Callers should always return
+    ``cached_update_status`` immediately rather than waiting for this worker.
+    """
+    global _background_check_in_progress
+    with _cache_lock:
+        if _background_check_in_progress:
+            return False
+        _background_check_in_progress = True
+
+    def _refresh() -> None:
+        global _background_check_in_progress
+        try:
+            check_for_updates(
+                force=force,
+                include_agent=include_agent,
+                channel=channel,
+            )
+        except Exception:
+            logger.exception("background update check failed")
+        finally:
+            with _cache_lock:
+                _background_check_in_progress = False
+
+    try:
+        threading.Thread(
+            target=_refresh,
+            daemon=True,
+            name="webui-update-check",
+        ).start()
+    except Exception:
+        with _cache_lock:
+            _background_check_in_progress = False
+        logger.exception("failed to start background update check")
+        return False
+    return True
 
 
 def _repo_path_for_update_target(target: str):

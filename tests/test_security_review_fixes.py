@@ -107,6 +107,38 @@ def test_get_update_check_returns_cache_without_fetch(monkeypatch):
     assert handler.status == 200
 
 
+def test_get_update_check_can_schedule_refresh_without_blocking(monkeypatch):
+    from api import routes, updates
+
+    calls = []
+    monkeypatch.setenv("HERMES_WEBUI_BACKGROUND_UPDATE_CHECKS", "true")
+    monkeypatch.setattr(
+        routes,
+        "load_settings",
+        lambda: {
+            "check_for_updates": True,
+            "ignore_agent_updates": False,
+            "update_channel": "stable",
+        },
+    )
+    monkeypatch.setattr(
+        updates,
+        "refresh_update_status_async",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        updates,
+        "cached_update_status",
+        lambda **kwargs: {"checked_at": 123, **kwargs},
+    )
+
+    handler = _Handler(client_ip="127.0.0.1")
+    routes.handle_get(handler, urlsplit("/api/updates/check"))
+
+    assert handler.status == 200
+    assert calls == [{"include_agent": True, "channel": "stable"}]
+
+
 def test_cached_update_status_does_not_drop_agent_info_when_reenabled(monkeypatch):
     from api import updates
 
@@ -144,6 +176,49 @@ def test_post_update_check_performs_forced_fetch(monkeypatch):
     routes.handle_post(handler, SimpleNamespace(path="/api/updates/check", query=""))
     assert handler.status == 200
     assert calls == [(True, True)]
+
+
+def test_post_update_check_can_force_background_refresh(monkeypatch):
+    from api import routes, updates
+
+    calls = []
+    monkeypatch.setenv("HERMES_WEBUI_BACKGROUND_UPDATE_CHECKS", "true")
+    monkeypatch.setattr(
+        routes,
+        "load_settings",
+        lambda: {
+            "check_for_updates": True,
+            "ignore_agent_updates": False,
+            "update_channel": "stable",
+        },
+    )
+    monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
+    monkeypatch.setattr(
+        updates,
+        "refresh_update_status_async",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        updates,
+        "cached_update_status",
+        lambda **kwargs: {"checked_at": 123, **kwargs},
+    )
+
+    body = b'{"force": true}'
+    handler = _Handler(
+        client_ip="127.0.0.1",
+        body=body,
+        headers={"Content-Length": str(len(body))},
+    )
+    routes.handle_post(
+        handler,
+        SimpleNamespace(path="/api/updates/check", query=""),
+    )
+
+    assert handler.status == 200
+    assert calls == [
+        {"force": True, "include_agent": True, "channel": "stable"}
+    ]
 
 
 def test_onboarding_untrusted_forwarded_header_denies_lan_proxy_socket(monkeypatch):
